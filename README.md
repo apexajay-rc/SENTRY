@@ -67,7 +67,7 @@ SENTRY is structured into two components:
 
 ### 1. Clone the repository
 
-    git clone https://github.com/<your-username>/sentry.git
+    git clone https://github.com/apexajay-rc/sentry.git
     cd sentry
 
 ---
