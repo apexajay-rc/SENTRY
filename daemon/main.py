@@ -4,6 +4,7 @@ import subprocess
 import signal
 from collections import deque
 from datetime import datetime
+from core.metrics import calculate_cpu, get_memory_usage, get_io_wait, compute_stress
 
 LOG_FILE = "sentry_log.txt"
 stress_history = deque(maxlen=5)
@@ -27,55 +28,6 @@ RESUME_SECONDS = 10
 def log_event(message):
     with open(LOG_FILE, "a") as f:
         f.write(f"[{datetime.now()}] {message}\n")
-
-
-def get_cpu_usage():
-    with open('/proc/stat', 'r') as f:
-        line = f.readline()
-        values = list(map(int, line.split()[1:]))
-        idle = values[3]
-        total = sum(values)
-    return idle, total
-
-
-def calculate_cpu():
-    idle1, total1 = get_cpu_usage()
-    time.sleep(1)
-    idle2, total2 = get_cpu_usage()
-
-    idle_delta = idle2 - idle1
-    total_delta = total2 - total1
-
-    cpu_usage = 100 * (1 - idle_delta / total_delta)
-    return round(cpu_usage, 2)
-
-
-def get_memory_usage():
-    with open('/proc/meminfo', 'r') as f:
-        lines = f.readlines()
-
-    mem_total = int(lines[0].split()[1])
-    mem_available = int(lines[2].split()[1])
-
-    mem_used = mem_total - mem_available
-    usage = (mem_used / mem_total) * 100
-    return round(usage, 2)
-
-
-def get_io_wait():
-    with open('/proc/stat', 'r') as f:
-        line = f.readline()
-        values = list(map(int, line.split()[1:]))
-        iowait = values[4]
-        total = sum(values)
-
-    return round((iowait / total) * 100, 2)
-
-
-def compute_stress(cpu, memory, io):
-    score = (0.5 * cpu + 0.3 * memory + 0.2 * io) / 100
-    return round(score, 2)
-
 
 def classify(score):
     if score < 0.25:
