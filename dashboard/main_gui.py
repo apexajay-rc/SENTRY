@@ -1,20 +1,17 @@
 import flet as ft
 import time
-import subprocess
 import threading
 from collections import deque
-from core.metrics import calculate_cpu, get_memory_usage, get_io_wait, compute_stress
+
+from core.platform_adapter import (
+    calculate_cpu,
+    get_memory_usage,
+    get_io_wait
+)
+from core.metrics import compute_stress
 
 stress_history = deque(maxlen=10)
 
-
-def get_cpu_usage():
-    with open('/proc/stat', 'r') as f:
-        line = f.readline()
-        values = list(map(int, line.split()[1:]))
-        idle = values[3]
-        total = sum(values)
-    return idle, total
 
 def classify(score, mode):
     if mode == "Gaming":
@@ -40,28 +37,7 @@ def trend_status():
     first = list(stress_history)[:2]
     last = list(stress_history)[-2:]
 
-    if sum(last) > sum(first):
-        return "Rising"
-    return "Stable"
-
-
-def get_top_processes():
-    rows = []
-
-    try:
-        output = subprocess.check_output(
-            ["ps", "-eo", "comm,%cpu", "--sort=-%cpu"]
-        ).decode().splitlines()
-
-        for line in output[1:4]:
-            parts = line.split()
-            if len(parts) >= 2:
-                rows.append(f"{parts[0]} : {parts[1]}%")
-
-        return "\n".join(rows)
-
-    except:
-        return "Unavailable"
+    return "Rising" if sum(last) > sum(first) else "Stable"
 
 
 def decision_engine(level, trend):
@@ -89,7 +65,6 @@ def sparkline():
 
 
 def main(page: ft.Page):
-
     page.title = "SENTRY"
     page.theme_mode = "dark"
     page.window_width = 1200
@@ -104,7 +79,6 @@ def main(page: ft.Page):
     stress_text = ft.Text(size=22, weight="bold")
     level_text = ft.Text(size=24, weight="bold")
 
-    process_text = ft.Text(size=18)
     trend_text = ft.Text(size=18)
     action_text = ft.Text(size=18)
 
@@ -143,12 +117,10 @@ def main(page: ft.Page):
         level_text.value = f"System Level: {level}"
         level_text.color = color
 
-        process_text.value = f"Top Processes:\n{get_top_processes()}"
         trend_text.value = f"Trend: {trend}"
-
         action_text.value = f"Mode: {mode}"
-        spark_text.value = sparkline()
 
+        spark_text.value = sparkline()
         decision_text.value = f"Decision Engine: {decision_engine(level, trend)}"
 
         page.update()
@@ -175,7 +147,6 @@ def main(page: ft.Page):
     ], expand=2)
 
     right = ft.Column([
-        ft.Card(ft.Container(process_text, padding=20)),
         ft.Card(ft.Container(trend_text, padding=20)),
         ft.Card(ft.Container(action_text, padding=20)),
         ft.Card(ft.Container(mode_dropdown, padding=20)),
