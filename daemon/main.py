@@ -1,6 +1,5 @@
 import time
 import os
-import signal
 from collections import deque
 from datetime import datetime
 
@@ -11,14 +10,16 @@ from core.platform_adapter import (
     get_top_process,
     PLATFORM
 )
+
 from core.metrics import compute_stress
 from core.policy import classify_basic
+from core.actions import reduce_priority, noop
+
 
 LOG_FILE = "sentry_log.txt"
 
 stress_history = deque(maxlen=5)
 last_mitigated = {}
-paused_processes = {}
 
 CRITICAL_PROCESSES = [
     "systemd",
@@ -31,7 +32,6 @@ CRITICAL_PROCESSES = [
 ]
 
 COOLDOWN_SECONDS = 15
-RESUME_SECONDS = 10
 
 
 def log_event(message):
@@ -49,43 +49,12 @@ def trend_rising():
     return sum(second_half) / len(second_half) > sum(first_half) / len(first_half)
 
 
-def reduce_priority(pid):
-    os.system(f"renice +5 -p {pid}")
-    return f"Priority reduced for PID {pid}"
-
-
-def pause_process(pid):
-    os.kill(int(pid), signal.SIGSTOP)
-    paused_processes[pid] = time.time()
-    return f"Process paused PID {pid}"
-
-
-def resume_process(pid):
-    os.kill(int(pid), signal.SIGCONT)
-    return f"Process resumed PID {pid}"
-
-
-def kill_process(pid):
-    os.kill(int(pid), signal.SIGTERM)
-    return f"Process terminated PID {pid}"
-
-
-print(f"[SENTRY] Autonomous Daemon Started ({PLATFORM})\n")
+print(f"[SENTRY] Safe Daemon Started ({PLATFORM})\n")
 
 while True:
     current_time = time.time()
 
-    # Resume paused processes
-    for pid in list(paused_processes.keys()):
-        if current_time - paused_processes[pid] > RESUME_SECONDS:
-            try:
-                result = resume_process(pid)
-                log_event(result)
-                del paused_processes[pid]
-            except:
-                del paused_processes[pid]
-
-    # Metrics
+    # Collect metrics
     cpu = calculate_cpu()
     memory = get_memory_usage()
     io = get_io_wait()
@@ -99,26 +68,31 @@ while True:
 
     action = "No action executed"
 
-    # Disable control on non-Linux
+    # Platform guard
     if PLATFORM != "Linux":
-        action = "Control disabled (non-Linux platform)"
+        action = "Monitoring only (control disabled on this platform)"
 
-    elif pid and name not in CRITICAL_PROCESSES and trend_rising():
+    elif not pid or not name:
+        action = "No valid target"
 
+    elif name in CRITICAL_PROCESSES:
+        action = f"Skipped critical process ({name})"
+
+    elif not trend_rising():
+        action = "No rising trend detected"
+
+    else:
+        # Cooldown check
         if pid in last_mitigated and current_time - last_mitigated[pid] < COOLDOWN_SECONDS:
             action = "Cooldown active"
 
         else:
-            if level == "MODERATE":
+            # Safe control strategy
+            if level in ["MODERATE", "HIGH", "CRITICAL"]:
                 action = reduce_priority(pid)
-
-            elif level == "HIGH":
-                action = pause_process(pid)
-
-            elif level == "CRITICAL":
-                action = kill_process(pid)
-
-            last_mitigated[pid] = current_time
+                last_mitigated[pid] = current_time
+            else:
+                action = "System stable"
 
     output = (
         f"CPU={cpu}% | MEM={memory}% | IO={io}% | "
