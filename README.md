@@ -1,130 +1,291 @@
-# SENTRY — System Stress Monitoring & Control
+# SENTRY — System Pressure Monitoring & Control
 
-SENTRY is a Linux systems project that explores how resource pressure can be detected, visualized, and managed in real time.
+SENTRY is a systems-level monitoring project that detects resource contention, classifies system pressure, and applies safe mitigation through Linux cgroups v2. It demonstrates practical approaches to real-time system observability and autonomous resource management.
 
-It consists of two core components:
-- **Dashboard** → visualizes system state
-- **Daemon** → monitors and applies mitigation actions
+The architecture follows a clean pipeline: **sense** → **analyze** → **decide** → **act**.
+
+---
+
+## Overview
+
+SENTRY monitors CPU, memory, and I/O pressure in real time, computes a unified stress score, and applies corrective actions via cgroups-based resource throttling. The project is designed to preserve system responsiveness under load while maintaining safety and predictability.
+
+**Key Design Principles:**
+- No process termination (only resource constraints)
+- Cgroups v2-based throttling (kernel-enforced limits)
+- Cross-platform abstraction (Linux + Windows monitoring)
+- Safe-by-design mitigation (reversible actions)
+
+---
+
+## Architecture
+
+SENTRY is structured around four layers:
+
+```
+┌─────────────────────────────────────────┐
+│  Dashboard (Flet UI)                    │  ← Visualization
+├─────────────────────────────────────────┤
+│  Policy Layer (classify_basic)          │  ← Decision logic
+├─────────────────────────────────────────┤
+│  Metrics Layer (compute_stress)         │  ← Analysis
+├─────────────────────────────────────────┤
+│  Platform Adapter (Linux / Windows)     │  ← Abstraction
+└─────────────────────────────────────────┘
+```
+
+### Components
+
+- **`core/platform_adapter.py`** — OS abstraction layer
+  - Reads `/proc/stat`, `/proc/meminfo`, `/proc/diskstats` (Linux)
+  - Reads WMI, Performance Counters (Windows)
+  - Exports `PLATFORM` constant and metric functions
+
+- **`core/metrics.py`** — Stress score computation
+  - Normalizes CPU, memory, I/O into `[0, 1]` range
+  - Weighted average stress calculation
+  - Trend analysis (rising vs. stable)
+
+- **`core/policy.py`** — Classification engine
+  - Maps stress score to severity levels (LOW → MODERATE → HIGH → CRITICAL)
+  - Configurable thresholds
+
+- **`daemon/main.py`** — Autonomous agent
+  - Monitors system state in control loop
+  - Applies cgroups v2 limits on high pressure
+  - Logs all actions for audit
+
+- **`dashboard/main-gui.py`** — Real-time visualization
+  - Stress sparkline graphs
+  - Live metric display
+  - Read-only (no control actions)
 
 ---
 
 ## Features
 
 ### Monitoring
-- CPU usage tracking from `/proc/stat`
-- Memory usage tracking from `/proc/meminfo`
-- I/O wait estimation
-- Unified stress score computation
+- **CPU Usage** — parsed from `/proc/stat` (user + system time)
+- **Memory Usage** — RSS + swap from `/proc/meminfo`
+- **I/O Wait** — estimated from `/proc/diskstats` or performance counters
+- **Top Process Identification** — current highest-load process
 
 ### Analysis
-- Stress classification:
-  - LOW
-  - MODERATE
-  - HIGH
-  - CRITICAL
-- Trend detection (Rising / Stable)
-- Top process identification
+- **Unified Stress Score** — weighted combination of normalized metrics
+- **Classification** — LOW, MODERATE, HIGH, CRITICAL
+- **Trend Detection** — identifies rising vs. stable patterns (5-sample window)
+- **Process-Level Scoring** — ranks processes by resource contribution
 
 ### Control (Daemon)
-- Priority reduction (`renice`)
-- Process pause/resume (`SIGSTOP` / `SIGCONT`)
-- Process termination (`SIGTERM`)
-- Cooldown and safety handling
+- **CPU Throttling** — via cgroups v2 `cpu.max`
+- **Memory Limits** — via cgroups v2 `memory.max`
+- **I/O Throttling** — via cgroups v2 `io.max`
+- **Automatic Resume** — limits are time-bound and reversible
+- **Cooldown Logic** — prevents thrashing on marginal workloads
 
 ### Visualization (Dashboard)
-- Real-time UI using Flet
-- Stress sparkline graph
-- Decision suggestions
-- Mode-based tuning (Gaming / Editing / Balanced)
+- **Stress Sparklines** — historical trend at a glance
+- **Live Metrics** — CPU, memory, I/O, score, level
+- **Process List** — current top consumers
+- **Safe by Design** — read-only, no control capability
 
 ---
 
-## Architecture
+## Cross-Platform Design
 
-SENTRY is structured into two components:
+SENTRY supports both Linux and Windows through a platform abstraction layer.
 
-### Dashboard (`dashboard/`)
-- UI layer
-- Displays system metrics and trends
-- Safe (no system modification)
+### Linux
+- Primary target; full feature support
+- Metrics from `/proc` filesystem
+- Cgroups v2 for resource control
+- Tested on Ubuntu 20.04+
 
-### Daemon (`daemon/`)
-- Background process
-- Detects stress and applies mitigation
-- Interacts with system processes
+### Windows
+- Monitoring only (no cgroups equivalent)
+- Metrics from WMI and Performance Counters
+- Dashboard functional; daemon safe-disables control actions
+- Suitable for development and observability
+
+**Platform Detection:**
+```python
+from core.platform_adapter import PLATFORM
+
+if PLATFORM == "Linux":
+    # Apply cgroups limits
+else:
+    # Monitoring only
+```
 
 ---
 
-## Requirements
+## Safety Model
 
-- Linux (Ubuntu recommended)
-- Python 3.8+
-- `/proc` filesystem access
+SENTRY is designed to never make a system unresponsive:
+
+1. **No Process Killing** — only resource constraints
+2. **Time-Bounded Actions** — limits automatically expire
+3. **Cooldown Windows** — prevents action churn
+4. **Kernel Enforcement** — cgroups v2 provides hard limits
+5. **Audit Logging** — all decisions logged to `sentry_log.txt`
+6. **Safe Defaults** — conservative thresholds on first run
+
+**Action Escalation:**
+- MODERATE: 50% CPU cap, 80% memory soft limit
+- HIGH: 30% CPU cap, 60% memory hard limit
+- CRITICAL: 10% CPU cap, 40% memory hard limit (brief)
 
 ---
 
 ## Setup
 
-### 1. Clone the repository
+### Requirements
+- **Linux:** Ubuntu 20.04+ with cgroups v2 enabled
+- **Windows:** Windows 10 Build 19041+
+- **Python:** 3.8+
+- **Dependencies:** `flet`, `psutil` (Linux/Windows metrics)
 
-    git clone https://github.com/apexajay-rc/SENTRY.git
-    cd SENTRY
+### Installation
 
----
+```bash
+git clone https://github.com/apexajay-rc/SENTRY.git
+cd SENTRY
 
-### 2. Create virtual environment
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-    python3 -m venv venv
-    source venv/bin/activate
-
----
-
-### 3. Install dependencies
-
-    pip install -r requirements.txt
-
----
-
-## How to Run
-
-### Run Dashboard
-
-    cd dashboard
-    python main-gui.py
+pip install -r requirements.txt
+```
 
 ---
 
-### Run Daemon
+## Running
 
-    cd daemon
-    python main.py
+### Dashboard (Monitoring Only)
+```bash
+cd dashboard
+python main-gui.py
+```
+
+Displays real-time metrics and trends. Safe to run on any system.
+
+### Daemon (Linux Only)
+```bash
+cd daemon
+sudo python main.py  # Requires privileges for cgroups
+```
+
+Runs autonomously, logs actions to `sentry_log.txt`.
+
+**Example Output:**
+```
+CPU=45% | MEM=62% | IO=3% | Stress=0.48 | Level=HIGH | Target=chrome(1234) | Action=cpu_throttled_to_50%
+```
 
 ---
 
-## Example Output (Daemon)
+## Configuration
 
-    CPU=45% | MEM=62% | IO=3% | Stress=0.48 | Level=HIGH | Target=chrome(1234) | Action=Priority reduced
+Edit values in `daemon/main.py`:
+
+```python
+COOLDOWN_SECONDS = 15        # Minimum time between actions
+RESUME_SECONDS = 10          # Duration of limits
+CRITICAL_PROCESSES = [...]   # Never throttle these
+```
+
+Thresholds in `core/policy.py`:
+
+```python
+THRESHOLDS = {
+    "MODERATE": 0.50,
+    "HIGH": 0.70,
+    "CRITICAL": 0.85,
+}
+```
+
+---
+
+## Project Structure
+
+```
+SENTRY/
+├── core/
+│   ├── platform_adapter.py   # OS abstraction (CPU, memory, I/O)
+│   ├── metrics.py            # Stress score computation
+│   └── policy.py             # Classification logic
+├── daemon/
+│   └── main.py               # Control loop and actions
+├── dashboard/
+│   └── main-gui.py           # Flet UI
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Roadmap
+
+### Near-term
+- [ ] PSI (Pressure Stall Information) integration for true contention signals
+- [ ] Configuration file support (`.yaml`)
+- [ ] Structured logging (JSON output)
+
+### Medium-term
+- [ ] Per-cgroup policy configuration
+- [ ] Historical metrics database (InfluxDB/Prometheus export)
+- [ ] Web dashboard (FastAPI + React)
+
+### Long-term
+- [ ] Machine learning-based workload classification
+- [ ] Predictive throttling (before pressure peaks)
+- [ ] Windows cgroups equivalent (Job Objects) support
 
 ---
 
 ## Limitations
 
-- Uses polling-based monitoring (not event-driven)
-- Relies on aggregate metrics (not true contention signals)
-- Process control is reactive
-- Some actions (pause/kill) may impact system stability if misused
+- **Polling-based:** Uses 3-second sampling intervals (not event-driven)
+- **Aggregate metrics:** Detects system-wide pressure, not per-application contention
+- **Cgroups v2 required:** Limits features on older Linux kernels
+- **Root access:** Daemon requires elevated privileges
 
 ---
 
-## Future Work
+## Testing
 
-- Replace polling with Linux PSI (Pressure Stall Information)
-- Introduce cgroup-based resource control
-- Add workload classification (foreground vs background)
-- Improve decision accuracy with better signals
+Run the dashboard on any platform to validate metric collection:
+
+```bash
+python dashboard/main-gui.py
+```
+
+On Linux, validate cgroups integration:
+
+```bash
+sudo python daemon/main.py &
+watch cat sentry_log.txt
+```
+
+---
+
+## Contributing
+
+Issues and pull requests welcome. Please include:
+- System details (kernel version, Python version)
+- Reproduction steps
+- Relevant log entries
 
 ---
 
 ## License
 
-MIT License
+MIT License. See LICENSE file for details.
+
+---
+
+## References
+
+- Linux cgroups v2: https://docs.kernel.org/admin-guide/cgroup-v2.html
+- Pressure Stall Information (PSI): https://www.kernel.org/doc/html/latest/accounting/psi.html
+- Flet Documentation: https://flet.dev/
