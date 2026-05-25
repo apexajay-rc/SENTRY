@@ -1,291 +1,367 @@
 # SENTRY — System Pressure Monitoring & Control
 
-SENTRY is a systems-level monitoring project that detects resource contention, classifies system pressure, and applies safe mitigation through Linux cgroups v2. It demonstrates practical approaches to real-time system observability and autonomous resource management.
+> **Real-time resource pressure detection and safe mitigation for Linux systems.**  
+> Autonomous daemon + observability dashboard. No process killing. Kernel-enforced limits via cgroups v2.
 
-The architecture follows a clean pipeline: **sense** → **analyze** → **decide** → **act**.
-
----
-
-## Overview
-
-SENTRY monitors CPU, memory, and I/O pressure in real time, computes a unified stress score, and applies corrective actions via cgroups-based resource throttling. The project is designed to preserve system responsiveness under load while maintaining safety and predictability.
-
-**Key Design Principles:**
-- No process termination (only resource constraints)
-- Cgroups v2-based throttling (kernel-enforced limits)
-- Cross-platform abstraction (Linux + Windows monitoring)
-- Safe-by-design mitigation (reversible actions)
+![SENTRY Overview](https://img.shields.io/badge/Linux-Primary-FCC624?logo=linux&logoColor=black) ![Python](https://img.shields.io/badge/Python-3.8+-3776ab?logo=python&logoColor=white) ![cgroups v2](https://img.shields.io/badge/cgroups-v2-FF6B6B) ![MIT License](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
-## Architecture
+## 🎯 Why SENTRY?
 
-SENTRY is structured around four layers:
+Modern systems fail silently under resource pressure. Applications freeze. Responsiveness collapses. Logs fill with timeout errors. **SENTRY detects this before it happens.**
 
 ```
-┌─────────────────────────────────────────┐
-│  Dashboard (Flet UI)                    │  ← Visualization
-├─────────────────────────────────────────┤
-│  Policy Layer (classify_basic)          │  ← Decision logic
-├─────────────────────────────────────────┤
-│  Metrics Layer (compute_stress)         │  ← Analysis
-├─────────────────────────────────────────┤
-│  Platform Adapter (Linux / Windows)     │  ← Abstraction
-└─────────────────────────────────────────┘
+Without SENTRY:
+  Chrome eats 95% CPU → System unresponsive → User loses work → OOM killer terminates random processes
+
+With SENTRY:
+  Chrome CPU spike detected → Pressure score rises → Limits applied → Chrome throttled to 40% → System stays responsive
 ```
 
-### Components
-
-- **`core/platform_adapter.py`** — OS abstraction layer
-  - Reads `/proc/stat`, `/proc/meminfo`, `/proc/diskstats` (Linux)
-  - Reads WMI, Performance Counters (Windows)
-  - Exports `PLATFORM` constant and metric functions
-
-- **`core/metrics.py`** — Stress score computation
-  - Normalizes CPU, memory, I/O into `[0, 1]` range
-  - Weighted average stress calculation
-  - Trend analysis (rising vs. stable)
-
-- **`core/policy.py`** — Classification engine
-  - Maps stress score to severity levels (LOW → MODERATE → HIGH → CRITICAL)
-  - Configurable thresholds
-
-- **`daemon/main.py`** — Autonomous agent
-  - Monitors system state in control loop
-  - Applies cgroups v2 limits on high pressure
-  - Logs all actions for audit
-
-- **`dashboard/main-gui.py`** — Real-time visualization
-  - Stress sparkline graphs
-  - Live metric display
-  - Read-only (no control actions)
+**Real use case:** Development laptop with Kubernetes + IDE + browser = resource chaos. SENTRY keeps it usable.
 
 ---
 
-## Features
+## 🏗️ Architecture
 
-### Monitoring
-- **CPU Usage** — parsed from `/proc/stat` (user + system time)
-- **Memory Usage** — RSS + swap from `/proc/meminfo`
-- **I/O Wait** — estimated from `/proc/diskstats` or performance counters
-- **Top Process Identification** — current highest-load process
+The core loop runs every 3 seconds:
 
-### Analysis
-- **Unified Stress Score** — weighted combination of normalized metrics
-- **Classification** — LOW, MODERATE, HIGH, CRITICAL
-- **Trend Detection** — identifies rising vs. stable patterns (5-sample window)
-- **Process-Level Scoring** — ranks processes by resource contribution
+```
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│   ┌─────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│   │   SENSE     │───▶│   ANALYZE    │───▶│   DECIDE     │  │
+│   │             │    │              │    │              │  │
+│   │ • CPU       │    │ • Score      │    │ • Classify   │  │
+│   │ • Memory    │    │ • Trend      │    │ • Escalate   │  │
+│   │ • I/O       │    │ • Top proc   │    │ • Cooldown   │  │
+│   └─────────────┘    └──────────────┘    └──────────────┘  │
+│                                                   │          │
+│                                                   ▼          │
+│   ┌──────────────────────────────────────────────────────┐  │
+│   │              ACT (Cgroups v2)                        │  │
+│   │  • CPU throttle (cpu.max)                            │  │
+│   │  • Memory limit (memory.max)                         │  │
+│   │  • I/O throttle (io.max)                             │  │
+│   │  ✓ All reversible, time-bounded                      │  │
+│   └──────────────────────────────────────────────────────┘  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
 
-### Control (Daemon)
-- **CPU Throttling** — via cgroups v2 `cpu.max`
-- **Memory Limits** — via cgroups v2 `memory.max`
-- **I/O Throttling** — via cgroups v2 `io.max`
-- **Automatic Resume** — limits are time-bound and reversible
-- **Cooldown Logic** — prevents thrashing on marginal workloads
+### Layered Design
 
-### Visualization (Dashboard)
-- **Stress Sparklines** — historical trend at a glance
-- **Live Metrics** — CPU, memory, I/O, score, level
-- **Process List** — current top consumers
-- **Safe by Design** — read-only, no control capability
-
----
-
-## Cross-Platform Design
-
-SENTRY supports both Linux and Windows through a platform abstraction layer.
-
-### Linux
-- Primary target; full feature support
-- Metrics from `/proc` filesystem
-- Cgroups v2 for resource control
-- Tested on Ubuntu 20.04+
-
-### Windows
-- Monitoring only (no cgroups equivalent)
-- Metrics from WMI and Performance Counters
-- Dashboard functional; daemon safe-disables control actions
-- Suitable for development and observability
-
-**Platform Detection:**
 ```python
-from core.platform_adapter import PLATFORM
-
-if PLATFORM == "Linux":
-    # Apply cgroups limits
-else:
-    # Monitoring only
+┌─────────────────────────────────────────────────┐
+│         Dashboard (Flet UI)                      │  🖥️  Read-only visualization
+├─────────────────────────────────────────────────┤
+│         Policy Layer (classify_basic)           │  🤖  Decision engine
+├─────────────────────────────────────────────────┤
+│         Metrics Layer (compute_stress)          │  📊  Stress score math
+├─────────────────────────────────────────────────┤
+│         Platform Adapter (Linux/Windows)        │  🔌  OS abstraction
+├─────────────────────────────────────────────────┤
+│         Kernel (cgroups v2, /proc)              │  🐧  System reality
+└─────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Safety Model
+## ✨ Features at a Glance
 
-SENTRY is designed to never make a system unresponsive:
+| Feature | Details | Linux | Windows |
+|---------|---------|-------|---------|
+| **Metrics** | CPU, memory, I/O from kernel | ✅ `/proc/stat` | ✅ WMI |
+| **Stress Score** | Unified [0, 1] metric | ✅ Real-time | ✅ Real-time |
+| **Classification** | LOW → MODERATE → HIGH → CRITICAL | ✅ 4 levels | ✅ 4 levels |
+| **Trend Detection** | Rising vs. stable (5-sample window) | ✅ | ✅ |
+| **Top Process ID** | Which process is heaviest? | ✅ | ✅ |
+| **CPU Throttling** | cgroups v2 `cpu.max` | ✅ Kernel-enforced | ❌ N/A |
+| **Memory Limits** | cgroups v2 `memory.max` | ✅ Kernel-enforced | ❌ N/A |
+| **I/O Throttling** | cgroups v2 `io.max` | ✅ Kernel-enforced | ❌ N/A |
+| **Automatic Resume** | Time-bounded limits (10s default) | ✅ | ✅ |
+| **Audit Logging** | JSON action log | ✅ | ✅ |
+| **Dashboard UI** | Real-time graphs + sparklines | ✅ Flet | ✅ Flet |
 
-1. **No Process Killing** — only resource constraints
-2. **Time-Bounded Actions** — limits automatically expire
-3. **Cooldown Windows** — prevents action churn
-4. **Kernel Enforcement** — cgroups v2 provides hard limits
-5. **Audit Logging** — all decisions logged to `sentry_log.txt`
-6. **Safe Defaults** — conservative thresholds on first run
+---
+
+## 🔒 Safety Model
+
+SENTRY is **paranoid by design**. It will never:
+
+- 🚫 Kill a process (only throttle)
+- 🚫 Leave limits in place (10-second auto-reset)
+- 🚫 Act repeatedly on the same threshold (15-second cooldown)
+- 🚫 Throttle critical processes (systemd, Xorg, pipewire, etc.)
+- 🚫 Control anything outside Linux (Windows = monitoring only)
 
 **Action Escalation:**
-- MODERATE: 50% CPU cap, 80% memory soft limit
-- HIGH: 30% CPU cap, 60% memory hard limit
-- CRITICAL: 10% CPU cap, 40% memory hard limit (brief)
+
+```
+Pressure Score → Level        → CPU Limit   → Memory Limit   → I/O Throttle
+─────────────────────────────────────────────────────────────────────────
+0.50 — 0.69  → MODERATE       → 50%         → Soft (warn)    → 50%
+0.70 — 0.84  → HIGH           → 30%         → Hard (limit)   → 30%
+0.85+        → CRITICAL       → 10%         → Hard + compact → 10%
+```
+
+All limits are **reversed automatically** after `RESUME_SECONDS` (default 10s).
 
 ---
 
-## Setup
+## 📦 Installation
 
 ### Requirements
-- **Linux:** Ubuntu 20.04+ with cgroups v2 enabled
-- **Windows:** Windows 10 Build 19041+
-- **Python:** 3.8+
-- **Dependencies:** `flet`, `psutil` (Linux/Windows metrics)
 
-### Installation
+```
+✓ Linux: Ubuntu 20.04+ (cgroups v2 enabled by default)
+✓ Python: 3.8+
+✓ Privileges: Root/sudo for cgroups (daemon only)
+```
+
+**Check cgroups v2:**
+```bash
+mount | grep cgroup2
+# Output: cgroup2 on /sys/fs/cgroup type cgroup2 (...)
+```
+
+### Setup (5 minutes)
 
 ```bash
+# 1. Clone
 git clone https://github.com/apexajay-rc/SENTRY.git
 cd SENTRY
 
+# 2. Virtual environment
 python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate
 
+# 3. Install
 pip install -r requirements.txt
 ```
 
 ---
 
-## Running
+## 🚀 Running
 
-### Dashboard (Monitoring Only)
+### Dashboard (Safe — no privileges needed)
+
 ```bash
 cd dashboard
 python main-gui.py
 ```
 
-Displays real-time metrics and trends. Safe to run on any system.
-
-### Daemon (Linux Only)
-```bash
-cd daemon
-sudo python main.py  # Requires privileges for cgroups
-```
-
-Runs autonomously, logs actions to `sentry_log.txt`.
-
-**Example Output:**
-```
-CPU=45% | MEM=62% | IO=3% | Stress=0.48 | Level=HIGH | Target=chrome(1234) | Action=cpu_throttled_to_50%
-```
+**Output:** Real-time graphs, stress trends, top processes.  
+**Safe on:** Any system (read-only monitoring).
 
 ---
 
-## Configuration
+### Daemon (Linux only — requires root)
 
-Edit values in `daemon/main.py`:
-
-```python
-COOLDOWN_SECONDS = 15        # Minimum time between actions
-RESUME_SECONDS = 10          # Duration of limits
-CRITICAL_PROCESSES = [...]   # Never throttle these
+```bash
+cd daemon
+sudo python main.py
 ```
 
-Thresholds in `core/policy.py`:
+**Output:** Control loop, applied actions, audit log.
+
+```
+[2026-05-25 14:23:45.123] CPU=45% | MEM=62% | IO=3% | Stress=0.48 | Level=HIGH | Target=chrome(1234) | Action=cpu_throttled_to_50%
+[2026-05-25 14:23:48.456] CPU=32% | MEM=59% | IO=1% | Stress=0.38 | Level=MODERATE | Target=chrome(1234) | Action=limit_expired_resumed
+```
+
+**Logs saved to:** `sentry_log.txt`
+
+---
+
+## ⚙️ Configuration
+
+### Daemon Behavior (`daemon/main.py`)
+
+```python
+COOLDOWN_SECONDS = 15        # Min time between actions on same PID
+RESUME_SECONDS = 10          # Auto-reset limits after this duration
+CRITICAL_PROCESSES = [       # Never throttle these
+    "systemd",
+    "gnome-shell",
+    "Xorg",
+    "pulseaudio",
+    "pipewire",
+    "python3",  # The daemon itself
+    "ps"
+]
+```
+
+### Stress Thresholds (`core/policy.py`)
 
 ```python
 THRESHOLDS = {
+    "LOW": 0.35,
     "MODERATE": 0.50,
     "HIGH": 0.70,
     "CRITICAL": 0.85,
 }
 ```
 
+Adjust for your workload:
+- **Gaming rig:** Higher thresholds (0.80, 0.90)
+- **Development laptop:** Conservative (0.40, 0.60)
+- **Server:** Aggressive (0.30, 0.50)
+
 ---
 
-## Project Structure
+## 📂 Project Structure
 
 ```
 SENTRY/
 ├── core/
-│   ├── platform_adapter.py   # OS abstraction (CPU, memory, I/O)
-│   ├── metrics.py            # Stress score computation
-│   └── policy.py             # Classification logic
+│   ├── platform_adapter.py   # 🔌 Linux (/proc) + Windows (WMI)
+│   ├── metrics.py            # 📊 Stress score + normalization
+│   └── policy.py             # 🤖 Classification logic
 ├── daemon/
-│   └── main.py               # Control loop and actions
+│   └── main.py               # 🔄 Control loop + cgroups interface
 ├── dashboard/
-│   └── main-gui.py           # Flet UI
+│   └── main-gui.py           # 🖥️  Flet UI (graphs + metrics)
 ├── requirements.txt
+├── sentry_log.txt            # 📝 Audit trail (auto-generated)
 └── README.md
 ```
 
 ---
 
-## Roadmap
+## 🔍 Observability
 
-### Near-term
-- [ ] PSI (Pressure Stall Information) integration for true contention signals
-- [ ] Configuration file support (`.yaml`)
-- [ ] Structured logging (JSON output)
+### Example: Stress Score Composition
 
-### Medium-term
-- [ ] Per-cgroup policy configuration
-- [ ] Historical metrics database (InfluxDB/Prometheus export)
-- [ ] Web dashboard (FastAPI + React)
+```
+CPU=45%  ──→  Normalize [0,1]  ──→  0.45
+MEM=62%  ──→  Normalize [0,1]  ──→  0.62
+IO=3%    ──→  Normalize [0,1]  ──→  0.03
 
-### Long-term
-- [ ] Machine learning-based workload classification
-- [ ] Predictive throttling (before pressure peaks)
-- [ ] Windows cgroups equivalent (Job Objects) support
+Stress = (0.45 * 0.50) + (0.62 * 0.35) + (0.03 * 0.15) = 0.485
+         └─ CPU weight ─┘  └─ MEM weight ─┘  └─ IO weight ┘
 
----
+Score 0.485 → Level = MODERATE → Apply limits
+```
 
-## Limitations
-
-- **Polling-based:** Uses 3-second sampling intervals (not event-driven)
-- **Aggregate metrics:** Detects system-wide pressure, not per-application contention
-- **Cgroups v2 required:** Limits features on older Linux kernels
-- **Root access:** Daemon requires elevated privileges
+Adjust weights in `core/metrics.py` for your hardware profile.
 
 ---
 
-## Testing
+## 🛣️ Roadmap
 
-Run the dashboard on any platform to validate metric collection:
+### Q2 2026 (Near-term)
+- [ ] **PSI Integration** — Replace polling with Linux Pressure Stall Information (`/proc/pressure/*`)
+- [ ] **YAML Config** — External configuration file instead of hardcoded thresholds
+- [ ] **JSON Logging** — Structured logs for ELK/Datadog integration
+
+### Q3 2026 (Medium-term)
+- [ ] **Per-Cgroup Policies** — Different limits for different workload types
+- [ ] **Prometheus Export** — `/metrics` endpoint for monitoring stacks
+- [ ] **Web Dashboard** — FastAPI + React (replace Flet)
+
+### Q4 2026 (Long-term)
+- [ ] **ML-Based Classification** — Predict pressure before it happens
+- [ ] **Windows Job Objects** — Full control parity on Windows
+- [ ] **Systemd Integration** — Native service unit + transient scopes
+
+---
+
+## ⚠️ Limitations & Tradeoffs
+
+| Aspect | Current | Future |
+|--------|---------|--------|
+| **Signaling** | Polling every 3s | PSI (event-driven) |
+| **Scope** | System-wide aggregate | Per-application, per-cgroup |
+| **Control** | cgroups v2 throttling | + Predictive limits |
+| **Platform** | Linux only (W10 read-only) | + Windows Job Objects |
+| **Persistence** | Text logs | + Metrics DB (Prometheus) |
+
+**When SENTRY isn't enough:**
+- Need per-thread CPU affinity → Use `taskset`
+- Need network rate limiting → Use `tc` (traffic control)
+- Need memory swap tuning → Use `sysctl` directly
+
+---
+
+## 🧪 Testing
+
+### Validate Metrics Collection
 
 ```bash
 python dashboard/main-gui.py
 ```
 
-On Linux, validate cgroups integration:
+Watch CPU, memory, I/O update in real-time across platforms.
+
+### Stress Test the Daemon
 
 ```bash
-sudo python daemon/main.py &
-watch cat sentry_log.txt
+# Terminal 1: Run daemon
+cd daemon
+sudo python main.py
+
+# Terminal 2: Watch logs
+watch tail -50 sentry_log.txt
+
+# Terminal 3: Generate load
+stress-ng --cpu 4 --vm 1 --vm-bytes 500M --timeout 60s
+```
+
+Expect to see:
+1. Stress score rises
+2. Level escalates to HIGH/CRITICAL
+3. Actions logged (`cpu_throttled_to_30%`, etc.)
+4. Process CPU% drops in logs
+5. After 10s, limits auto-reset
+
+---
+
+## 🤝 Contributing
+
+We welcome:
+- 🐛 Bug reports (include `uname -a`, `python --version`, logs)
+- ✨ Feature requests (with use cases)
+- 🔧 PRs (follow existing style, add tests)
+
+**Before opening an issue:**
+```bash
+python dashboard/main-gui.py  # Does it work?
+sudo python daemon/main.py &  # Any errors?
+cat sentry_log.txt            # What's logged?
 ```
 
 ---
 
-## Contributing
+## 📚 References
 
-Issues and pull requests welcome. Please include:
-- System details (kernel version, Python version)
-- Reproduction steps
-- Relevant log entries
-
----
-
-## License
-
-MIT License. See LICENSE file for details.
+| Topic | Link |
+|-------|------|
+| cgroups v2 | https://docs.kernel.org/admin-guide/cgroup-v2.html |
+| PSI (Pressure Stall Information) | https://www.kernel.org/doc/html/latest/accounting/psi.html |
+| Flet UI Framework | https://flet.dev/ |
+| Linux /proc | https://man7.org/linux/man-pages/man5/proc.5.html |
+| cgroup Interfaces | https://www.man7.org/linux/man-pages/man7/cgroups.7.html |
 
 ---
 
-## References
+## 📄 License
 
-- Linux cgroups v2: https://docs.kernel.org/admin-guide/cgroup-v2.html
-- Pressure Stall Information (PSI): https://www.kernel.org/doc/html/latest/accounting/psi.html
-- Flet Documentation: https://flet.dev/
+MIT License — Use, modify, distribute freely. See [LICENSE](LICENSE) for details.
+
+---
+
+## 💡 Inspiration & Context
+
+Built during the era of:
+- **Cloud-native complexity** — Kubernetes, containers, microservices
+- **AI/ML resource hunger** — LLMs, model training, inference servers
+- **Developer ergonomics** — Keeping laptops responsive under load
+- **Kernel capabilities maturity** — cgroups v2 now stable across distributions
+
+SENTRY is a response to: *"Why does my system freeze when I compile code + train ML models + stream video?"*
+
+---
+
+**Made by [apexajay-rc](https://github.com/apexajay-rc) · Questions? Open an [issue](https://github.com/apexajay-rc/SENTRY/issues).**
