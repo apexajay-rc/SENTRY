@@ -14,6 +14,10 @@ from core.platform_adapter import (
 from core.metrics import compute_stress
 from core.policy import classify_basic
 from core.actions import reduce_priority, noop
+from core.cgroups import setup_cgroup, add_process, set_cpu_weight
+
+if PLATFORM == "Linux":
+    setup_cgroup()
 
 
 LOG_FILE = "sentry_log.txt"
@@ -89,7 +93,9 @@ while True:
         else:
             # Safe control strategy
             if level in ["MODERATE", "HIGH", "CRITICAL"]:
-                action = reduce_priority(pid)
+                add_process(pid)
+                set_cpu_weight(50)
+                action = f"cgroup throttle applied (PID {pid})"
                 last_mitigated[pid] = current_time
             else:
                 action = "System stable"
