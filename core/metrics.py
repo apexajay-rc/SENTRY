@@ -1,17 +1,37 @@
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from core.procfs import (
     PROC_ROOT,
     CpuStatSnapshot,
-    PsiReading,
     cpu_usage_percent,
     io_wait_percent,
     read_memory_usage_percent,
     read_psi,
     read_system_stat,
 )
+
+if TYPE_CHECKING:
+    from core.config import ConfigManager
+
+DEFAULT_METRIC_WEIGHTS = {
+    "cpu_weight": 0.5,
+    "memory_weight": 0.3,
+    "io_weight": 0.2,
+}
+
+_metric_weights = DEFAULT_METRIC_WEIGHTS.copy()
+
+
+def configure_metrics(config: "ConfigManager") -> None:
+    global _metric_weights
+    weights = config.metric_weights()
+    _metric_weights = {
+        "cpu_weight": weights.get("cpu_weight", DEFAULT_METRIC_WEIGHTS["cpu_weight"]),
+        "memory_weight": weights.get("memory_weight", DEFAULT_METRIC_WEIGHTS["memory_weight"]),
+        "io_weight": weights.get("io_weight", DEFAULT_METRIC_WEIGHTS["io_weight"]),
+    }
 
 
 @dataclass(frozen=True)
@@ -25,16 +45,31 @@ class SystemMetrics:
     psi_io_some_avg10: Optional[float] = None
 
 
-def compute_stress(cpu: float, memory: float, io: float) -> float:
-    return round((0.5 * cpu + 0.3 * memory + 0.2 * io) / 100, 2)
+def compute_stress(
+    cpu: float,
+    memory: float,
+    io: float,
+    weights: Optional[dict[str, float]] = None,
+) -> float:
+    active = weights or _metric_weights
+    cpu_w = active.get("cpu_weight", DEFAULT_METRIC_WEIGHTS["cpu_weight"])
+    mem_w = active.get("memory_weight", DEFAULT_METRIC_WEIGHTS["memory_weight"])
+    io_w = active.get("io_weight", DEFAULT_METRIC_WEIGHTS["io_weight"])
+    return round((cpu_w * cpu + mem_w * memory + io_w * io) / 100, 2)
 
 
 class SystemMetricsSampler:
     """Delta-based system metrics from /proc/stat and /proc/meminfo."""
 
-    def __init__(self, proc_root: str = PROC_ROOT, interval: float = 0.5):
+    def __init__(
+        self,
+        proc_root: str = PROC_ROOT,
+        interval: float = 0.5,
+        metric_weights: Optional[dict[str, float]] = None,
+    ):
         self.proc_root = proc_root
         self.interval = interval
+        self.metric_weights = metric_weights
         self._previous: Optional[CpuStatSnapshot] = None
 
     def warmup(self) -> SystemMetrics:
@@ -52,7 +87,7 @@ class SystemMetricsSampler:
                 cpu_percent=0.0,
                 memory_percent=memory,
                 io_wait_percent=0.0,
-                stress_score=compute_stress(0.0, memory, 0.0),
+                stress_score=compute_stress(0.0, memory, 0.0, self.metric_weights),
                 **_read_psi_fields(self.proc_root),
             )
 
@@ -64,7 +99,7 @@ class SystemMetricsSampler:
             cpu_percent=cpu,
             memory_percent=memory,
             io_wait_percent=io,
-            stress_score=compute_stress(cpu, memory, io),
+            stress_score=compute_stress(cpu, memory, io, self.metric_weights),
             **_read_psi_fields(self.proc_root),
         )
 

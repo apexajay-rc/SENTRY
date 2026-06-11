@@ -3,6 +3,11 @@ Policy classification module for SENTRY.
 Defines stress levels and escalation thresholds.
 """
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.config import ConfigManager
+
 # Stress level thresholds (customize based on workload)
 THRESHOLDS = {
     "LOW": 0.35,
@@ -34,6 +39,23 @@ ESCALATION_MATRIX = {
         "io_weight": 10,        # 10% I/O throttle
     },
 }
+
+
+def configure_policy(config: "ConfigManager") -> None:
+    """Apply thresholds and escalation matrix from sentry_config.yaml."""
+    global THRESHOLDS, ESCALATION_MATRIX
+
+    thresholds = config.all_thresholds()
+    THRESHOLDS = {
+        "LOW": thresholds.get("low", 0.35),
+        "MODERATE": thresholds.get("moderate", 0.50),
+        "HIGH": thresholds.get("high", 0.70),
+        "CRITICAL": thresholds.get("critical", 0.85),
+    }
+
+    ESCALATION_MATRIX = {}
+    for level in ["LOW", "MODERATE", "HIGH", "CRITICAL"]:
+        ESCALATION_MATRIX[level] = config.get_escalation_actions(level)
 
 
 def classify_basic(stress_score):

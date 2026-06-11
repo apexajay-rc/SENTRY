@@ -318,7 +318,7 @@ stress-ng --cpu 4 --vm 1 --vm-bytes 500M --timeout 60s
 
 ### Near-term
 - [ ] Weight PSI into stress score and policy decisions
-- [ ] Wire `sentry_config.yaml` into daemon runtime
+- [x] Wire `sentry_config.yaml` into daemon runtime
 - [ ] Apply memory + I/O cgroup limits from escalation matrix
 - [ ] Structured JSON audit log (`sentry_audit.json`)
 

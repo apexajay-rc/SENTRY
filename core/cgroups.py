@@ -3,15 +3,25 @@ cgroups v2 resource control module for SENTRY.
 Manages CPU, memory, and I/O limits via kernel cgroups.
 """
 
-import os
 import logging
+import os
+from typing import Optional
 
 CGROUP_PATH = "/sys/fs/cgroup/sentry_bg"
 logger = logging.getLogger(__name__)
 
 
-def setup_cgroup():
+def configure_cgroup(path: str) -> None:
+    global CGROUP_PATH
+    CGROUP_PATH = path
+
+
+def setup_cgroup(path: Optional[str] = None):
     """Initialize SENTRY cgroup hierarchy."""
+    global CGROUP_PATH
+    if path is not None:
+        CGROUP_PATH = path
+
     try:
         os.makedirs(CGROUP_PATH, exist_ok=True)
         logger.info(f"Cgroup initialized at {CGROUP_PATH}")

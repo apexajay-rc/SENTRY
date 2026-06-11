@@ -1,4 +1,3 @@
-import os
 import sys
 import time
 from collections import deque
@@ -10,38 +9,26 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.classifier import trend_label, trend_rising
-from core.cgroups import add_process, set_cpu_weight, setup_cgroup
+from core.cgroups import add_process, set_cpu_weight
+from core.config import ConfigManager
 from core.ipc import DaemonState, IpcServer, resolve_ipc_endpoint
 from core.metrics import SystemMetricsSampler, compute_stress
 from core.platform_adapter import PLATFORM
 from core.policy import classify_basic, get_action_limits
 from core.process import ProcessSampler, read_total_memory_kb
 from core.procfs import read_system_stat
+from core.runtime import init_runtime
 
-if PLATFORM == "Linux":
-    setup_cgroup()
-
-LOG_FILE = "sentry_log.txt"
-POLL_INTERVAL = 3
-COOLDOWN_SECONDS = 15
-
-CRITICAL_PROCESSES = {
-    "systemd",
-    "gnome-shell",
-    "Xorg",
-    "pulseaudio",
-    "pipewire",
-    "ps",
-}
-
-metrics_sampler = SystemMetricsSampler()
-process_sampler = ProcessSampler()
+config = init_runtime()
 daemon_state = DaemonState(platform=PLATFORM)
 ipc_server = IpcServer(daemon_state)
+metrics_sampler = SystemMetricsSampler(metric_weights=config.metric_weights())
+process_sampler = ProcessSampler()
 
 
-def log_event(message):
-    with open(LOG_FILE, "a", encoding="utf-8") as handle:
+def log_event(message: str) -> None:
+    log_path = config.text_log_file()
+    with open(log_path, "a", encoding="utf-8") as handle:
         handle.write(f"[{datetime.now()}] {message}\n")
 
 
@@ -60,20 +47,24 @@ def _format_top_processes(process_sampler, system_total_delta, total_memory_kb):
 
 def _decide_action(level, pid, name, current_time, last_mitigated, stress_history):
     snapshot = daemon_state.snapshot()
+    critical_processes = config.critical_processes_set()
+    cooldown_seconds = config.cooldown_seconds()
 
     if PLATFORM != "Linux":
         return "Monitoring only (control disabled on this platform)"
+    if not config.cgroup_enabled():
+        return "Cgroup control disabled in config"
     if snapshot["observe_only"]:
         return "Observe only (mitigation disabled)"
     if not snapshot["armed"]:
         return "Disarmed (mitigation disabled)"
     if not pid or not name:
         return "No valid target"
-    if name in CRITICAL_PROCESSES:
+    if name in critical_processes:
         return f"Skipped critical process ({name})"
     if not trend_rising(stress_history):
         return "No rising trend detected"
-    if pid in last_mitigated and current_time - last_mitigated[pid] < COOLDOWN_SECONDS:
+    if pid in last_mitigated and current_time - last_mitigated[pid] < cooldown_seconds:
         return "Cooldown active"
     if level not in ["MODERATE", "HIGH", "CRITICAL"]:
         return "System stable"
@@ -96,11 +87,14 @@ def main():
     endpoint = resolve_ipc_endpoint()
     ipc_server.start_background()
     print(f"[SENTRY] Safe Daemon Started ({PLATFORM})")
+    print(f"[SENTRY] Config: {config.config_file}")
     print(f"[SENTRY] IPC listening on {endpoint}\n")
 
     stress_history = deque(maxlen=10)
     last_mitigated = {}
     previous_stat = None
+    poll_interval = config.poll_interval()
+    critical_processes = config.critical_processes_set()
 
     if PLATFORM == "Linux":
         metrics_sampler.warmup()
@@ -127,7 +121,7 @@ def main():
             pid, name, pscore = process_sampler.top_process(
                 system_total_delta,
                 total_memory_kb,
-                protected_comm=CRITICAL_PROCESSES,
+                protected_comm=critical_processes,
             )
 
             cpu = metrics.cpu_percent
@@ -197,7 +191,7 @@ def main():
 
         print(output)
         log_event(output)
-        time.sleep(POLL_INTERVAL)
+        time.sleep(poll_interval)
 
 
 if __name__ == "__main__":

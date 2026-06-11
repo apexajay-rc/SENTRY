@@ -3,9 +3,12 @@ YAML configuration module for SENTRY.
 Loads external configuration for thresholds, limits, and behavior.
 """
 
-import yaml
+import copy
+import os
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional, Set
+
+import yaml
 
 
 DEFAULT_CONFIG = {
@@ -69,6 +72,21 @@ DEFAULT_CONFIG = {
 }
 
 
+def resolve_config_path(config_file: Optional[str] = None) -> Path:
+    if config_file:
+        return Path(config_file)
+
+    env_path = os.environ.get("SENTRY_CONFIG")
+    if env_path:
+        return Path(env_path)
+
+    return Path(__file__).resolve().parent.parent / "sentry_config.yaml"
+
+
+def load_config(config_file: Optional[str] = None) -> "ConfigManager":
+    return ConfigManager(str(resolve_config_path(config_file)))
+
+
 class ConfigManager:
     """
     Manages SENTRY configuration from YAML file.
@@ -92,22 +110,21 @@ class ConfigManager:
         Returns:
             dict: Merged configuration
         """
-        config = DEFAULT_CONFIG.copy()
-        
+        config = copy.deepcopy(DEFAULT_CONFIG)
+
         if self.config_file.exists():
             try:
-                with open(self.config_file, "r") as f:
-                    user_config = yaml.safe_load(f) or {}
-                
-                # Deep merge user config with defaults
+                with open(self.config_file, "r", encoding="utf-8") as handle:
+                    user_config = yaml.safe_load(handle) or {}
+
                 config = self._merge_dicts(config, user_config)
                 print(f"[SENTRY] Loaded config from {self.config_file}")
-                
-            except Exception as e:
-                print(f"[SENTRY] Failed to load config: {e}, using defaults")
+
+            except Exception as exc:
+                print(f"[SENTRY] Failed to load config: {exc}, using defaults")
         else:
             print(f"[SENTRY] Config file not found at {self.config_file}, using defaults")
-        
+
         return config
     
     def _merge_dicts(self, base: Dict, override: Dict) -> Dict:
@@ -199,14 +216,17 @@ class ConfigManager:
     def get_escalation_actions(self, level: str) -> Dict[str, int]:
         """
         Get resource limits for stress level.
-        
+
         Args:
-            level (str): Level name ('low', 'moderate', 'high', 'critical')
-        
+            level (str): Level name ('low', 'moderate', 'high', 'critical' or uppercase)
+
         Returns:
             dict: Actions with cpu_weight, memory_limit_percent, io_weight
         """
-        return self.get_dict(f"escalation.{level}")
+        level_key = level.lower()
+        escalation = self.get_dict("escalation")
+        defaults = DEFAULT_CONFIG["escalation"].get(level_key, {})
+        return escalation.get(level_key, defaults)
     
     # Metrics configuration
     def metric_weights(self) -> Dict[str, float]:
@@ -226,6 +246,10 @@ class ConfigManager:
     def critical_processes(self) -> list:
         """Get list of critical processes to never throttle."""
         return self.get("critical_processes", [])
+
+    def critical_processes_set(self) -> Set[str]:
+        """Get critical process names as a set for fast membership checks."""
+        return set(self.critical_processes())
     
     # Logging configuration
     def json_log_file(self) -> str:
