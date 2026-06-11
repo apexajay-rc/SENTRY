@@ -47,12 +47,13 @@ It consists of two core components:
 ```
 SENTRY/
 ??? core/
+?   ??? ipc.py         # DaemonState + JSON socket protocol
 ?   ??? procfs.py      # /proc parsing (testable via SENTRY_PROC_ROOT)
 ?   ??? metrics.py     # SystemMetricsSampler + stress score
 ?   ??? process.py     # ProcessSampler (per-PID CPU/memory)
 ?   ??? classifier.py  # Levels, trends, decision hints
-??? daemon/            # Autonomous mitigation loop
-??? dashboard/         # Flet UI (read-only)
+??? daemon/            # Mitigation loop + IPC server
+??? dashboard/         # Flet UI (IPC client, local fallback)
 ??? tests/             # Unit tests with mocked /proc fixtures
 ```
 
@@ -112,6 +113,19 @@ Run from the repository root:
 
     python daemon/main.py
 
+Start the daemon first on Linux. The dashboard connects over IPC and falls back to local polling if the daemon is not running.
+
+**IPC defaults**
+- Linux: Unix socket at `/tmp/sentry.sock` (or `$XDG_RUNTIME_DIR/sentry.sock`)
+- Windows: TCP `127.0.0.1:17481`
+- Override: `SENTRY_IPC_ENDPOINT=unix:/path/to.sock` or `SENTRY_IPC_ENDPOINT=tcp:127.0.0.1:17481`
+
+**Dashboard controls (via IPC)**
+- Mode: Gaming / Editing / Balanced
+- Armed: allow mitigation (default off)
+- Observe only: monitor without throttling (default on)
+- Dry run: log actions without applying cgroup limits
+
 ---
 
 ### Run Tests
@@ -133,17 +147,15 @@ Tests use mocked `/proc` fixtures. Override the proc root with `SENTRY_PROC_ROOT
 - Uses polling-based monitoring (not event-driven)
 - PSI is read but not yet used in stress scoring or policy
 - Process control is reactive
-- Dashboard and daemon are not yet connected over IPC
-- Some actions (pause/kill) may impact system stability if misused
+- Mitigation is off by default until dashboard arms the daemon
+- cgroup limits currently apply CPU weight only (memory/I/O limits pending)
 
 ---
 
 ## Future Work
 
 - Weight PSI into stress score and mitigation policy
-- Introduce cgroup-based resource control
-- Connect dashboard ? daemon over a socket
-- Add observe-only / dry-run defaults
+- Apply memory and I/O cgroup limits from policy escalation
 - Add workload classification (foreground vs background)
 - Benchmark suite vs systemd-oomd and earlyoom
 
