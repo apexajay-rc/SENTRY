@@ -4,7 +4,13 @@ import unittest
 from pathlib import Path
 
 from core.classifier import classify_stress, decision_hint, trend_label, trend_rising
-from core.metrics import SystemMetricsSampler, compute_stress
+from core.metrics import (
+    SystemMetricsSampler,
+    compute_psi_score,
+    compute_stress,
+    compute_stress_breakdown,
+    compute_utilization_score,
+)
 from core.process import ProcessSampler
 from core.procfs import (
     cpu_usage_percent,
@@ -121,6 +127,44 @@ class ProcessSamplerTests(unittest.TestCase):
             self.assertEqual(processes[0].comm, "worker")
             self.assertEqual(processes[0].cpu_percent, 50.0)
             self.assertEqual(processes[0].memory_percent, 25.0)
+
+
+class PsiStressTests(unittest.TestCase):
+    def test_utilization_only_when_psi_missing(self):
+        breakdown = compute_stress_breakdown(80.0, 60.0, 20.0)
+        self.assertEqual(breakdown.utilization, compute_utilization_score(80.0, 60.0, 20.0))
+        self.assertIsNone(breakdown.psi)
+        self.assertEqual(breakdown.total, breakdown.utilization)
+
+    def test_psi_increases_stress_when_utilization_is_low(self):
+        breakdown = compute_stress_breakdown(
+            20.0,
+            20.0,
+            5.0,
+            psi_cpu=50.0,
+            psi_memory=40.0,
+            psi_io=30.0,
+        )
+        self.assertLess(breakdown.utilization, breakdown.total)
+        self.assertIsNotNone(breakdown.psi)
+        assert breakdown.psi is not None
+        self.assertGreater(breakdown.psi, breakdown.utilization)
+
+    def test_high_utilization_with_low_psi_stays_lower_than_raw_util(self):
+        breakdown = compute_stress_breakdown(
+            90.0,
+            80.0,
+            10.0,
+            psi_cpu=2.0,
+            psi_memory=1.0,
+            psi_io=1.0,
+            weights={"psi_blend": 0.40},
+        )
+        self.assertLess(breakdown.total, breakdown.utilization)
+
+    def test_compute_psi_score_uses_available_signals_only(self):
+        score = compute_psi_score(40.0, None, 20.0)
+        self.assertAlmostEqual(score, 0.33)
 
 
 class ClassifierTests(unittest.TestCase):

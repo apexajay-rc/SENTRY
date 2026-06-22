@@ -49,6 +49,8 @@ class DaemonState:
     memory_percent: float = 0.0
     io_wait_percent: float = 0.0
     stress_score: float = 0.0
+    utilization_score: float = 0.0
+    psi_score: Optional[float] = None
     level: str = "LOW"
     trend: str = "Collecting"
     target_pid: Optional[int] = None
@@ -83,6 +85,8 @@ class DaemonState:
                 "memory_percent": self.memory_percent,
                 "io_wait_percent": self.io_wait_percent,
                 "stress_score": self.stress_score,
+                "utilization_score": self.utilization_score,
+                "psi_score": self.psi_score,
                 "level": self.level,
                 "trend": self.trend,
                 "target_pid": self.target_pid,

@@ -11,15 +11,13 @@ from core.procfs import (
     read_psi,
     read_system_stat,
 )
+from engine.pressure import DEFAULT_PRESSURE_WEIGHTS, PressureEngine, compute_pressure_score
+from model.pressure import PsiSample, UtilizationSample
 
 if TYPE_CHECKING:
     from core.config import ConfigManager
 
-DEFAULT_METRIC_WEIGHTS = {
-    "cpu_weight": 0.5,
-    "memory_weight": 0.3,
-    "io_weight": 0.2,
-}
+DEFAULT_METRIC_WEIGHTS = DEFAULT_PRESSURE_WEIGHTS
 
 _metric_weights = DEFAULT_METRIC_WEIGHTS.copy()
 
@@ -28,10 +26,16 @@ def configure_metrics(config: "ConfigManager") -> None:
     global _metric_weights
     weights = config.metric_weights()
     _metric_weights = {
-        "cpu_weight": weights.get("cpu_weight", DEFAULT_METRIC_WEIGHTS["cpu_weight"]),
-        "memory_weight": weights.get("memory_weight", DEFAULT_METRIC_WEIGHTS["memory_weight"]),
-        "io_weight": weights.get("io_weight", DEFAULT_METRIC_WEIGHTS["io_weight"]),
+        key: weights.get(key, DEFAULT_METRIC_WEIGHTS[key])
+        for key in DEFAULT_METRIC_WEIGHTS
     }
+
+
+@dataclass(frozen=True)
+class StressBreakdown:
+    total: float
+    utilization: float
+    psi: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -40,9 +44,58 @@ class SystemMetrics:
     memory_percent: float
     io_wait_percent: float
     stress_score: float
+    utilization_score: float
+    psi_score: Optional[float] = None
     psi_cpu_some_avg10: Optional[float] = None
     psi_memory_some_avg10: Optional[float] = None
     psi_io_some_avg10: Optional[float] = None
+
+
+def compute_utilization_score(
+    cpu: float,
+    memory: float,
+    io: float,
+    weights: Optional[dict[str, float]] = None,
+) -> float:
+    return PressureEngine(weights or _metric_weights).utilization_score(
+        UtilizationSample(cpu_percent=cpu, memory_percent=memory, io_wait_percent=io)
+    )
+
+
+def compute_psi_score(
+    psi_cpu: Optional[float],
+    psi_memory: Optional[float],
+    psi_io: Optional[float],
+    weights: Optional[dict[str, float]] = None,
+) -> Optional[float]:
+    return PressureEngine(weights or _metric_weights).psi_score(
+        PsiSample(
+            cpu_some_avg10=psi_cpu,
+            memory_some_avg10=psi_memory,
+            io_some_avg10=psi_io,
+        )
+    )
+
+
+def compute_stress_breakdown(
+    cpu: float,
+    memory: float,
+    io: float,
+    weights: Optional[dict[str, float]] = None,
+    psi_cpu: Optional[float] = None,
+    psi_memory: Optional[float] = None,
+    psi_io: Optional[float] = None,
+) -> StressBreakdown:
+    score = compute_pressure_score(
+        cpu,
+        memory,
+        io,
+        weights or _metric_weights,
+        psi_cpu=psi_cpu,
+        psi_memory=psi_memory,
+        psi_io=psi_io,
+    )
+    return StressBreakdown(total=score.total, utilization=score.utilization, psi=score.psi)
 
 
 def compute_stress(
@@ -50,12 +103,19 @@ def compute_stress(
     memory: float,
     io: float,
     weights: Optional[dict[str, float]] = None,
+    psi_cpu: Optional[float] = None,
+    psi_memory: Optional[float] = None,
+    psi_io: Optional[float] = None,
 ) -> float:
-    active = weights or _metric_weights
-    cpu_w = active.get("cpu_weight", DEFAULT_METRIC_WEIGHTS["cpu_weight"])
-    mem_w = active.get("memory_weight", DEFAULT_METRIC_WEIGHTS["memory_weight"])
-    io_w = active.get("io_weight", DEFAULT_METRIC_WEIGHTS["io_weight"])
-    return round((cpu_w * cpu + mem_w * memory + io_w * io) / 100, 2)
+    return compute_stress_breakdown(
+        cpu,
+        memory,
+        io,
+        weights,
+        psi_cpu=psi_cpu,
+        psi_memory=psi_memory,
+        psi_io=psi_io,
+    ).total
 
 
 class SystemMetricsSampler:
@@ -80,27 +140,51 @@ class SystemMetricsSampler:
     def sample(self) -> SystemMetrics:
         current = read_system_stat(self.proc_root)
         memory = read_memory_usage_percent(self.proc_root)
+        psi_fields = _read_psi_fields(self.proc_root)
 
         if self._previous is None:
             self._previous = current
+            breakdown = compute_stress_breakdown(
+                0.0,
+                memory,
+                0.0,
+                self.metric_weights,
+                psi_cpu=psi_fields["psi_cpu_some_avg10"],
+                psi_memory=psi_fields["psi_memory_some_avg10"],
+                psi_io=psi_fields["psi_io_some_avg10"],
+            )
             return SystemMetrics(
                 cpu_percent=0.0,
                 memory_percent=memory,
                 io_wait_percent=0.0,
-                stress_score=compute_stress(0.0, memory, 0.0, self.metric_weights),
-                **_read_psi_fields(self.proc_root),
+                stress_score=breakdown.total,
+                utilization_score=breakdown.utilization,
+                psi_score=breakdown.psi,
+                **psi_fields,
             )
 
         cpu = cpu_usage_percent(self._previous, current)
         io = io_wait_percent(self._previous, current)
         self._previous = current
 
+        breakdown = compute_stress_breakdown(
+            cpu,
+            memory,
+            io,
+            self.metric_weights,
+            psi_cpu=psi_fields["psi_cpu_some_avg10"],
+            psi_memory=psi_fields["psi_memory_some_avg10"],
+            psi_io=psi_fields["psi_io_some_avg10"],
+        )
+
         return SystemMetrics(
             cpu_percent=cpu,
             memory_percent=memory,
             io_wait_percent=io,
-            stress_score=compute_stress(cpu, memory, io, self.metric_weights),
-            **_read_psi_fields(self.proc_root),
+            stress_score=breakdown.total,
+            utilization_score=breakdown.utilization,
+            psi_score=breakdown.psi,
+            **psi_fields,
         )
 
     def sample_blocking(self) -> SystemMetrics:

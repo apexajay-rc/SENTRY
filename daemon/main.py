@@ -128,6 +128,8 @@ def main():
             memory = metrics.memory_percent
             io = metrics.io_wait_percent
             score = metrics.stress_score
+            util_score = metrics.utilization_score
+            psi_score = metrics.psi_score
             top_processes = _format_top_processes(
                 process_sampler, system_total_delta, total_memory_kb
             )
@@ -146,6 +148,8 @@ def main():
             memory = get_memory_usage()
             io = get_io_wait()
             score = compute_stress(cpu, memory, io)
+            util_score = score
+            psi_score = None
             stress_history.append(score)
             level = classify_basic(score)
             pid, name, pscore = get_top_process()
@@ -161,6 +165,8 @@ def main():
             memory_percent=memory,
             io_wait_percent=io,
             stress_score=score,
+            utilization_score=util_score,
+            psi_score=psi_score,
             level=level,
             trend=trend_label(stress_history),
             target_pid=int(pid) if pid else None,
@@ -183,8 +189,12 @@ def main():
             psi_parts.append(f"PSI_IO={psi_io}")
         psi_text = f" | {' | '.join(psi_parts)}" if psi_parts else ""
 
+        blend_text = f"Util={util_score}"
+        if psi_score is not None:
+            blend_text += f" | PsiScore={psi_score}"
+
         output = (
-            f"CPU={cpu}% | MEM={memory}% | IO={io}% | Stress={score} | "
+            f"CPU={cpu}% | MEM={memory}% | IO={io}% | Stress={score} | {blend_text} | "
             f"Level={level} | Target={name}({pid}) | ProcessScore={pscore} | "
             f"Action={action}{psi_text}"
         )

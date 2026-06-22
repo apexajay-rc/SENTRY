@@ -51,6 +51,13 @@ def format_top_processes_ipc(top_processes):
     return "\n".join(rows)
 
 
+def format_stress_text(score, util_score=None, psi_score=None):
+    if psi_score is not None:
+        util_value = util_score if util_score is not None else score
+        return f"Unified Stress Score: {score} (util={util_value}, psi={psi_score})"
+    return f"Unified Stress Score: {score}"
+
+
 def sparkline_from_history(history):
     bars = ""
     for score in history:
@@ -142,7 +149,11 @@ def main(page: ft.Page):
         cpu_text.value = f"CPU Usage: {state.get('cpu_percent', 0)}%"
         mem_text.value = f"Memory Usage: {state.get('memory_percent', 0)}%"
         io_text.value = f"I/O Wait: {state.get('io_wait_percent', 0)}%"
-        stress_text.value = f"Unified Stress Score: {score}"
+        stress_text.value = format_stress_text(
+            score,
+            state.get("utilization_score"),
+            state.get("psi_score"),
+        )
         level_text.value = f"System Level: {level}"
         level_text.color = color
         trend_text.value = f"Trend: {trend}"
@@ -178,6 +189,8 @@ def main(page: ft.Page):
             mem = metrics.memory_percent
             io = metrics.io_wait_percent
             score = metrics.stress_score
+            util_score = metrics.utilization_score
+            psi_score = metrics.psi_score
 
             if metrics.psi_cpu_some_avg10 is not None:
                 psi_text.value = (
@@ -199,6 +212,8 @@ def main(page: ft.Page):
             mem = get_memory_usage()
             io = get_io_wait()
             score = compute_stress(cpu, mem, io)
+            util_score = score
+            psi_score = None
             psi_text.value = "PSI: Linux only"
             process_text.value = "Top Processes:\nUnavailable on this platform"
 
@@ -214,7 +229,7 @@ def main(page: ft.Page):
         cpu_text.value = f"CPU Usage: {cpu}%"
         mem_text.value = f"Memory Usage: {mem}%"
         io_text.value = f"I/O Wait: {io}%"
-        stress_text.value = f"Unified Stress Score: {score}"
+        stress_text.value = format_stress_text(score, util_score, psi_score)
         level_text.value = f"System Level: {level}"
         level_text.color = color
         trend_text.value = f"Trend: {trend}"

@@ -135,13 +135,17 @@ SENTRY/
 
 ### Stress Score
 
-SENTRY fuses utilization into a normalized `[0, 1]` score:
+SENTRY blends **utilization** and **PSI stall pressure** into a normalized `[0, 1]` score:
 
 ```
-stress = (0.50 * cpu%) + (0.30 * mem%) + (0.20 * io_wait%)
+util_score = (cpu_w*cpu% + mem_w*mem% + io_w*io_wait%) / 100
+psi_score  = weighted(cpu_psi, mem_psi, io_psi) / 100
+stress     = (1 - psi_blend) * util_score + psi_blend * psi_score
 ```
 
-Weights are configurable in `sentry_config.yaml`.
+When PSI is unavailable, `stress = util_score`.
+
+Default weights and `psi_blend` live in `sentry_config.yaml` under `metrics`.
 
 ### Classification Tiers
 
@@ -317,7 +321,7 @@ stress-ng --cpu 4 --vm 1 --vm-bytes 500M --timeout 60s
 ## Roadmap
 
 ### Near-term
-- [ ] Weight PSI into stress score and policy decisions
+- [x] Weight PSI into stress score and policy decisions
 - [x] Wire `sentry_config.yaml` into daemon runtime
 - [ ] Apply memory + I/O cgroup limits from escalation matrix
 - [ ] Structured JSON audit log (`sentry_audit.json`)

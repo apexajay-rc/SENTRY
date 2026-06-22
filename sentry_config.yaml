@@ -49,12 +49,16 @@ escalation:
     io_weight: 10          # 10% I/O throttle
 
 # Metric weights for stress score calculation
-# Adjust to prioritize different resources
-# Must sum to 1.0 for normalized scoring
+# utilization score uses cpu/memory/io; PSI score uses pressure avg10 signals
+# psi_blend controls how much PSI influences the final stress score (0.0 to 1.0)
 metrics:
-  cpu_weight: 0.5          # CPU is most critical (50%)
-  memory_weight: 0.3       # Memory is secondary (30%)
-  io_weight: 0.2           # I/O is tertiary (20%)
+  cpu_weight: 0.35
+  memory_weight: 0.25
+  io_weight: 0.15
+  psi_cpu_weight: 0.10
+  psi_memory_weight: 0.10
+  psi_io_weight: 0.05
+  psi_blend: 0.40
 
 # cgroup v2 configuration (Linux only)
 cgroup:
