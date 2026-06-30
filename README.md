@@ -2,268 +2,185 @@
 
 # SENTRY
 
-### Pressure-Aware Resource Orchestration for Linux
+### Keep Linux Responsive Under Heavy Workloads.
 
-**SENTRY preserves responsiveness under contention.**
+**SENTRY is an experimental Linux daemon that detects resource pressure using Linux Pressure Stall Information (PSI) and automatically applies reversible cgroup v2 controls before your system becomes sluggish.**
 
-It watches kernel pressure, understands which workloads matter, applies reversible controls, and verifies whether the system actually recovered.
+> **Observe → Understand → Mitigate → Verify**
 
-<br>
+[![Linux](https://img.shields.io/badge/Linux-First-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://kernel.org)
+[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+](https://python.org)
+[![cgroup v2](https://img.shields.io/badge/cgroup-v2-E74C3C?style=for-the-badge)](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+[![PSI](https://img.shields.io/badge/Pressure-PSI-1ABC9C?style=for-the-badge)](https://www.kernel.org/doc/html/latest/accounting/psi.html)
+[![MIT License](https://img.shields.io/badge/License-MIT-2ECC71?style=for-the-badge)](LICENSE)
 
-[![Linux](https://img.shields.io/badge/Linux-first-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://kernel.org)
-[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
-[![cgroups v2](https://img.shields.io/badge/cgroups-v2-FF6B6B?style=for-the-badge)](https://docs.kernel.org/admin-guide/cgroup-v2.html)
-[![PSI](https://img.shields.io/badge/Pressure-PSI-4ECDC4?style=for-the-badge)](https://www.kernel.org/doc/html/latest/accounting/psi.html)
-[![License](https://img.shields.io/badge/License-MIT-22C55E?style=for-the-badge)](LICENSE)
+---
 
-<br>
+**Experimental • Linux-first • Pressure-aware • Open Source**
 
-[Why SENTRY](#why-sentry) |
-[Architecture](#architecture) |
-[Pressure Engine](#pressure-engine) |
-[Quick Start](#quick-start) |
-[Roadmap](#roadmap)
+[Quick Start](#quick-start) •
+[Features](#features) •
+[Architecture](#architecture) •
+[Roadmap](#roadmap) •
+[Contributing](#contributing)
 
 </div>
 
 ---
 
-## Why SENTRY
+# Why SENTRY?
 
-Most system monitors answer a simple question:
+Have you ever experienced one of these?
 
-```text
-How busy is the machine?
-```
+- 🐳 A Docker build freezes your desktop.
+- ⚙️ `make -j32` makes your browser unusable.
+- 🤖 AI training causes mouse lag.
+- 📦 Background jobs starve interactive applications.
+- 💻 CPU utilization looks "fine" but the machine still feels slow.
 
-SENTRY is built around a better question:
+Traditional monitoring tools tell you **how busy** the system is.
 
-```text
-Which workloads are stalling, what is causing it, and what action preserves performance?
-```
+SENTRY asks a different question:
 
-High CPU is not always a problem. Low CPU is not always health. A desktop can feel frozen before utilization looks dramatic. A database can miss latency targets while averages still look fine. A GPU training job can idle because the CPU data pipeline is under pressure.
+> **"Which workloads are making useful work wait?"**
 
-SENTRY treats **pressure** as the primary signal.
+That difference matters.
 
-```text
-Utilization says: "The resource is used."
-Pressure says:    "Work is waiting."
-```
+Modern Linux exposes **Pressure Stall Information (PSI)**—a kernel signal that measures **how long work is waiting for CPU, memory or I/O resources.**
 
----
+Waiting is what users experience as:
 
-## The Loop
+- Lag
+- Stuttering
+- Freezes
+- Poor responsiveness
 
-```mermaid
-flowchart LR
-    A["Observe<br/>/proc, PSI, processes"] --> B["Understand<br/>pressure + workload context"]
-    B --> C["Predict<br/>near-future contention"]
-    C --> D["Optimize<br/>choose reversible controls"]
-    D --> E["Act<br/>cgroups, scheduler hints, affinity"]
-    E --> F["Verify<br/>did pressure fall?"]
-    F --> G["Learn<br/>record outcome"]
-    G --> A
-```
-
-Current SENTRY implements the first production slice of this loop:
-
-```text
-Metrics -> Pressure scoring -> Policy -> Reversible action
-```
-
-The goal is larger:
-
-```text
-Observe -> Understand -> Predict -> Optimize -> Verify -> Learn
-```
+Instead of reacting after the system becomes unusable, SENTRY continuously watches pressure signals and applies **safe, reversible** cgroup controls before resource contention becomes severe.
 
 ---
 
-## What It Does Today
+# What Makes SENTRY Different?
 
-SENTRY currently provides:
+Most tools focus on observation.
 
-- Delta-based CPU and I/O wait sampling from `/proc/stat`
-- Memory pressure context from `/proc/meminfo`
-- Linux PSI reads from `/proc/pressure/{cpu,memory,io}`
-- Per-process CPU scoring from `/proc/[pid]/stat`
-- Configurable PSI-aware pressure scoring
-- Policy tiers: `LOW`, `MODERATE`, `HIGH`, `CRITICAL`
-- Safe cgroup v2 CPU throttling through `cpu.weight`
-- Critical-process protection
-- Observe-only, armed, and dry-run modes
-- Daemon/dashboard IPC over Unix socket or TCP
-- Flet dashboard with live system state and control switches
-- Mocked `/proc` fixtures for tests
-
-SENTRY does **not** kill processes by default. Its first instinct is reversible pressure shaping.
-
----
-
-## Architecture
-
-```mermaid
-flowchart TB
-    subgraph Kernel["Linux Kernel Interfaces"]
-        PROC["/proc/stat<br/>/proc/meminfo<br/>/proc/[pid]/stat"]
-        PSI["/proc/pressure/*"]
-        CGROUP["cgroups v2<br/>cpu.weight, memory.max, io.max"]
-    end
-
-    subgraph Collectors["Collectors"]
-        CPROC["procfs"]
-        CPROC2["processes"]
-        CPSI["psi"]
-    end
-
-    subgraph Model["Domain Model"]
-        MUTIL["UtilizationSample"]
-        MPSI["PsiSample"]
-        MSCORE["PressureScore"]
-        MSTATE["DaemonState"]
-    end
-
-    subgraph Engine["Engine"]
-        PRESSURE["PressureEngine"]
-        CLASSIFY["classifier"]
-        POLICY["policy"]
-    end
-
-    subgraph Actuators["Actuators"]
-        ACTCG["cgroups_v2"]
-    end
-
-    subgraph Runtime["Runtime"]
-        DAEMON["sentry daemon"]
-        DASH["dashboard"]
-    end
-
-    PROC --> CPROC
-    PROC --> CPROC2
-    PSI --> CPSI
-    CPROC --> MUTIL
-    CPSI --> MPSI
-    MUTIL --> PRESSURE
-    MPSI --> PRESSURE
-    PRESSURE --> MSCORE
-    MSCORE --> CLASSIFY
-    CLASSIFY --> POLICY
-    POLICY --> ACTCG
-    ACTCG --> CGROUP
-    DAEMON --> PRESSURE
-    DAEMON --> MSTATE
-    DASH <-->|"JSON IPC"| DAEMON
-```
-
-Repository layout:
+SENTRY focuses on **decision making.**
 
 ```text
-SENTRY/
-|-- core/                  # Existing runtime, collectors, IPC, policy, cgroups
-|-- model/                 # Canonical resource and pressure models
-|-- engine/                # Pressure-first scoring and future decision engines
-|-- daemon/                # Long-running control loop
-|-- dashboard/             # Flet real-time dashboard
-|-- tests/                 # Unit tests and mocked /proc fixtures
-|-- sentry_config.yaml     # Thresholds, metric weights, cgroup settings
-`-- requirements.txt
+Traditional Monitor
+
+CPU ↑
+
+↓
+
+Display Graph
+
+↓
+
+Human decides
+
+↓
+
+Human fixes problem
 ```
 
----
-
-## Pressure Engine
-
-SENTRY blends utilization context with PSI stall signals.
+SENTRY
 
 ```text
-utilization_score =
-  cpu_weight * cpu%
-  + memory_weight * memory%
-  + io_weight * io_wait%
+Observe
 
-psi_score =
-  weighted(cpu_psi_some_avg10, memory_psi_some_avg10, io_psi_some_avg10)
+↓
 
-pressure_score =
-  (1 - psi_blend) * utilization_score
-  + psi_blend * psi_score
+Understand
+
+↓
+
+Choose safest action
+
+↓
+
+Apply reversible mitigation
+
+↓
+
+Verify recovery
 ```
 
-When PSI is unavailable, SENTRY falls back to utilization scoring.
-
-The scoring contract now lives in:
-
-- `model/pressure.py`
-- `engine/pressure.py`
-- `core/metrics.py`
-
-This is the first step toward making SENTRY pressure-first instead of monitor-first.
+The long-term vision is a daemon that continuously protects Linux responsiveness with minimal user intervention.
 
 ---
 
-## Safety Model
+# Project Status
 
-SENTRY is deliberately conservative.
+| Component | Status |
+|------------|---------|
+| Metrics Collection | ✅ Stable |
+| PSI Integration | ✅ Stable |
+| Process Ranking | ✅ Stable |
+| Dashboard | ✅ Stable |
+| CPU Mitigation (cgroup v2) | ✅ Functional |
+| Memory / IO Mitigation | 🚧 In Progress |
+| Prediction Engine | 🚧 Planned |
+| Feedback Learning | 📅 Planned |
 
-| Safety gate | Default | Why it matters |
-|---|---:|---|
-| Observe-only mode | On | Lets you inspect decisions before control |
-| Armed mode | Off | Mitigation must be explicitly enabled |
-| Dry-run mode | Off | Can log intended actions without writing cgroups |
-| Critical process denylist | On | Protects system services and SENTRY itself |
-| Per-PID cooldown | 15s | Prevents repeated hammering of the same target |
-| Platform guard | On | Windows/dev mode remains monitor-only |
-
-Action ladder:
-
-```text
-observe
-dry-run decision
-cgroup cpu.weight adjustment
-future: io.weight
-future: memory.high / memory.max
-future: scheduler and affinity hints
-future: GPU-aware placement and throttling
-```
+> **Current Release:** Experimental (`v0.x`)
+>
+> SENTRY is suitable for experimentation, benchmarking and community feedback.
+>
+> It is **not yet recommended for production environments.**
 
 ---
 
-## Quick Start
+# Quick Start
 
-### Requirements
+## Requirements
 
-- Linux, preferably with cgroups v2 enabled
+- Linux
 - Python 3.8+
-- Root/sudo for live cgroup writes
+- cgroup v2 enabled
+- Root privileges for live mitigation
 
-Check cgroups v2:
+Verify cgroup v2:
 
 ```bash
 mount | grep cgroup2
 ```
 
-Install:
+Clone the repository
 
 ```bash
 git clone https://github.com/apexajay-rc/SENTRY.git
+
 cd SENTRY
-python3 -m venv venv
-source venv/bin/activate
+```
+
+Create a virtual environment
+
+```bash
+python3 -m venv .venv
+
+source .venv/bin/activate
+```
+
+Install dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-Run:
+Start the daemon
 
 ```bash
-# Terminal 1: daemon
 sudo python daemon/main.py
+```
 
-# Terminal 2: dashboard
+Launch the dashboard
+
+```bash
 python dashboard/main_gui.py
 ```
 
-Run tests:
+Run tests
 
 ```bash
 python -m unittest discover -s tests -v
@@ -271,138 +188,969 @@ python -m unittest discover -s tests -v
 
 ---
 
-## Configuration
+# Demo
 
-`sentry_config.yaml` controls polling, thresholds, pressure weights, cgroup behavior, cooldowns, and protected process names.
+> **Coming soon**
 
-Example pressure weights:
+The repository will include a demonstration showing:
+
+```
+Without SENTRY
+
+stress-ng
+
+↓
+
+Desktop becomes sluggish
+
+────────────────────────────
+
+With SENTRY
+
+stress-ng
+
+↓
+
+PSI rises
+
+↓
+
+SENTRY detects contention
+
+↓
+
+cgroup mitigation applied
+
+↓
+
+Desktop remains responsive
+```
+
+---
+
+# Why PSI Instead of CPU Usage?
+
+CPU utilization answers:
+
+> **"How busy is the CPU?"**
+
+Pressure Stall Information answers:
+
+> **"How long is useful work waiting?"**
+
+Those are fundamentally different questions.
+
+For example:
+
+| Situation | CPU Usage | User Experience |
+|------------|-----------|----------------|
+| Idle machine | 5% | Responsive |
+| Video rendering | 100% | Still responsive |
+| Heavy compilation | 85% | Browser freezes |
+| Memory thrashing | 35% | Nearly unusable |
+
+CPU usage alone cannot distinguish these cases.
+
+PSI measures actual resource contention, allowing SENTRY to respond to **user-visible slowdowns** rather than utilization alone.
+
+---
+
+# Comparison
+
+| Capability | htop | earlyoom | systemd-oomd | SENTRY |
+|------------|------|-----------|---------------|---------|
+| Live CPU & Memory Monitoring | ✅ | ❌ | Limited | ✅ |
+| Uses PSI | ❌ | ✅ | ✅ | ✅ |
+| CPU Pressure Awareness | ❌ | ❌ | ❌ | ✅ |
+| Automatic Mitigation | ❌ | Process Kill | Memory-based | Reversible cgroup control |
+| Dashboard | ❌ | ❌ | ❌ | ✅ |
+| Process Ranking | Limited | ❌ | ❌ | ✅ |
+| Reversible Actions | ❌ | ❌ | ❌ | ✅ |
+| Open Architecture | ❌ | Limited | Limited | ✅ |
+
+> SENTRY is **not a replacement** for these tools.
+>
+> It complements existing Linux infrastructure by acting as a pressure-aware decision engine built around PSI and cgroup v2.
+
+---
+
+# Core Philosophy
+
+SENTRY follows one simple principle:
+
+> **Protect responsiveness before users notice degradation.**
+
+Its first instinct is **not** to kill processes.
+
+Instead it:
+
+1. Observes the system.
+2. Identifies contention.
+3. Chooses the least intrusive mitigation.
+4. Verifies whether the action helped.
+5. Learns from future improvements.
+---
+
+# Features
+
+SENTRY is designed around one idea:
+
+> **Observe less. Understand more. Act safely.**
+
+Instead of collecting metrics for humans to interpret, SENTRY continuously analyzes system pressure and decides whether intervention is necessary.
+
+## Current Features
+
+### Linux-native Metrics Collection
+
+- Delta-based CPU utilization from `/proc/stat`
+- Memory utilization from `/proc/meminfo`
+- I/O wait monitoring
+- Linux Pressure Stall Information (PSI)
+- Per-process CPU accounting
+- Per-process memory accounting
+- Process ranking based on weighted resource contribution
+
+---
+
+### Pressure-Aware Scoring
+
+SENTRY combines traditional utilization metrics with Linux PSI.
+
+Unlike conventional monitoring tools, high utilization alone does not trigger action.
+
+Instead, SENTRY asks:
+
+- Is work actually stalling?
+- Is pressure increasing?
+- Is intervention necessary?
+
+This significantly reduces unnecessary mitigation.
+
+---
+
+### Policy Engine
+
+Pressure is classified into four operating states.
+
+| Level | Meaning |
+|--------|----------|
+| LOW | Healthy |
+| MODERATE | Early contention detected |
+| HIGH | Sustained resource pressure |
+| CRITICAL | Immediate intervention recommended |
+
+Policies determine:
+
+- when mitigation is allowed
+- mitigation intensity
+- cooldown duration
+- protected workloads
+- safety constraints
+
+---
+
+### Safe Mitigation
+
+Current mitigation uses Linux **cgroup v2**.
+
+Supported today:
+
+- CPU weight adjustment (`cpu.weight`)
+
+Planned:
+
+- Memory protection (`memory.high`)
+- Memory limits (`memory.max`)
+- IO control
+- CPU affinity
+- Scheduler hints
+
+Every action is designed to be **reversible**.
+
+---
+
+### Dashboard
+
+The Flet dashboard provides live visibility into:
+
+- CPU
+- Memory
+- I/O
+- PSI
+- Stress score
+- Pressure level
+- Selected target
+- Applied mitigation
+- Trend
+- Top processes
+
+Runtime controls include:
+
+- Observe-only mode
+- Armed mode
+- Dry-run mode
+
+---
+
+### IPC
+
+SENTRY exposes daemon state through IPC.
+
+Supported transports:
+
+- Unix Domain Socket
+- TCP (development)
+
+The dashboard consumes the daemon state through this interface.
+
+Future CLI tools will use the same API.
+
+---
+
+### Configuration
+
+Everything important is configurable.
+
+Examples:
+
+- polling interval
+- pressure thresholds
+- metric weights
+- PSI blend ratio
+- cooldown duration
+- protected processes
+- cgroup behavior
+
+No source-code modification is required for tuning.
+
+---
+
+# How SENTRY Works
+
+At a high level:
+
+```text
+Linux Kernel
+
+↓
+
+/proc + PSI
+
+↓
+
+SENTRY
+
+↓
+
+Policy Engine
+
+↓
+
+cgroup v2
+
+↓
+
+Linux Scheduler
+```
+
+Every iteration follows the same lifecycle.
+
+```text
+Observe
+
+↓
+
+Measure
+
+↓
+
+Score
+
+↓
+
+Classify
+
+↓
+
+Select Process
+
+↓
+
+Choose Action
+
+↓
+
+Apply Mitigation
+
+↓
+
+Verify
+
+↓
+
+Repeat
+```
+
+This loop runs continuously while minimizing overhead.
+
+---
+
+# Internal Architecture
+
+```mermaid
+flowchart LR
+
+A[/proc/stat]
+
+B[/proc/meminfo]
+
+C[/proc/pressure]
+
+D[/proc/[pid]/stat]
+
+A --> Metrics
+B --> Metrics
+C --> Metrics
+D --> ProcessSampler
+
+Metrics --> PressureEngine
+ProcessSampler --> PressureEngine
+
+PressureEngine --> Policy
+
+Policy --> Mitigation
+
+Mitigation --> Cgroups
+
+Mitigation --> Dashboard
+
+Dashboard <-->|IPC| Daemon
+```
+
+---
+
+# Repository Structure
+
+```text
+SENTRY/
+
+├── daemon/
+│   └── Main daemon lifecycle
+│
+├── core/
+│   ├── Metrics
+│   ├── Policy
+│   ├── IPC
+│   ├── Process sampling
+│   ├── cgroup interface
+│   └── Runtime
+│
+├── model/
+│   ├── Pressure models
+│   └── Domain objects
+│
+├── engine/
+│   ├── Pressure engine
+│   └── Future prediction engines
+│
+├── dashboard/
+│   └── Flet dashboard
+│
+├── tests/
+│   ├── Unit tests
+│   └── Mock /proc fixtures
+│
+├── docs/
+│
+└── sentry_config.yaml
+```
+
+---
+
+# Pressure Engine
+
+Traditional monitoring computes utilization.
+
+SENTRY computes **pressure**.
+
+The scoring pipeline:
+
+```text
+CPU %
+
+Memory %
+
+IO Wait %
+
+↓
+
+Utilization Score
+
++
+
+PSI
+
+↓
+
+Pressure Score
+
+↓
+
+Policy Decision
+```
+
+Current pressure calculation:
+
+```text
+Utilization Score
+
+=
+
+CPU Weight × CPU
+
++
+
+Memory Weight × Memory
+
++
+
+IO Weight × IO Wait
+```
+
+```text
+PSI Score
+
+=
+
+CPU PSI
+
++
+
+Memory PSI
+
++
+
+IO PSI
+```
+
+```text
+Pressure Score
+
+=
+
+(1 − Blend)
+
+×
+
+Utilization
+
++
+
+Blend
+
+×
+
+PSI
+```
+
+The blend ratio is configurable.
+
+If PSI is unavailable, SENTRY automatically falls back to utilization scoring.
+
+---
+
+# Process Ranking
+
+When mitigation becomes necessary, SENTRY identifies workloads contributing most to resource contention.
+
+Each process receives a weighted score.
+
+```text
+Process Score
+
+=
+
+70%
+
+CPU Contribution
+
++
+
+30%
+
+Memory Contribution
+```
+
+Processes are ranked from highest to lowest.
+
+Protected processes are automatically excluded.
+
+The highest eligible process becomes the mitigation candidate.
+
+---
+
+# Safety Model
+
+SENTRY is intentionally conservative.
+
+Resource control should never surprise the user.
+
+## Observe-only
+
+No kernel writes occur.
+
+All decisions are logged.
+
+Perfect for validation and benchmarking.
+
+---
+
+## Armed Mode
+
+Mitigation is disabled until explicitly armed.
+
+This prevents accidental intervention.
+
+---
+
+## Dry-run
+
+Shows exactly what SENTRY would do without modifying cgroups.
+
+Useful during development.
+
+---
+
+## Critical Process Protection
+
+Important services are never selected.
+
+Examples include:
+
+- init
+- systemd
+- sshd
+- SENTRY itself
+
+The denylist is configurable.
+
+---
+
+## Cooldowns
+
+Repeated mitigation on the same workload is avoided.
+
+Each process enters a configurable cooldown after intervention.
+
+This prevents oscillation.
+
+---
+
+## Platform Guards
+
+Linux:
+
+✅ Monitoring
+
+✅ PSI
+
+✅ cgroups
+
+Windows:
+
+Monitoring only.
+
+No resource control.
+
+---
+
+# Runtime Decision Flow
+
+Every polling cycle follows this sequence.
+
+```mermaid
+flowchart TD
+
+A[Collect Metrics]
+
+B[Read PSI]
+
+C[Compute Pressure Score]
+
+D[Classify Level]
+
+E[Rank Processes]
+
+F{Mitigation Needed?}
+
+G[Observe]
+
+H[Apply cgroup Action]
+
+I[Update Dashboard]
+
+J[Log Decision]
+
+A --> B
+B --> C
+C --> D
+D --> E
+E --> F
+
+F -->|No| G
+F -->|Yes| H
+
+G --> I
+H --> I
+
+I --> J
+```
+
+---
+
+> **Design Principle**
+>
+> SENTRY always prefers the least intrusive action capable of restoring responsiveness.
+>
+> Resource control is incremental, reversible, and guided by kernel signals rather than fixed utilization thresholds.
+> ---
+
+# Configuration
+
+SENTRY is configured through `sentry_config.yaml`.
+
+Nearly every runtime behavior can be customized without modifying source code.
+
+Supported configuration includes:
+
+- Polling interval
+- Pressure thresholds
+- CPU / Memory / I/O metric weights
+- PSI blend ratio
+- Cooldown duration
+- Protected processes
+- cgroup behavior
+- Observe-only mode
+- Dry-run mode
+
+Example:
 
 ```yaml
 metrics:
   cpu_weight: 0.35
   memory_weight: 0.25
   io_weight: 0.15
+
   psi_cpu_weight: 0.10
   psi_memory_weight: 0.10
   psi_io_weight: 0.05
+
   psi_blend: 0.40
 ```
 
-Example policy tiers:
+Policy configuration:
 
-| Level | Score | Current response |
-|---|---:|---|
-| `LOW` | `< 0.35` | Monitor |
-| `MODERATE` | `>= 0.50` | CPU weight 50 |
-| `HIGH` | `>= 0.70` | CPU weight 30 |
-| `CRITICAL` | `>= 0.85` | CPU weight 10 |
+```yaml
+policy:
+
+  low: 0.35
+
+  moderate: 0.50
+
+  high: 0.70
+
+  critical: 0.85
+```
+
+Current mitigation policy:
+
+| Level | Default Action |
+|---------|----------------|
+| LOW | Monitor |
+| MODERATE | CPU Weight = 50 |
+| HIGH | CPU Weight = 30 |
+| CRITICAL | CPU Weight = 10 |
 
 ---
 
-## Example Decision
+# Example Runtime Output
+
+Typical daemon output:
 
 ```text
-CPU=45% | MEM=62% | IO=3%
-Stress=0.48 | Util=0.32 | PsiScore=0.72
-Level=MODERATE | Trend=Rising
-Target=build-worker(1234)
-Action=Observe only (mitigation disabled)
-PSI_CPU=12.3 | PSI_MEM=4.1 | PSI_IO=0.8
+CPU=42%
+
+MEM=58%
+
+IO=2%
+
+Stress=0.47
+
+Util=0.31
+
+PsiScore=0.71
+
+Level=MODERATE
+
+Trend=Rising
+
+Target=build-worker (PID 4821)
+
+Action=Observe only
+
+PSI_CPU=11.8
+
+PSI_MEM=3.9
+
+PSI_IO=0.6
 ```
 
-After arming and disabling observe-only:
+After enabling mitigation:
 
 ```text
-Action=cgroup throttle applied (PID 1234, cpu_weight=50)
+Action=cgroup throttle applied
+
+PID=4821
+
+cpu.weight=50
 ```
+
+Every action is logged for later inspection.
 
 ---
 
-## Roadmap
+# Performance
 
-```mermaid
-flowchart LR
-    L1["Level 1<br/>Reactive metrics + policy"] --> L2["Level 2<br/>PSI-aware pressure engine"]
-    L2 --> L3["Level 3<br/>Workload intent"]
-    L3 --> L4["Level 4<br/>Prediction"]
-    L4 --> L5["Level 5<br/>Cluster agents"]
-    L5 --> L6["Level 6<br/>GPU-aware control"]
-    L6 --> L7["Level 7<br/>Feedback learning"]
-    L7 --> L8["Level 8<br/>OS companion"]
-```
+The project aims to remain lightweight.
 
-Near-term:
+Current benchmark status:
 
-- [x] Read CPU, memory, and I/O PSI
-- [x] Blend PSI into pressure scoring
-- [x] Introduce `model/` and `engine/` layers
-- [ ] Move collectors into a dedicated `collectors/` package
-- [ ] Add workload identity and protection rules
-- [ ] Add structured decision logs
-- [ ] Apply memory and I/O cgroup actions
+| Metric | Status |
+|---------|--------|
+| CPU overhead | 📅 To be measured |
+| Memory footprint | 📅 To be measured |
+| Detection latency | 📅 To be measured |
+| Mitigation latency | 📅 To be measured |
+| Maximum tested processes | 📅 To be measured |
 
-Medium-term:
-
-- [ ] Foreground workload protection
-- [ ] Workload classifier for games, browsers, compilers, databases, containers, and AI jobs
-- [ ] Prediction engine using pressure trends and growth rates
-- [ ] Verification loop for action outcomes
-- [ ] Benchmark harness against baseline, earlyoom, and systemd-oomd-style behavior
-
-Long-term:
-
-- [ ] GPU telemetry through NVML and ROCm
-- [ ] GPU-aware workload placement and protection
-- [ ] Node-agent/control-plane split
-- [ ] Cluster pressure scoring and lightweight scheduling
-- [ ] Feedback-driven policy adaptation
-- [ ] Prometheus metrics export
+Future releases will publish reproducible benchmark results and methodology.
 
 ---
 
-## Design Direction
+# Use Cases
 
-The ultimate SENTRY is not a monitor. It is a pressure-aware resource control plane.
+SENTRY is designed for workloads where maintaining system responsiveness matters.
 
-```text
-It should know:
+Examples include:
 
-What workloads are doing
-Why they are doing it
-What pressure is forming
-What pressure will form
-Which action is safest
-Whether the action worked
-What to do better next time
-```
+### Development Workstations
 
-The destination:
-
-```text
-A pressure-aware distributed resource orchestration platform that continuously
-learns workload behavior and dynamically optimizes CPU, memory, storage,
-network, and accelerator allocation while preserving service guarantees.
-```
+- Large software compilation
+- Docker builds
+- Containerized development
+- IDE responsiveness
 
 ---
 
-## References
+### AI & Data Science
+
+- Local model training
+- Dataset preprocessing
+- Background inference
+- Mixed interactive workloads
+
+---
+
+### Homelabs
+
+- Multiple containers
+- Backup jobs
+- Media servers
+- Virtual machines
+
+---
+
+### Performance Research
+
+- PSI experimentation
+- Resource contention analysis
+- Linux scheduler studies
+- cgroup policy evaluation
+
+---
+
+# Who Should Use SENTRY?
+
+SENTRY is a good fit if you are:
+
+- Linux desktop users
+- Systems programmers
+- Kernel enthusiasts
+- DevOps engineers
+- Platform engineers
+- Homelab operators
+- Open-source contributors
+- Performance researchers
+
+---
+
+# Who Should NOT Use SENTRY?
+
+At its current stage, SENTRY is **not** intended for:
+
+- Mission-critical production clusters
+- Safety-critical infrastructure
+- Systems requiring long-term support guarantees
+- Environments where experimental software cannot be deployed
+
+The project is still evolving and APIs may change before a stable 1.0 release.
+
+---
+
+# Roadmap
+
+## v0.x — Foundation
+
+- [x] `/proc` metrics
+- [x] PSI integration
+- [x] Pressure scoring
+- [x] Process ranking
+- [x] CPU mitigation via cgroup v2
+- [x] Dashboard
+- [x] IPC
+
+---
+
+## Near Term
+
+- [ ] Memory cgroup support
+- [ ] I/O cgroup support
+- [ ] Structured logging
+- [ ] Graceful daemon shutdown
+- [ ] CLI client
+- [ ] Packaging
+- [ ] Systemd service
+
+---
+
+## Medium Term
+
+- [ ] Workload classification
+- [ ] Foreground application protection
+- [ ] Trend prediction
+- [ ] Action verification engine
+- [ ] Benchmark suite
+- [ ] Prometheus metrics
+
+---
+
+## Long Term
+
+- [ ] GPU telemetry
+- [ ] GPU-aware scheduling policies
+- [ ] Feedback-driven policy tuning
+- [ ] Plugin architecture
+- [ ] Distributed agents
+- [ ] Cluster-aware resource management
+
+The roadmap reflects project direction rather than guaranteed delivery dates.
+
+---
+
+# Contributing
+
+Contributions are welcome.
+
+Whether you're fixing bugs, improving documentation, or experimenting with new scheduling policies, your help is appreciated.
+
+You can contribute by:
+
+- Reporting bugs
+- Suggesting features
+- Improving documentation
+- Writing tests
+- Benchmarking SENTRY
+- Reviewing code
+- Submitting pull requests
+
+If you're looking for somewhere to start, check issues labeled:
+
+- `good first issue`
+- `help wanted`
+- `documentation`
+- `enhancement`
+
+Please keep pull requests focused and include a clear explanation of the problem being solved.
+
+---
+
+# Development Principles
+
+SENTRY follows a few core principles:
+
+- Linux-first
+- Pressure-aware rather than utilization-aware
+- Safe by default
+- Reversible actions
+- Configuration over hardcoding
+- Kernel mechanisms, userspace policy
+- Simple architecture over unnecessary complexity
+
+---
+
+# Inspiration
+
+SENTRY builds upon capabilities provided by the Linux kernel rather than replacing them.
+
+Key technologies include:
+
+- Linux Pressure Stall Information (PSI)
+- cgroup v2
+- `/proc`
+- Unix Domain Sockets
+- Python
+- Flet
+
+---
+
+# References
 
 | Topic | Documentation |
-|---|---|
-| cgroups v2 | [kernel.org/admin-guide/cgroup-v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) |
-| PSI | [kernel.org/accounting/psi](https://www.kernel.org/doc/html/latest/accounting/psi.html) |
-| `/proc` filesystem | [man proc(5)](https://man7.org/linux/man-pages/man5/proc.5.html) |
-| Flet UI | [flet.dev](https://flet.dev/) |
+|--------|---------------|
+| cgroup v2 | https://docs.kernel.org/admin-guide/cgroup-v2.html |
+| Pressure Stall Information | https://www.kernel.org/doc/html/latest/accounting/psi.html |
+| proc(5) | https://man7.org/linux/man-pages/man5/proc.5.html |
+| Flet | https://flet.dev |
+
+---
+
+# License
+
+SENTRY is released under the MIT License.
+
+See the `LICENSE` file for details.
+
+---
+
+# Acknowledgements
+
+SENTRY exists because Linux exposes powerful building blocks such as PSI, cgroup v2, and `/proc`.
+
+Rather than reinventing resource management, SENTRY aims to orchestrate these kernel mechanisms into a practical, pressure-aware userspace daemon.
 
 ---
 
 <div align="center">
 
-**Built by [@apexajay-rc](https://github.com/apexajay-rc)**
+## Star the Project
 
-*Kernel signals. Reversible controls. Performance preserved under pressure.*
+If SENTRY helped you, taught you something, or you believe in its direction, consider giving the repository a ⭐.
 
-MIT License
+Bug reports, benchmark results, feature ideas, and pull requests are all welcome.
+
+**Kernel signals. Intelligent decisions. Reversible control. Responsive Linux.**
+
+Made with ❤️ by **[@apexajay-rc](https://github.com/apexajay-rc)**
 
 </div>
