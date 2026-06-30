@@ -499,36 +499,36 @@ This loop runs continuously while minimizing overhead.
 # Internal Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
 
-A[/proc/stat]
+    subgraph Kernel
+        PROC["/proc"]
+        PSI["Pressure Stall Information (PSI)"]
+        CG["cgroup v2"]
+    end
 
-B[/proc/meminfo]
+    subgraph SENTRY
+        COLLECT["Collectors"]
+        ENGINE["Pressure Engine"]
+        POLICY["Policy Engine"]
+        ACTION["Mitigation"]
+    end
 
-C[/proc/pressure]
+    subgraph User
+        DASH["Dashboard"]
+    end
 
-D[/proc/[pid]/stat]
+    PROC --> COLLECT
+    PSI --> COLLECT
 
-A --> Metrics
-B --> Metrics
-C --> Metrics
-D --> ProcessSampler
+    COLLECT --> ENGINE
+    ENGINE --> POLICY
+    POLICY --> ACTION
 
-Metrics --> PressureEngine
-ProcessSampler --> PressureEngine
+    ACTION --> CG
 
-PressureEngine --> Policy
-
-Policy --> Mitigation
-
-Mitigation --> Cgroups
-
-Mitigation --> Dashboard
-
-Dashboard <-->|IPC| Daemon
+    ENGINE --> DASH
 ```
-
----
 
 # Repository Structure
 
