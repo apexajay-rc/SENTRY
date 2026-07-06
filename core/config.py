@@ -1,282 +1,89 @@
 """
-YAML configuration module for SENTRY.
-Loads external configuration for thresholds, limits, and behavior.
+core/config.py
+
+Strict, fail-safe configuration parser for the SENTRY daemon.
+Validates YAML inputs and provides guaranteed fallback defaults 
+if the configuration file is missing or malformed.
 """
 
-import copy
 import os
-from pathlib import Path
-from typing import Any, Dict, Optional, Set
-
+import logging
 import yaml
+from dataclasses import dataclass
 
+logger = logging.getLogger(__name__)
 
-DEFAULT_CONFIG = {
-    "daemon": {
-        "poll_interval_seconds": 3,
-        "resume_seconds": 10,
-        "cooldown_seconds": 15,
-    },
-    "thresholds": {
-        "low": 0.35,
-        "moderate": 0.50,
-        "high": 0.70,
-        "critical": 0.85,
-    },
-    "escalation": {
-        "low": {
-            "cpu_weight": 100,
-            "memory_limit_percent": 100,
-            "io_weight": 100,
-        },
-        "moderate": {
-            "cpu_weight": 50,
-            "memory_limit_percent": 90,
-            "io_weight": 50,
-        },
-        "high": {
-            "cpu_weight": 30,
-            "memory_limit_percent": 75,
-            "io_weight": 30,
-        },
-        "critical": {
-            "cpu_weight": 10,
-            "memory_limit_percent": 50,
-            "io_weight": 10,
-        },
-    },
-    "metrics": {
-        "cpu_weight": 0.35,
-        "memory_weight": 0.25,
-        "io_weight": 0.15,
-        "psi_cpu_weight": 0.10,
-        "psi_memory_weight": 0.10,
-        "psi_io_weight": 0.05,
-        "psi_blend": 0.40,
-    },
-    "cgroup": {
-        "path": "/sys/fs/cgroup/sentry_bg",
-        "enabled": True,
-    },
-    "critical_processes": [
-        "systemd",
-        "gnome-shell",
-        "Xorg",
-        "pulseaudio",
-        "pipewire",
-        "python3",
-        "ps",
-    ],
-    "logging": {
-        "json_file": "sentry_audit.json",
-        "text_file": "sentry_log.txt",
-        "console": True,
-        "console_level": "INFO",
-    },
-}
+@dataclass
+class SentryConfig:
+    """Strictly typed configuration state."""
+    memory_throttle_limit: str = "500M"
+    cooldown_period: float = 60.0
+    watchdog_interval: float = 5.0
 
-
-def resolve_config_path(config_file: Optional[str] = None) -> Path:
-    if config_file:
-        return Path(config_file)
-
-    env_path = os.environ.get("SENTRY_CONFIG")
-    if env_path:
-        return Path(env_path)
-
-    return Path(__file__).resolve().parent.parent / "sentry_config.yaml"
-
-
-def load_config(config_file: Optional[str] = None) -> "ConfigManager":
-    return ConfigManager(str(resolve_config_path(config_file)))
-
-
-class ConfigManager:
-    """
-    Manages SENTRY configuration from YAML file.
-    Falls back to defaults if config file not found.
-    """
+class ConfigParser:
+    """Reads and validates the sentry_config.yaml file."""
     
-    def __init__(self, config_file: str = "sentry_config.yaml"):
-        """
-        Initialize config manager.
-        
-        Args:
-            config_file (str): Path to YAML configuration file
-        """
-        self.config_file = Path(config_file)
-        self.config = self._load_config()
-    
-    def _load_config(self) -> Dict[str, Any]:
-        """
-        Load configuration from YAML file or use defaults.
-        
-        Returns:
-            dict: Merged configuration
-        """
-        config = copy.deepcopy(DEFAULT_CONFIG)
+    DEFAULT_PATHS = [
+        "/etc/sentry/config.yaml",     # Standard Linux config path
+        "/opt/sentry/sentry_config.yaml", # Makefile install path
+        "sentry_config.yaml"           # Local dev fallback
+    ]
 
-        if self.config_file.exists():
+    @classmethod
+    def load(cls, custom_path: str = None) -> SentryConfig:
+        """
+        Locates, loads, and validates the configuration.
+        Returns a SentryConfig object populated with defaults on failure.
+        """
+        config_obj = SentryConfig()
+        
+        target_path = custom_path
+        if not target_path:
+            for path in cls.DEFAULT_PATHS:
+                if os.path.exists(path):
+                    target_path = path
+                    break
+                    
+        if not target_path:
+            logger.warning("No sentry_config.yaml found. Using fail-safe defaults.")
+            return config_obj
+
+        try:
+            with open(target_path, "r") as f:
+                raw_yaml = yaml.safe_load(f) or {}
+                
+            logger.info(f"Loaded configuration from {target_path}")
+            return cls._validate_and_apply(raw_yaml, config_obj)
+            
+        except yaml.YAMLError as e:
+            logger.error(f"Malformed YAML in {target_path}: {e}. Using defaults.")
+            return config_obj
+        except Exception as e:
+            logger.error(f"Failed to read config {target_path}: {e}. Using defaults.")
+            return config_obj
+
+    @staticmethod
+    def _validate_and_apply(raw: dict, config: SentryConfig) -> SentryConfig:
+        """Safely extracts and type-casts YAML values into the config object."""
+        policy = raw.get("policy", {})
+        daemon = raw.get("daemon", {})
+
+        # Parse memory limit
+        if "memory_throttle_limit" in policy:
+            config.memory_throttle_limit = str(policy["memory_throttle_limit"])
+
+        # Parse cooldown
+        if "cooldown_period" in policy:
             try:
-                with open(self.config_file, "r", encoding="utf-8") as handle:
-                    user_config = yaml.safe_load(handle) or {}
+                config.cooldown_period = float(policy["cooldown_period"])
+            except ValueError:
+                logger.error("Invalid config: cooldown_period must be a number. Defaulting.")
 
-                config = self._merge_dicts(config, user_config)
-                print(f"[SENTRY] Loaded config from {self.config_file}")
-
-            except Exception as exc:
-                print(f"[SENTRY] Failed to load config: {exc}, using defaults")
-        else:
-            print(f"[SENTRY] Config file not found at {self.config_file}, using defaults")
+        # Parse watchdog
+        if "watchdog_interval" in daemon:
+            try:
+                config.watchdog_interval = float(daemon["watchdog_interval"])
+            except ValueError:
+                logger.error("Invalid config: watchdog_interval must be a number. Defaulting.")
 
         return config
-    
-    def _merge_dicts(self, base: Dict, override: Dict) -> Dict:
-        """
-        Recursively merge override dict into base dict.
-        
-        Args:
-            base (dict): Base configuration
-            override (dict): Override values
-        
-        Returns:
-            dict: Merged configuration
-        """
-        result = base.copy()
-        
-        for key, value in override.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                result[key] = self._merge_dicts(result[key], value)
-            else:
-                result[key] = value
-        
-        return result
-    
-    def get(self, path: str, default: Any = None) -> Any:
-        """
-        Get configuration value by dot-notation path.
-        
-        Args:
-            path (str): Configuration path (e.g., "daemon.poll_interval_seconds")
-            default: Default value if path not found
-        
-        Returns:
-            Configuration value or default
-        """
-        keys = path.split(".")
-        value = self.config
-        
-        for key in keys:
-            if isinstance(value, dict) and key in value:
-                value = value[key]
-            else:
-                return default
-        
-        return value
-    
-    def get_dict(self, section: str) -> Dict:
-        """
-        Get entire configuration section as dict.
-        
-        Args:
-            section (str): Section name (e.g., "daemon", "thresholds")
-        
-        Returns:
-            dict: Configuration section
-        """
-        return self.config.get(section, {})
-    
-    # Daemon configuration
-    def poll_interval(self) -> int:
-        """Get daemon poll interval in seconds."""
-        return self.get("daemon.poll_interval_seconds", 3)
-    
-    def resume_seconds(self) -> int:
-        """Get auto-resume timeout in seconds."""
-        return self.get("daemon.resume_seconds", 10)
-    
-    def cooldown_seconds(self) -> int:
-        """Get cooldown period in seconds."""
-        return self.get("daemon.cooldown_seconds", 15)
-    
-    # Threshold configuration
-    def get_threshold(self, level: str) -> float:
-        """
-        Get stress threshold for level.
-        
-        Args:
-            level (str): Level name ('low', 'moderate', 'high', 'critical')
-        
-        Returns:
-            float: Threshold value [0, 1]
-        """
-        return self.get(f"thresholds.{level}", DEFAULT_CONFIG["thresholds"].get(level, 0.0))
-    
-    def all_thresholds(self) -> Dict[str, float]:
-        """Get all stress thresholds."""
-        return self.get_dict("thresholds")
-    
-    # Escalation configuration
-    def get_escalation_actions(self, level: str) -> Dict[str, int]:
-        """
-        Get resource limits for stress level.
-
-        Args:
-            level (str): Level name ('low', 'moderate', 'high', 'critical' or uppercase)
-
-        Returns:
-            dict: Actions with cpu_weight, memory_limit_percent, io_weight
-        """
-        level_key = level.lower()
-        escalation = self.get_dict("escalation")
-        defaults = DEFAULT_CONFIG["escalation"].get(level_key, {})
-        return escalation.get(level_key, defaults)
-    
-    # Metrics configuration
-    def metric_weights(self) -> Dict[str, float]:
-        """Get metric weights for stress calculation."""
-        return self.get_dict("metrics")
-    
-    # cgroup configuration
-    def cgroup_path(self) -> str:
-        """Get cgroup path."""
-        return self.get("cgroup.path", "/sys/fs/cgroup/sentry_bg")
-    
-    def cgroup_enabled(self) -> bool:
-        """Check if cgroup control is enabled."""
-        return self.get("cgroup.enabled", True)
-    
-    # Critical processes
-    def critical_processes(self) -> list:
-        """Get list of critical processes to never throttle."""
-        return self.get("critical_processes", [])
-
-    def critical_processes_set(self) -> Set[str]:
-        """Get critical process names as a set for fast membership checks."""
-        return set(self.critical_processes())
-    
-    # Logging configuration
-    def json_log_file(self) -> str:
-        """Get JSON log file path."""
-        return self.get("logging.json_file", "sentry_audit.json")
-    
-    def text_log_file(self) -> str:
-        """Get text log file path."""
-        return self.get("logging.text_file", "sentry_log.txt")
-    
-    def console_logging_enabled(self) -> bool:
-        """Check if console logging is enabled."""
-        return self.get("logging.console", True)
-    
-    def console_log_level(self) -> str:
-        """Get console logging level."""
-        return self.get("logging.console_level", "INFO")
-    
-    def save_default_config(self):
-        """Generate and save default configuration file."""
-        try:
-            with open(self.config_file, "w") as f:
-                yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False, sort_keys=False)
-            print(f"[SENTRY] Default config saved to {self.config_file}")
-        except Exception as e:
-            print(f"[SENTRY] Failed to save config: {e}")
