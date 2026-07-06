@@ -1,84 +1,15 @@
-# SENTRY Configuration File
-# Customize daemon behavior, thresholds, and resource limits
+# SENTRY Daemon Configuration
+# Values applied dynamically to the control loop.
+
+policy:
+  # The cgroup v2 memory.high limit applied to the heaviest process during a spike.
+  # Accepts standard kernel memory strings (e.g., 500M, 1G, max)
+  memory_throttle_limit: "500M"
+  
+  # Minimum time (in seconds) a process remains throttled before limits are lifted.
+  # Prevents control-loop flapping.
+  cooldown_period: 60.0
 
 daemon:
-  # How often (in seconds) to poll system metrics and check for pressure
-  poll_interval_seconds: 3
-  
-  # Time (in seconds) before automatically resuming limits on a throttled process
-  resume_seconds: 10
-  
-  # Cooldown period (in seconds) - minimum time between actions on the same PID
-  # Prevents repeated throttling of the same process
-  cooldown_seconds: 15
-
-# Stress level thresholds (normalized to [0, 1] range)
-# Adjust based on your workload:
-# - Gaming rig: Higher thresholds (0.80, 0.90)
-# - Development laptop: Conservative (0.40, 0.60)
-# - Server: Aggressive (0.30, 0.50)
-thresholds:
-  low: 0.35        # Below this = system healthy
-  moderate: 0.50   # Light pressure - apply gentle limits
-  high: 0.70       # Heavy pressure - apply moderate limits
-  critical: 0.85   # Critical pressure - apply aggressive limits
-
-# Resource limits per stress level
-# cpu_weight: [1-10000] where 100=proportional, 50=50% share, 10=10% share
-# memory_limit_percent: [1-100] percentage of current memory usage
-# io_weight: [1-10000] I/O weight scheduling
-escalation:
-  low:
-    cpu_weight: 100        # No throttle
-    memory_limit_percent: 100  # No limit
-    io_weight: 100         # No throttle
-  
-  moderate:
-    cpu_weight: 50         # 50% CPU throttle
-    memory_limit_percent: 90   # Soft limit at 90% of current
-    io_weight: 50          # 50% I/O throttle
-  
-  high:
-    cpu_weight: 30         # 30% CPU throttle
-    memory_limit_percent: 75   # Hard limit at 75% of current
-    io_weight: 30          # 30% I/O throttle
-  
-  critical:
-    cpu_weight: 10         # 10% CPU throttle
-    memory_limit_percent: 50   # Hard limit at 50% of current
-    io_weight: 10          # 10% I/O throttle
-
-# Metric weights for stress score calculation
-# utilization score uses cpu/memory/io; PSI score uses pressure avg10 signals
-# psi_blend controls how much PSI influences the final stress score (0.0 to 1.0)
-metrics:
-  cpu_weight: 0.35
-  memory_weight: 0.25
-  io_weight: 0.15
-  psi_cpu_weight: 0.10
-  psi_memory_weight: 0.10
-  psi_io_weight: 0.05
-  psi_blend: 0.40
-
-# cgroup v2 configuration (Linux only)
-cgroup:
-  path: /sys/fs/cgroup/sentry_bg  # Path to SENTRY cgroup
-  enabled: true                    # Enable/disable cgroup control
-
-# Processes that should NEVER be throttled
-# Add critical system services here (e.g., your monitoring agent, init system)
-critical_processes:
-  - systemd
-  - gnome-shell
-  - Xorg
-  - pulseaudio
-  - pipewire
-  - python3      # SENTRY itself
-  - ps           # Process listing command
-
-# Logging configuration
-logging:
-  json_file: sentry_audit.json    # Structured JSON audit trail
-  text_file: sentry_log.txt        # Human-readable text logs
-  console: true                    # Log to console as well
-  console_level: INFO              # Console log level (DEBUG, INFO, WARNING, ERROR)
+  # Interval (in seconds) to ping the systemd watchdog and run the cooldown reconciler.
+  watchdog_interval: 5.0
