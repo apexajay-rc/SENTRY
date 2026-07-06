@@ -11,6 +11,7 @@ import time
 import signal
 import logging
 
+from core.config import ConfigParser
 from core.collectors.epoll_events import EpollReactor
 from core.collectors.psi import PsiMonitor
 from core.cgroup_manager import CgroupManager
@@ -27,26 +28,29 @@ logger = logging.getLogger(__name__)
 
 class SentryDaemon:
     def __init__(self):
-        # 1. System Plumbing
+        # 1. Load Configuration
+        self.config = ConfigParser.load()
+        
+        # 2. System Plumbing
         self.notifier = SystemdNotifier()
         self.reactor = EpollReactor()
         self.psi_monitor = PsiMonitor()
         
-        # 2. Execution & Safety
+        # 3. Execution & Safety
         self.cgroup_mgr = CgroupManager()
         self.safety_guard = SafetyGuard()
         
-        # 3. Intelligence & State
+        # 4. Intelligence & State
         self.selector = TargetSelector()
         self.reconciler = StateReconciler()
         
-        # 4. State variables
+        # 5. State variables
         self._running = False
         
-        # 5. Configuration Limits
-        self.memory_throttle_limit = "500M" 
-        self.watchdog_interval = 5.0    # Seconds between systemd pings
-        self.cooldown_period = 60.0     # Seconds before lifting cgroup limits
+        # 6. Apply Configuration Limits
+        self.memory_throttle_limit = self.config.memory_throttle_limit 
+        self.watchdog_interval = self.config.watchdog_interval
+        self.cooldown_period = self.config.cooldown_period
 
     def _handle_shutdown_signal(self, signum, frame):
         """Catches SIGTERM/SIGINT for graceful shutdown."""
@@ -79,7 +83,7 @@ class SentryDaemon:
             logger.warning(f"Could not resolve cgroup for PID {target_pid}. Cannot throttle.")
             return
 
-        logger.info(f"Applying memory throttle to PID {target_pid}")
+        logger.info(f"Applying memory throttle ({self.memory_throttle_limit}) to PID {target_pid}")
         success = self.cgroup_mgr.throttle_memory(target_pid, self.memory_throttle_limit)
         
         if success:
@@ -120,7 +124,8 @@ class SentryDaemon:
         last_watchdog_ping = time.time()
 
         try:
-            # Register kernel PSI trigger (e.g., memory stalled for 500ms within a 1s window)
+            # Register kernel PSI trigger (Memory stalled for 500ms within a 1s window)
+            # Future enhancement: Move these parameters into sentry_config.yaml
             mem_fd = self.psi_monitor.create_trigger("memory", "some", 500000, 1000000)
             self.reactor.register(mem_fd, self._pressure_callback)
 
@@ -128,9 +133,9 @@ class SentryDaemon:
             self.notifier.ready()
 
             while self._running:
-                # Wake up at least every 5 seconds to process cooldowns, 
+                # Wake up based on the watchdog interval to process cooldowns, 
                 # or instantly if the kernel triggers a PSI event.
-                self.reactor.poll(timeout=5.0)
+                self.reactor.poll(timeout=self.watchdog_interval)
                 
                 # Check for tasks that need un-throttling
                 self._process_reconciliations()
