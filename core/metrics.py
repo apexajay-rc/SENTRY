@@ -22,7 +22,7 @@ DEFAULT_METRIC_WEIGHTS = DEFAULT_PRESSURE_WEIGHTS
 _metric_weights = DEFAULT_METRIC_WEIGHTS.copy()
 
 
-def configure_metrics(config: "ConfigManager") -> None:
+def configure_metrics(config: "ConfigParser") -> None:
     global _metric_weights
     weights = config.metric_weights()
     _metric_weights = {
