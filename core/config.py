@@ -30,7 +30,7 @@ class ConfigParser:
     ]
 
     @classmethod
-    def load(cls, custom_path: str = None) -> SentryConfig:
+    def load(cls, custom_path: str | None = None) -> SentryConfig:
         """
         Locates, loads, and validates the configuration.
         Returns a SentryConfig object populated with defaults on failure.
