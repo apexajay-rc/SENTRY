@@ -41,7 +41,7 @@ ESCALATION_MATRIX = {
 }
 
 
-def configure_policy(config: "ConfigManager") -> None:
+def configure_policy(config: "ConfigParser") -> None:
     """Apply thresholds and escalation matrix from sentry_config.yaml."""
     global THRESHOLDS, ESCALATION_MATRIX
 
