@@ -10,7 +10,7 @@ if platform.system() == "Linux":
     PLATFORM = "Linux"
 
 elif platform.system() == "Windows":
-    from core.platform.windows import (
+    from core.platform.windows import (  # type: ignore[no-redef]
         calculate_cpu,
         get_memory_usage,
         get_io_wait,
