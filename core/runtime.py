@@ -9,7 +9,7 @@ from core.platform_adapter import PLATFORM
 from core.policy import configure_policy
 
 
-def init_runtime(config_file: Optional[str] = None) -> ConfigManager:
+def init_runtime(config_file: Optional[str] = None) -> ConfigParser:
     config = load_config(config_file)
     configure_policy(config)
     configure_metrics(config)
