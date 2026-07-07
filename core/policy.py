@@ -6,7 +6,7 @@ Defines stress levels and escalation thresholds.
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from core.config import ConfigManager
+    from core.config import ConfigParser
 
 # Stress level thresholds (customize based on workload)
 THRESHOLDS = {
