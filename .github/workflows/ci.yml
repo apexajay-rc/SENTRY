@@ -34,4 +34,4 @@ jobs:
 
     - name: Type check with mypy
       run: |
-        mypy daemon/ core/ engine/ --ignore-missing-imports
+        mypy daemon/ core/ engine/ --ignore-missing-imports --explicit-package-bases
