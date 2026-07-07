@@ -3,7 +3,7 @@
 from typing import Optional
 
 from core.cgroups import setup_cgroup
-from core.config import ConfigManager, load_config
+from core.config import ConfigParser, load_config
 from core.metrics import configure_metrics
 from core.platform_adapter import PLATFORM
 from core.policy import configure_policy
