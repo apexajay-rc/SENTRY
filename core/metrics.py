@@ -24,7 +24,7 @@ _metric_weights = DEFAULT_METRIC_WEIGHTS.copy()
 
 def configure_metrics(config: "ConfigParser") -> None:
     global _metric_weights
-    weights = config.metric_weights()
+    weights = config.metric_weights()  # type: ignore[attr-defined]
     _metric_weights = {
         key: weights.get(key, DEFAULT_METRIC_WEIGHTS[key])
         for key in DEFAULT_METRIC_WEIGHTS
