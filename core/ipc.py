@@ -19,7 +19,7 @@ def default_unix_socket_path() -> str:
     return "/tmp/sentry.sock"
 
 
-def resolve_ipc_endpoint() -> tuple[str, Any]:
+def resolve_ipc_endpoint() -> tuple[Any, ...]:
     override = os.environ.get("SENTRY_IPC_ENDPOINT")
     if override:
         return _parse_endpoint(override)
@@ -29,7 +29,7 @@ def resolve_ipc_endpoint() -> tuple[str, Any]:
     return ("tcp", DEFAULT_TCP_HOST, DEFAULT_TCP_PORT)
 
 
-def _parse_endpoint(value: str) -> tuple[str, Any]:
+def _parse_endpoint(value: str) -> tuple[Any, ...]:
     if value.startswith("unix:"):
         return ("unix", value[5:])
     if value.startswith("tcp:"):
@@ -133,14 +133,14 @@ class IpcServer:
     def __init__(
         self,
         state: DaemonState,
-        endpoint: Optional[tuple[str, Any]] = None,
+        endpoint: Optional[tuple[Any, ...]] = None,
     ):
         self.state = state
         self.endpoint = endpoint or resolve_ipc_endpoint()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._socket: Optional[socket.socket] = None
-        self.address: Optional[tuple[str, Any]] = None
+        self.address: Optional[tuple[Any, ...]] = None
 
     def start_background(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -202,7 +202,7 @@ class IpcServer:
 
 
 class IpcClient:
-    def __init__(self, endpoint: Optional[tuple[str, Any]] = None):
+    def __init__(self, endpoint: Optional[tuple[Any, ...]] = None):
         self.endpoint = endpoint or resolve_ipc_endpoint()
         self.timeout = 1.0
 
