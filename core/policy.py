@@ -45,7 +45,7 @@ def configure_policy(config: "ConfigParser") -> None:
     """Apply thresholds and escalation matrix from sentry_config.yaml."""
     global THRESHOLDS, ESCALATION_MATRIX
 
-    thresholds = config.all_thresholds()
+    thresholds = config.all_thresholds()  # type: ignore[attr-defined]
     THRESHOLDS = {
         "LOW": thresholds.get("low", 0.35),
         "MODERATE": thresholds.get("moderate", 0.50),
@@ -55,7 +55,7 @@ def configure_policy(config: "ConfigParser") -> None:
 
     ESCALATION_MATRIX = {}
     for level in ["LOW", "MODERATE", "HIGH", "CRITICAL"]:
-        ESCALATION_MATRIX[level] = config.get_escalation_actions(level)
+        ESCALATION_MATRIX[level] = config.get_escalation_actions(level)  # type: ignore[attr-defined]
 
 
 def classify_basic(stress_score):
