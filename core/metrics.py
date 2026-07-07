@@ -15,7 +15,7 @@ from engine.pressure import DEFAULT_PRESSURE_WEIGHTS, PressureEngine, compute_pr
 from model.pressure import PsiSample, UtilizationSample
 
 if TYPE_CHECKING:
-    from core.config import ConfigManager
+    from core.config import ConfigParser
 
 DEFAULT_METRIC_WEIGHTS = DEFAULT_PRESSURE_WEIGHTS
 
