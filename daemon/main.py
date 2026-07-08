@@ -151,7 +151,7 @@ class SentryDaemon:
         try:
             # 1. Initialize eBPF Sensor
             logger.info("Loading eBPF CO-RE sensor...")
-            self.bpf = BPF(obj_file="sensor.bpf.c")
+            self.bpf = BPF(src_file="sensor.bpf.c")
             self.bpf["events"].open_ring_buffer(self._handle_bpf_event)
 
             # 2. Register kernel PSI trigger (Memory stalled for 500ms within a 1s window)
