@@ -3,13 +3,16 @@ daemon/main.py
 
 The main entry point for the SENTRY daemon.
 Orchestrates the event-driven control loop, handles OS signals,
-and manages systemd integration.
+integrates eBPF telemetry, and manages systemd integration.
 """
 
 import sys
 import time
 import signal
 import logging
+import ctypes
+
+from bcc import BPF
 
 from core.config import ConfigParser
 from core.collectors.epoll_events import EpollReactor
@@ -26,6 +29,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# -------------------------------------------------------------------
+# eBPF Data Structure (The Translator)
+# MUST perfectly match the 'event_t' struct in sensor.bpf.c
+# -------------------------------------------------------------------
+class Event(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_uint32),
+        ("comm", ctypes.c_char * 16)
+    ]
+
+
 class SentryDaemon:
     def __init__(self):
         # 1. Load Configuration
@@ -35,6 +50,7 @@ class SentryDaemon:
         self.notifier = SystemdNotifier()
         self.reactor = EpollReactor()
         self.psi_monitor = PsiMonitor()
+        self.bpf = None  # eBPF Object reference
         
         # 3. Execution & Safety
         self.cgroup_mgr = CgroupManager()
@@ -57,6 +73,15 @@ class SentryDaemon:
         sig_name = signal.Signals(signum).name
         logger.info(f"Received signal {sig_name}. Initiating graceful shutdown...")
         self._running = False
+
+    def _handle_bpf_event(self, ctx, data, size):
+        """Callback triggered instantly when C code pushes to the Ring Buffer."""
+        event = ctypes.cast(data, ctypes.POINTER(Event)).contents
+        command = event.comm.decode('utf-8', 'replace').strip('\x00')
+        
+        # For now, we are just observing. In v1.1, this is where we will map
+        # process executions to our resource limits dynamically.
+        logger.info(f"⚡ [eBPF Sensor] Process Started -> PID: {event.pid} | Command: {command}")
 
     def _apply_mitigation(self):
         """Invoked when pressure crosses thresholds. Evaluates and throttles."""
@@ -124,23 +149,36 @@ class SentryDaemon:
         last_watchdog_ping = time.time()
 
         try:
-            # Register kernel PSI trigger (Memory stalled for 500ms within a 1s window)
-            # Future enhancement: Move these parameters into sentry_config.yaml
+            # 1. Initialize eBPF Sensor
+            logger.info("Loading eBPF CO-RE sensor...")
+            self.bpf = BPF(obj_file="sensor.bpf.o")
+            self.bpf["events"].open_ring_buffer(self._handle_bpf_event)
+
+            # 2. Register kernel PSI trigger (Memory stalled for 500ms within a 1s window)
             mem_fd = self.psi_monitor.create_trigger("memory", "some", 500000, 1000000)
             self.reactor.register(mem_fd, self._pressure_callback)
 
-            logger.info("SENTRY daemon initialized successfully. Entering watch state.")
+            logger.info("🛡️ SENTRY daemon fully armed (eBPF + PSI active). Entering watch state.")
             self.notifier.ready()
 
             while self._running:
-                # Wake up based on the watchdog interval to process cooldowns, 
-                # or instantly if the kernel triggers a PSI event.
-                self.reactor.poll(timeout=self.watchdog_interval)
+                # Tick every 200ms instead of full watchdog_interval.
+                # This keeps eBPF event ingestion near real-time without burning CPU.
+                self.reactor.poll(timeout=0.2)
+                
+                # Instantly consume any pending eBPF events from the C program
+                if self.bpf:
+                    try:
+                        # ring_buffer_consume is non-blocking
+                        self.bpf.ring_buffer_consume()
+                    except AttributeError:
+                        # Fallback for older BCC versions
+                        self.bpf.ring_buffer_poll(0)
                 
                 # Check for tasks that need un-throttling
                 self._process_reconciliations()
                 
-                # Ping systemd watchdog
+                # Ping systemd watchdog based on the actual interval setting
                 now = time.time()
                 if now - last_watchdog_ping >= self.watchdog_interval:
                     status_msg = f"WATCHDOG=1\nSTATUS=Monitoring. Throttled tasks: {self.reconciler.active_count()}"
@@ -154,7 +192,7 @@ class SentryDaemon:
             self.cleanup()
 
     def cleanup(self):
-        """Reverts limits, closes FDs, and signals shutdown to systemd."""
+        """Reverts limits, closes FDs, cleans BPF, and signals shutdown to systemd."""
         self.notifier.stopping()
         logger.info("Initiating cleanup. Reverting applied mitigations...")
         
@@ -164,9 +202,13 @@ class SentryDaemon:
             if current_cgroup == task.cgroup_path:
                 self.cgroup_mgr.reset_memory_throttle(task.pid)
                 
-        # Clean up file descriptors
+        # Clean up file descriptors and free kernel memory
         self.reactor.close()
         self.psi_monitor.cleanup_all()
+        
+        if self.bpf:
+            del self.bpf
+            
         logger.info("SENTRY shutdown complete.")
 
 if __name__ == "__main__":
