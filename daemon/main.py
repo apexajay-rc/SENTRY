@@ -11,6 +11,7 @@ import time
 import signal
 import logging
 import ctypes
+
 from engine.aggregator import CPUMonitor
 from bcc import BPF
 
@@ -61,6 +62,7 @@ class SentryDaemon:
         self.selector = TargetSelector()
         self.reconciler = StateReconciler()
         self.cpu_monitor = CPUMonitor(window_size_sec=1.0, cpu_limit_pct=85.0)
+        
         # 5. State variables
         self._running = False
         
@@ -68,6 +70,12 @@ class SentryDaemon:
         self.memory_throttle_limit = self.config.memory_throttle_limit 
         self.watchdog_interval = self.config.watchdog_interval
         self.cooldown_period = self.config.cooldown_period
+
+    def _handle_shutdown_signal(self, signum, frame):
+        """Catches SIGTERM/SIGINT for graceful shutdown."""
+        sig_name = signal.Signals(signum).name
+        logger.info(f"Received signal {sig_name}. Initiating graceful shutdown...")
+        self._running = False
 
     def _handle_bpf_event(self, ctx, data, size):
         """Callback triggered instantly when C code pushes to the Ring Buffer."""
@@ -91,23 +99,12 @@ class SentryDaemon:
             
             cgroup_path = self.cgroup_mgr.get_process_cgroup(event.pid)
             if cgroup_path:
-                logger.info(f"Applying strict CPU throttle to PID {event.pid}")
+                logger.info(f"Applying strict throttle to PID {event.pid}")
                 
-                # Use your existing cgroup manager to clamp the CPU
-                # (Assuming you have a throttle_cpu method, or just use memory as a proxy for now)
+                # Use your existing cgroup manager to clamp the process
                 success = self.cgroup_mgr.throttle_memory(event.pid, self.memory_throttle_limit)
                 if success:
                     self.reconciler.track(event.pid, cgroup_path)
-
-    def _handle_bpf_event(self, ctx, data, size):
-        """Callback triggered instantly when C code pushes to the Ring Buffer."""
-        event = ctypes.cast(data, ctypes.POINTER(Event)).contents
-        command = event.comm.decode('utf-8', 'replace').strip('\x00')
-        
-        # Convert nanoseconds to milliseconds for easier reading
-        duration_ms = event.duration_ns / 1_000_000.0
-        
-        logger.info(f"⚡ [CPU SENSOR] PID: {event.pid:<6} | Cmd: {command:<15} | CPU Burst: {duration_ms:.2f} ms")
 
     def _apply_mitigation(self):
         """Invoked when pressure crosses thresholds. Evaluates and throttles."""
