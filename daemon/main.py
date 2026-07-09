@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 class Event(ctypes.Structure):
     _fields_ = [
         ("pid", ctypes.c_uint32),
-        ("comm", ctypes.c_char * 16)
+        ("comm", ctypes.c_char * 16),
+        ("duration_ns", ctypes.c_uint64)  # <-- Added the new 64-bit int
     ]
 
 
@@ -68,11 +69,15 @@ class SentryDaemon:
         self.watchdog_interval = self.config.watchdog_interval
         self.cooldown_period = self.config.cooldown_period
 
-    def _handle_shutdown_signal(self, signum, frame):
-        """Catches SIGTERM/SIGINT for graceful shutdown."""
-        sig_name = signal.Signals(signum).name
-        logger.info(f"Received signal {sig_name}. Initiating graceful shutdown...")
-        self._running = False
+    def _handle_bpf_event(self, ctx, data, size):
+        """Callback triggered instantly when C code pushes to the Ring Buffer."""
+        event = ctypes.cast(data, ctypes.POINTER(Event)).contents
+        command = event.comm.decode('utf-8', 'replace').strip('\x00')
+        
+        # Convert nanoseconds to milliseconds for easier reading
+        duration_ms = event.duration_ns / 1_000_000.0
+        
+        logger.info(f"⚡ [CPU SENSOR] PID: {event.pid:<6} | Cmd: {command:<15} | CPU Burst: {duration_ms:.2f} ms")
 
     def _handle_bpf_event(self, ctx, data, size):
         """Callback triggered instantly when C code pushes to the Ring Buffer."""
