@@ -11,7 +11,7 @@ import time
 import signal
 import logging
 import ctypes
-
+from engine.aggregator import CPUMonitor
 from bcc import BPF
 
 from core.config import ConfigParser
@@ -60,7 +60,7 @@ class SentryDaemon:
         # 4. Intelligence & State
         self.selector = TargetSelector()
         self.reconciler = StateReconciler()
-        
+        self.cpu_monitor = CPUMonitor(window_size_sec=1.0, cpu_limit_pct=85.0)
         # 5. State variables
         self._running = False
         
@@ -69,11 +69,35 @@ class SentryDaemon:
         self.watchdog_interval = self.config.watchdog_interval
         self.cooldown_period = self.config.cooldown_period
 
-    def _handle_shutdown_signal(self, signum, frame):
-        """Catches SIGTERM/SIGINT for graceful shutdown."""
-        sig_name = signal.Signals(signum).name
-        logger.info(f"Received signal {sig_name}. Initiating graceful shutdown...")
-        self._running = False
+    def _handle_bpf_event(self, ctx, data, size):
+        """Callback triggered instantly when C code pushes to the Ring Buffer."""
+        event = ctypes.cast(data, ctypes.POINTER(Event)).contents
+        command = event.comm.decode('utf-8', 'replace').strip('\x00')
+        
+        # 1. Feed the burst to the Aggregator Brain
+        violation_pct = self.cpu_monitor.add_burst(event.pid, event.duration_ns)
+        
+        # 2. If it crosses our 85% threshold, Enforce!
+        if violation_pct:
+            # Don't spam the throttle if it's already in the penalty box
+            if self.reconciler.is_tracked(event.pid):
+                return
+                
+            # Check the Safety Guard (don't kill sshd or systemd)
+            if self.safety_guard.is_protected(event.pid):
+                return
+                
+            logger.warning(f"🚨 CPU VIOLATION: PID {event.pid} ({command}) is at {violation_pct:.1f}% CPU!")
+            
+            cgroup_path = self.cgroup_mgr.get_process_cgroup(event.pid)
+            if cgroup_path:
+                logger.info(f"Applying strict CPU throttle to PID {event.pid}")
+                
+                # Use your existing cgroup manager to clamp the CPU
+                # (Assuming you have a throttle_cpu method, or just use memory as a proxy for now)
+                success = self.cgroup_mgr.throttle_memory(event.pid, self.memory_throttle_limit)
+                if success:
+                    self.reconciler.track(event.pid, cgroup_path)
 
     def _handle_bpf_event(self, ctx, data, size):
         """Callback triggered instantly when C code pushes to the Ring Buffer."""
