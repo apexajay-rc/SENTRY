@@ -38,7 +38,7 @@ class Event(ctypes.Structure):
     _fields_ = [
         ("pid", ctypes.c_uint32),
         ("comm", ctypes.c_char * 16),
-        ("duration_ns", ctypes.c_uint64)  # <-- Added the new 64-bit int
+        ("duration_ns", ctypes.c_uint64)  # <-- The new 64-bit int for CPU time
     ]
 
 
@@ -78,15 +78,6 @@ class SentryDaemon:
         duration_ms = event.duration_ns / 1_000_000.0
         
         logger.info(f"⚡ [CPU SENSOR] PID: {event.pid:<6} | Cmd: {command:<15} | CPU Burst: {duration_ms:.2f} ms")
-
-    def _handle_bpf_event(self, ctx, data, size):
-        """Callback triggered instantly when C code pushes to the Ring Buffer."""
-        event = ctypes.cast(data, ctypes.POINTER(Event)).contents
-        command = event.comm.decode('utf-8', 'replace').strip('\x00')
-        
-        # For now, we are just observing. In v1.1, this is where we will map
-        # process executions to our resource limits dynamically.
-        logger.info(f"⚡ [eBPF Sensor] Process Started -> PID: {event.pid} | Command: {command}")
 
     def _apply_mitigation(self):
         """Invoked when pressure crosses thresholds. Evaluates and throttles."""
