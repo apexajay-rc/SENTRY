@@ -33,14 +33,16 @@ class CgroupManager:
         parts = rel_path.split(os.sep)
         current_path = self.CGROUP_ROOT
         
-        # Write to subtree_control in root, and every parent directory up to the leaf
-        for part in parts[:-1]: 
+        # FIX: Iterate through ALL parts (removed [:-1]). 
+        # Writing before appending the part perfectly hits every parent directory,
+        # ensuring the immediate parent of the target gets the delegation command.
+        for part in parts: 
             subtree_file = os.path.join(current_path, "cgroup.subtree_control")
             try:
                 with open(subtree_file, "w") as f:
                     f.write(f"+{controller}\n")
             except OSError as e:
-                # Systemd might lock some internal nodes, we log as debug and continue
+                # Systemd locks some internal nodes. We log as debug and continue.
                 logger.debug(f"Failed to delegate {controller} at {current_path}: {e}")
             
             current_path = os.path.join(current_path, part)
