@@ -99,10 +99,10 @@ class SentryDaemon:
             
             cgroup_path = self.cgroup_mgr.get_process_cgroup(event.pid)
             if cgroup_path:
-                logger.info(f"Applying strict throttle to PID {event.pid}")
+                logger.info(f"Applying strict CPU throttle (20%) to PID {event.pid}")
                 
-                # Use your existing cgroup manager to clamp the process
-                success = self.cgroup_mgr.throttle_memory(event.pid, self.memory_throttle_limit)
+                # Apply a CPU punishment for a CPU crime!
+                success = self.cgroup_mgr.throttle_cpu(event.pid, cpu_quota_pct=20)
                 if success:
                     self.reconciler.track(event.pid, cgroup_path)
 
@@ -156,8 +156,9 @@ class SentryDaemon:
                     "Dropping from SENTRY state without altering cgroup limits."
                 )
             else:
-                logger.info(f"Cooldown expired for PID {task.pid}. Releasing throttle.")
+                logger.info(f"Cooldown expired for PID {task.pid}. Releasing throttles.")
                 self.cgroup_mgr.reset_memory_throttle(task.pid)
+                self.cgroup_mgr.reset_cpu_throttle(task.pid)
             
             # Always remove from our tracking state
             self.reconciler.drop(task.pid)
@@ -224,6 +225,7 @@ class SentryDaemon:
             current_cgroup = self.cgroup_mgr.get_process_cgroup(task.pid)
             if current_cgroup == task.cgroup_path:
                 self.cgroup_mgr.reset_memory_throttle(task.pid)
+                self.cgroup_mgr.reset_cpu_throttle(task.pid)
                 
         # Clean up file descriptors and free kernel memory
         self.reactor.close()
