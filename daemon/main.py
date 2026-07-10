@@ -131,8 +131,13 @@ class SentryDaemon:
             logger.warning(f"Could not resolve cgroup for PID {target_pid}. Cannot throttle.")
             return
 
-        logger.info(f"Applying memory throttle ({self.memory_throttle_limit}) to PID {target_pid}")
-        success = self.cgroup_mgr.throttle_memory(target_pid, self.memory_throttle_limit)
+        # ---------------------------------------------------------
+        # THE FIX: Swap the lethal memory throttle for a safe CPU throttle!
+        # By slowing down the CPU, the process stops allocating RAM so fast,
+        # allowing the OS to recover without triggering the OOM Killer.
+        # ---------------------------------------------------------
+        logger.info(f"Applying CPU throttle (20%) to mitigate resource pressure for PID {target_pid}")
+        success = self.cgroup_mgr.throttle_cpu(target_pid, cpu_quota_pct=20)
         
         if success:
             self.reconciler.track(target_pid, cgroup_path)
