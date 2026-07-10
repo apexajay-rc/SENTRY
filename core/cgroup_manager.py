@@ -21,32 +21,55 @@ class CgroupManager:
     def __init__(self) -> None:
         self._verify_cgroup_v2()
 
+    def _delegate_controller(self, cgroup_path: str, controller: str = "cpu") -> None:
+        """
+        Walks from the cgroup root down to the parent of the target,
+        enabling the specified controller in cgroup.subtree_control.
+        """
+        rel_path = os.path.relpath(cgroup_path, self.CGROUP_ROOT)
+        if rel_path == ".":
+            return
+            
+        parts = rel_path.split(os.sep)
+        current_path = self.CGROUP_ROOT
+        
+        # Write to subtree_control in root, and every parent directory up to the leaf
+        for part in parts[:-1]: 
+            subtree_file = os.path.join(current_path, "cgroup.subtree_control")
+            try:
+                with open(subtree_file, "w") as f:
+                    f.write(f"+{controller}\n")
+            except OSError as e:
+                # Systemd might lock some internal nodes, we log as debug and continue
+                logger.debug(f"Failed to delegate {controller} at {current_path}: {e}")
+            
+            current_path = os.path.join(current_path, part)
+
     def throttle_cpu(self, pid: int, cpu_quota_pct: int = 20) -> bool:
         """
         Clamps the CPU usage of a process using cgroups v2 cpu.max.
-        cpu_quota_pct: The maximum percentage of one CPU core the process can use (e.g., 20).
         """
         cgroup_path = self.get_process_cgroup(pid)
         if not cgroup_path:
             return False
             
-        # In cgroups v2, the default period is 100,000 microseconds.
-        # If we want 20% CPU, the quota is 20,000.
-        quota = int((cpu_quota_pct / 100.0) * 100000)
+        # 1. Force the kernel to enable the CPU controller for this path
+        self._delegate_controller(cgroup_path, "cpu")
         
-        cpu_max_file = f"{cgroup_path}/cpu.max"
+        cpu_max_file = os.path.join(cgroup_path, "cpu.max")
+        
+        # 2. Verify the file actually materialized
+        if not os.path.exists(cpu_max_file):
+            logger.error(f"CPU controller delegation failed. {cpu_max_file} does not exist.")
+            return False
+            
+        quota = int((cpu_quota_pct / 100.0) * 100000)
         
         try:
             with open(cpu_max_file, 'w') as f:
                 f.write(f"{quota} 100000\n")
             logger.info(f"Successfully set cpu.max to '{quota} 100000' ({cpu_quota_pct}%) for {cgroup_path}")
             return True
-        except PermissionError:
-            logger.error(f"Permission denied: Cannot write to {cpu_max_file}. Are you root?")
-            return False
-        except FileNotFoundError:
-            logger.warning(f"cpu.max not found at {cgroup_path}. Is the CPU controller enabled?")
-            return False
         except Exception as e:
             logger.error(f"Failed to set CPU throttle: {e}")
             return False
@@ -57,9 +80,11 @@ class CgroupManager:
         if not cgroup_path:
             return False
             
-        cpu_max_file = f"{cgroup_path}/cpu.max"
+        cpu_max_file = os.path.join(cgroup_path, "cpu.max")
+        if not os.path.exists(cpu_max_file):
+            return False
+            
         try:
-            # Writing 'max' removes the quota limit
             with open(cpu_max_file, 'w') as f:
                 f.write("max 100000\n")
             logger.info(f"Successfully removed CPU throttle for {cgroup_path}")
@@ -78,23 +103,13 @@ class CgroupManager:
             )
 
     def get_process_cgroup(self, pid: int) -> Optional[str]:
-        """
-        Resolves the cgroup path for a given PID.
-        
-        Args:
-            pid: The process ID.
-            
-        Returns:
-            The absolute path to the process's cgroup directory, or None if failed.
-        """
+        """Resolves the cgroup path for a given PID."""
         cgroup_file = f"/proc/{pid}/cgroup"
         try:
             with open(cgroup_file, "r") as f:
                 for line in f:
-                    # cgroup v2 format is `0::/path/to/cgroup`
                     if line.startswith("0::"):
                         cgroup_path = line.strip().split("::", 1)[1]
-                        # Remove leading slash to join correctly with CGROUP_ROOT
                         if cgroup_path.startswith("/"):
                             cgroup_path = cgroup_path[1:]
                         return os.path.join(self.CGROUP_ROOT, cgroup_path)
@@ -109,7 +124,6 @@ class CgroupManager:
         return None
 
     def read_limit(self, cgroup_path: str, limit_file: str) -> Optional[str]:
-        """Reads a specific limit from a cgroup directory."""
         target = os.path.join(cgroup_path, limit_file)
         try:
             with open(target, "r") as f:
@@ -121,17 +135,6 @@ class CgroupManager:
             return None
 
     def write_limit(self, cgroup_path: str, limit_file: str, value: str) -> bool:
-        """
-        Writes a value to a cgroup limit file.
-        
-        Args:
-            cgroup_path: The directory of the cgroup.
-            limit_file: The specific controller file (e.g., 'memory.high').
-            value: The string value to write (e.g., '500M' or 'max').
-            
-        Returns:
-            True if successful, False otherwise.
-        """
         target = os.path.join(cgroup_path, limit_file)
         try:
             with open(target, "w") as f:
@@ -149,14 +152,12 @@ class CgroupManager:
             return False
 
     def throttle_memory(self, pid: int, limit_bytes: int) -> bool:
-        """Applies a memory.high throttle to a specific PID's cgroup."""
         cgroup = self.get_process_cgroup(pid)
         if not cgroup:
             return False
         return self.write_limit(cgroup, "memory.high", str(limit_bytes))
 
     def reset_memory_throttle(self, pid: int) -> bool:
-        """Removes the memory.high throttle (sets to 'max')."""
         cgroup = self.get_process_cgroup(pid)
         if not cgroup:
             return False
