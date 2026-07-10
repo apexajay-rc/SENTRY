@@ -39,16 +39,16 @@ class CgroupManager:
         try:
             with open(cpu_max_file, 'w') as f:
                 f.write(f"{quota} 100000\n")
-            self.logger.info(f"Successfully set cpu.max to '{quota} 100000' ({cpu_quota_pct}%) for {cgroup_path}")
+            logger.info(f"Successfully set cpu.max to '{quota} 100000' ({cpu_quota_pct}%) for {cgroup_path}")
             return True
         except PermissionError:
-            self.logger.error(f"Permission denied: Cannot write to {cpu_max_file}. Are you root?")
+            logger.error(f"Permission denied: Cannot write to {cpu_max_file}. Are you root?")
             return False
         except FileNotFoundError:
-            self.logger.warning(f"cpu.max not found at {cgroup_path}. Is the CPU controller enabled?")
+            logger.warning(f"cpu.max not found at {cgroup_path}. Is the CPU controller enabled?")
             return False
         except Exception as e:
-            self.logger.error(f"Failed to set CPU throttle: {e}")
+            logger.error(f"Failed to set CPU throttle: {e}")
             return False
 
     def reset_cpu_throttle(self, pid: int) -> bool:
@@ -62,10 +62,10 @@ class CgroupManager:
             # Writing 'max' removes the quota limit
             with open(cpu_max_file, 'w') as f:
                 f.write("max 100000\n")
-            self.logger.info(f"Successfully removed CPU throttle for {cgroup_path}")
+            logger.info(f"Successfully removed CPU throttle for {cgroup_path}")
             return True
         except Exception as e:
-            self.logger.error(f"Failed to reset CPU throttle: {e}")
+            logger.error(f"Failed to reset CPU throttle: {e}")
             return False
 
     def _verify_cgroup_v2(self) -> None:
