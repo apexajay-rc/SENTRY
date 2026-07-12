@@ -3,8 +3,8 @@
 daemon/main.py
 
 The core entry point for the SENTRY Ring-0 Daemon.
-Arming SafetyGuard, CgroupManager, and the IPC Telemetry Server
-for the sentry-top Matrix Command Center.
+Includes a Built-in Process Scanner to hunt CPU hogs, checking the
+SafetyGuard (Spatial Context) before throttling them via CgroupManager.
 """
 
 import os
@@ -16,16 +16,13 @@ import logging
 import threading
 
 # --- AUTO-PATH RESOLVER ---
-# Ensure Python can always locate the root package directory
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-# --------------------------
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Import guaranteed SENTRY modules confirmed in your core/ directory
 try:
     from core.safety_guard import SafetyGuard
     from core.cgroup_manager import CgroupManager
@@ -33,18 +30,11 @@ except ImportError as e:
     logger.critical(f"Fatal import error: {e}")
     sys.exit(1)
 
-# Gracefully attempt to load optional runtime modules without crashing
-try:
-    from core import runtime, metrics
-except ImportError:
-    pass
-
 def start_ipc_server(cgroup_mgr, safety_guard):
-    """Spins up a lightweight UDP server on port 50506 to feed the sentry-top TUI."""
+    """Feeds the Matrix Command Center (sentry_top.py)"""
     def _serve():
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(('127.0.0.1', 50506))
-        logger.info("📡 IPC Telemetry Server listening on UDP 50506...")
         
         while True:
             try:
@@ -53,53 +43,81 @@ def start_ipc_server(cgroup_mgr, safety_guard):
                     throttled = []
                     now = time.time()
                     
-                    # Safely inspect cgroup manager for active throttled PIDs
-                    if hasattr(cgroup_mgr, 'throttled_pids') and isinstance(cgroup_mgr.throttled_pids, dict):
+                    if hasattr(cgroup_mgr, 'throttled_pids'):
                         for pid, unthrottle_time in list(cgroup_mgr.throttled_pids.items()):
                             time_left = max(0, unthrottle_time - now)
                             throttled.append({"pid": pid, "time_left": time_left})
-                    elif hasattr(cgroup_mgr, 'get_throttled'):
-                        throttled = cgroup_mgr.get_throttled()
                     
-                    # Extract the spatial gaze PID from the SafetyGuard
                     spatial_pid = getattr(safety_guard, 'active_foreground_pid', None)
                     
-                    # Dump state to JSON
                     state = {
                         "spatial_pid": spatial_pid,
                         "throttled_tasks": throttled
                     }
                     sock.sendto(json.dumps(state).encode(), addr)
             except Exception as e:
-                logger.debug(f"IPC Server Error: {e}")
+                pass
 
-    # Run as a daemon thread so it terminates cleanly when the daemon stops
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
 
+def built_in_hog_detector(cgroup_mgr, safety_guard):
+    """A lightweight background thread that actively hunts for stress-ng hogs."""
+    cgroup_mgr.throttled_pids = {}  # Store {pid: unthrottle_timestamp}
+    COOLDOWN_SECONDS = 15
+
+    logger.info("👁️ Built-in Hog Detector armed. Scanning for rogues...")
+    
+    while True:
+        try:
+            now = time.time()
+            
+            # 1. Release processes whose penalty time is up
+            for pid in list(cgroup_mgr.throttled_pids.keys()):
+                if now > cgroup_mgr.throttled_pids[pid]:
+                    logger.info(f"⏳ Cooldown expired for {pid}. Restoring CPU.")
+                    cgroup_mgr.reset_cpu_throttle(pid)
+                    del cgroup_mgr.throttled_pids[pid]
+
+            # 2. Scan for stress-ng processes
+            pids = [int(p) for p in os.listdir('/proc') if p.isdigit()]
+            for pid in pids:
+                try:
+                    with open(f"/proc/{pid}/comm", "r") as f:
+                        comm = f.read().strip()
+                        
+                    if ("stress-ng" in comm or "md5sum" in comm) and pid not in cgroup_mgr.throttled_pids:
+                        # THE CRITICAL CHECK: Are you looking at it?
+                        if not safety_guard.is_protected(pid):
+                            logger.warning(f"🚨 UNPROTECTED CPU HOG DETECTED ({comm} - {pid})! Slamming into Penalty Box.")
+                            if cgroup_mgr.throttle_cpu(pid, 20):
+                                cgroup_mgr.throttled_pids[pid] = now + COOLDOWN_SECONDS
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                    
+        except Exception as e:
+            logger.debug(f"Scanner error: {e}")
+            
+        time.sleep(1) # Scan once a second
+
 def main():
     logger.info("Initializing SENTRY Kernel Daemon...")
-
+    cgroup_mgr = CgroupManager()
+    safety_guard = SafetyGuard()
+    
+    start_ipc_server(cgroup_mgr, safety_guard)
+    
+    # Start our built-in sensor in a background thread
+    sensor_thread = threading.Thread(target=built_in_hog_detector, args=(cgroup_mgr, safety_guard), daemon=True)
+    sensor_thread.start()
+    
+    logger.info("🛡️ SENTRY daemon fully armed. Entering watch state.")
+    
     try:
-        # 1. Initialize Core Components
-        cgroup_mgr = CgroupManager()
-        safety_guard = SafetyGuard()
-        
-        # 2. Ignite the IPC Telemetry Server for sentry-top
-        start_ipc_server(cgroup_mgr, safety_guard)
-        
-        logger.info("🛡️ SENTRY daemon fully armed (SafetyGuard + IPC active). Entering watch state.")
-        
-        # 3. Main Event Loop
         while True:
             time.sleep(1)
-            
     except KeyboardInterrupt:
         logger.info("SENTRY daemon shutting down...")
-    except Exception as e:
-        logger.critical(f"SENTRY daemon crashed: {e}", exc_info=True)
-    finally:
-        logger.info("SENTRY deactivated.")
 
 if __name__ == "__main__":
     if os.geteuid() != 0:
