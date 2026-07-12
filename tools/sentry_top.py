@@ -26,7 +26,7 @@ def get_process_name(pid):
 def fetch_sentry_state():
     """Pings the SENTRY daemon for a brain-dump."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.1) # Don't block the UI if SENTRY is offline
+    sock.settimeout(0.2) # Don't block the UI if SENTRY is offline
     try:
         sock.sendto(b"STATUS", (UDP_IP, IPC_PORT))
         data, _ = sock.recvfrom(4096)
@@ -67,7 +67,7 @@ def draw_hud(stdscr):
         if state is None:
             err_msg = "[!] DAEMON OFFLINE OR UNREACHABLE"
             stdscr.addstr(4, max_x // 2 - len(err_msg) // 2, err_msg, curses.color_pair(2) | curses.A_BOLD)
-            stdscr.addstr(5, max_x // 2 - 15, "Ensure 'sudo python3 -m daemon.main' is running.")
+            stdscr.addstr(5, max_x // 2 - 24, "Ensure 'sudo python3 -m daemon.main' is running.")
         else:
             # --- PILLAR 1: SPATIAL CONTEXT ---
             spatial_pid = state.get("spatial_pid")
