@@ -26,6 +26,9 @@ from core.safety_guard import SafetyGuard
 from daemon.systemd_integration import SystemdNotifier
 from engine.reconciliation import StateReconciler
 from engine.selector import TargetSelector
+import threading
+import socket
+import json
 
 logging.basicConfig(
     level=logging.INFO,
