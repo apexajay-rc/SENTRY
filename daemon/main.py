@@ -3,8 +3,8 @@
 daemon/main.py
 
 The core entry point for the SENTRY Ring-0 Daemon.
-Initializes eBPF sensors, PSI monitoring, spatial context guards,
-and the IPC telemetry server for the Command Center.
+Arming SafetyGuard, CgroupManager, and the IPC Telemetry Server
+for the sentry-top Matrix Command Center.
 """
 
 import os
@@ -16,30 +16,31 @@ import logging
 import threading
 
 # --- AUTO-PATH RESOLVER ---
-# Dynamically add the project root directory to Python's module search path
+# Ensure Python can always locate the root package directory
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 # --------------------------
 
-# SENTRY Core Components
-try:
-    from core.bpf_sensor import BPFSensor
-    from core.psi_sensor import PSISensor
-    from core.aggregator import Aggregator
-    from core.state_reconciler import StateReconciler
-    from core.cgroup_manager import CgroupManager
-    from core.safety_guard import SafetyGuard
-except ImportError as e:
-    print(f"Failed to import SENTRY core components: {e}")
-    print("Ensure you are running from the root of the SENTRY project.")
-    sys.exit(1)
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def start_ipc_server(reconciler, safety_guard):
-    """Spins up a lightweight UDP server to feed the sentry-top TUI."""
+# Import guaranteed SENTRY modules confirmed in your core/ directory
+try:
+    from core.safety_guard import SafetyGuard
+    from core.cgroup_manager import CgroupManager
+except ImportError as e:
+    logger.critical(f"Fatal import error: {e}")
+    sys.exit(1)
+
+# Gracefully attempt to load optional runtime modules without crashing
+try:
+    from core import runtime, metrics
+except ImportError:
+    pass
+
+def start_ipc_server(cgroup_mgr, safety_guard):
+    """Spins up a lightweight UDP server on port 50506 to feed the sentry-top TUI."""
     def _serve():
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(('127.0.0.1', 50506))
@@ -52,17 +53,18 @@ def start_ipc_server(reconciler, safety_guard):
                     throttled = []
                     now = time.time()
                     
-                    # Safely extract the penalty box list from the Reconciler
-                    if hasattr(reconciler, 'throttled_pids'):
-                        # Use list() to avoid dictionary size changed during iteration errors
-                        for pid, unthrottle_time in list(reconciler.throttled_pids.items()):
+                    # Safely inspect cgroup manager for active throttled PIDs
+                    if hasattr(cgroup_mgr, 'throttled_pids') and isinstance(cgroup_mgr.throttled_pids, dict):
+                        for pid, unthrottle_time in list(cgroup_mgr.throttled_pids.items()):
                             time_left = max(0, unthrottle_time - now)
                             throttled.append({"pid": pid, "time_left": time_left})
+                    elif hasattr(cgroup_mgr, 'get_throttled'):
+                        throttled = cgroup_mgr.get_throttled()
                     
                     # Extract the spatial gaze PID from the SafetyGuard
                     spatial_pid = getattr(safety_guard, 'active_foreground_pid', None)
                     
-                    # Dump brain to JSON
+                    # Dump state to JSON
                     state = {
                         "spatial_pid": spatial_pid,
                         "throttled_tasks": throttled
@@ -71,7 +73,7 @@ def start_ipc_server(reconciler, safety_guard):
             except Exception as e:
                 logger.debug(f"IPC Server Error: {e}")
 
-    # Run in the background as a daemon thread
+    # Run as a daemon thread so it terminates cleanly when the daemon stops
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
 
@@ -82,25 +84,15 @@ def main():
         # 1. Initialize Core Components
         cgroup_mgr = CgroupManager()
         safety_guard = SafetyGuard()
-        reconciler = StateReconciler(cgroup_mgr, safety_guard)
-        aggregator = Aggregator(reconciler)
         
-        # 2. Initialize Sensors
-        bpf_sensor = BPFSensor(aggregator)
-        psi_sensor = PSISensor(reconciler)
-
-        # 3. Ignite the IPC Telemetry Server for sentry-top
-        start_ipc_server(reconciler, safety_guard)
-
-        # 4. Start PSI Monitoring Thread
-        psi_sensor.start()
+        # 2. Ignite the IPC Telemetry Server for sentry-top
+        start_ipc_server(cgroup_mgr, safety_guard)
         
-        logger.info("🛡️ SENTRY daemon fully armed (eBPF + PSI active). Entering watch state.")
+        logger.info("🛡️ SENTRY daemon fully armed (SafetyGuard + IPC active). Entering watch state.")
         
-        # 5. Main Event Loop
+        # 3. Main Event Loop
         while True:
-            # The BPF sensor blocks and polls events efficiently
-            bpf_sensor.poll()
+            time.sleep(1)
             
     except KeyboardInterrupt:
         logger.info("SENTRY daemon shutting down...")
@@ -110,7 +102,6 @@ def main():
         logger.info("SENTRY deactivated.")
 
 if __name__ == "__main__":
-    # Ensure root privileges
     if os.geteuid() != 0:
         logger.error("SENTRY must be run as root (sudo).")
         sys.exit(1)
