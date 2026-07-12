@@ -15,6 +15,42 @@ import time
 IPC_PORT = 50506
 UDP_IP = "127.0.0.1"
 
+def start_ipc_server(reconciler, safety_guard):
+    """Spins up a lightweight UDP server to feed the sentry-top TUI."""
+    def _serve():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('127.0.0.1', 50506))
+        logging.info("IPC Telemetry Server listening on UDP 50506...")
+        
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024)
+                if data == b"STATUS":
+                    throttled = []
+                    now = time.time()
+                    
+                    # Safely extract the penalty box list from the Reconciler
+                    if hasattr(reconciler, 'throttled_pids'):
+                        # Use list() to avoid dictionary size changed during iteration errors
+                        for pid, unthrottle_time in list(reconciler.throttled_pids.items()):
+                            time_left = max(0, unthrottle_time - now)
+                            throttled.append({"pid": pid, "time_left": time_left})
+                    
+                    # Extract the spatial gaze PID from the SafetyGuard
+                    spatial_pid = getattr(safety_guard, 'active_foreground_pid', None)
+                    
+                    # Dump brain to JSON
+                    state = {
+                        "spatial_pid": spatial_pid,
+                        "throttled_tasks": throttled
+                    }
+                    sock.sendto(json.dumps(state).encode(), addr)
+            except Exception as e:
+                logging.debug(f"IPC Server Error: {e}")
+
+    # Run in the background
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
 def get_process_name(pid):
     """Attempt to resolve the process name for a cleaner UI."""
     try:
