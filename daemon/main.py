@@ -3,8 +3,7 @@
 daemon/main.py
 
 The core entry point for the SENTRY Ring-0 Daemon.
-Includes a Built-in Process Scanner to hunt CPU hogs, checking the
-SafetyGuard (Spatial Context) before throttling them via CgroupManager.
+Now upgraded to Phase 1: eBPF Behavioral Fingerprinting.
 """
 
 import os
@@ -26,6 +25,7 @@ logger = logging.getLogger(__name__)
 try:
     from core.safety_guard import SafetyGuard
     from core.cgroup_manager import CgroupManager
+    from core.bpf_sensor import BPFSensor
 except ImportError as e:
     logger.critical(f"Fatal import error: {e}")
     sys.exit(1)
@@ -61,12 +61,19 @@ def start_ipc_server(cgroup_mgr, safety_guard):
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
 
-def built_in_hog_detector(cgroup_mgr, safety_guard):
-    """A lightweight background thread that actively hunts for stress-ng hogs."""
-    cgroup_mgr.throttled_pids = {}  # Store {pid: unthrottle_timestamp}
+def bpf_hog_detector(cgroup_mgr, safety_guard):
+    """Actively queries the eBPF kernel maps for behavioral CPU hogs."""
+    cgroup_mgr.throttled_pids = {}
     COOLDOWN_SECONDS = 15
 
-    logger.info("👁️ Built-in Hog Detector armed. Scanning for rogues...")
+    sensor = BPFSensor()
+    try:
+        sensor.start()
+    except Exception as e:
+        logger.critical(f"Failed to start eBPF sensor: {e}")
+        sys.exit(1)
+        
+    logger.info("👁️ eBPF Behavioral Sensor armed. Mapping kernel scheduler...")
     
     while True:
         try:
@@ -77,28 +84,42 @@ def built_in_hog_detector(cgroup_mgr, safety_guard):
                 if now > cgroup_mgr.throttled_pids[pid]:
                     logger.info(f"⏳ Cooldown expired for {pid}. Restoring CPU.")
                     cgroup_mgr.reset_cpu_throttle(pid)
+                    try:
+                        os.setpriority(os.PRIO_PROCESS, pid, 0)
+                    except Exception:
+                        pass
                     del cgroup_mgr.throttled_pids[pid]
 
-            # 2. Scan for stress-ng processes
-            pids = [int(p) for p in os.listdir('/proc') if p.isdigit()]
-            for pid in pids:
-                try:
-                    with open(f"/proc/{pid}/comm", "r") as f:
-                        comm = f.read().strip()
+            # 2. Query the eBPF map for processes that burned > 500ms of CPU in the last second
+            # 500,000,000 nanoseconds = 500ms
+            hog_pids = sensor.get_top_hogs(threshold_ns=500000000)
+            
+            for pid in hog_pids:
+                if pid not in cgroup_mgr.throttled_pids:
+                    # THE CRITICAL CHECK: Are you looking at it? Is it a core daemon?
+                    if not safety_guard.is_protected(pid):
                         
-                    if ("stress-ng" in comm or "md5sum" in comm) and pid not in cgroup_mgr.throttled_pids:
-                        # THE CRITICAL CHECK: Are you looking at it?
-                        if not safety_guard.is_protected(pid):
-                            logger.warning(f"🚨 UNPROTECTED CPU HOG DETECTED ({comm} - {pid})! Slamming into Penalty Box.")
-                            if cgroup_mgr.throttle_cpu(pid, 20):
-                                cgroup_mgr.throttled_pids[pid] = now + COOLDOWN_SECONDS
-                except (FileNotFoundError, ProcessLookupError):
-                    continue
-                    
+                        # Grab the name just for logging purposes
+                        comm = "unknown"
+                        try:
+                            with open(f"/proc/{pid}/comm", "r") as f:
+                                comm = f.read().strip()
+                        except: pass
+                            
+                        logger.warning(f"🚨 eBPF BEHAVIORAL HOG DETECTED ({comm} - {pid})! Slamming into Penalty Box.")
+                        
+                        cgroup_mgr.throttled_pids[pid] = now + COOLDOWN_SECONDS
+                        if not cgroup_mgr.throttle_cpu(pid, 20):
+                            logger.warning(f"⚠️ Cgroup bypass detected. Deploying OS-level Scheduler Penalty (Nice 19) for {pid}.")
+                            try:
+                                os.setpriority(os.PRIO_PROCESS, pid, 19)
+                            except Exception:
+                                pass
+                                
         except Exception as e:
             logger.debug(f"Scanner error: {e}")
             
-        time.sleep(1) # Scan once a second
+        time.sleep(1) # Poll the eBPF map once a second
 
 def main():
     logger.info("Initializing SENTRY Kernel Daemon...")
@@ -107,8 +128,8 @@ def main():
     
     start_ipc_server(cgroup_mgr, safety_guard)
     
-    # Start our built-in sensor in a background thread
-    sensor_thread = threading.Thread(target=built_in_hog_detector, args=(cgroup_mgr, safety_guard), daemon=True)
+    # Start our eBPF sensor in a background thread
+    sensor_thread = threading.Thread(target=bpf_hog_detector, args=(cgroup_mgr, safety_guard), daemon=True)
     sensor_thread.start()
     
     logger.info("🛡️ SENTRY daemon fully armed. Entering watch state.")
