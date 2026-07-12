@@ -15,6 +15,13 @@ import socket
 import logging
 import threading
 
+# --- AUTO-PATH RESOLVER ---
+# Dynamically add the project root directory to Python's module search path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+# --------------------------
+
 # SENTRY Core Components
 try:
     from core.bpf_sensor import BPFSensor
