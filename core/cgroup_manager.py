@@ -157,6 +157,8 @@ class CgroupManager:
         cgroup = self.get_process_cgroup(pid)
         if not cgroup:
             return False
+        # Enable memory controller up the tree
+        self._delegate_controller(cgroup, "memory")
         return self.write_limit(cgroup, "memory.high", str(limit_bytes))
 
     def reset_memory_throttle(self, pid: int) -> bool:
