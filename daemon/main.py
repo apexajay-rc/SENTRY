@@ -3,7 +3,7 @@
 daemon/main.py
 
 The core entry point for the SENTRY Ring-0 Daemon.
-Now upgraded to Phase 1: eBPF Behavioral Fingerprinting.
+Phase 2: Fuses eBPF CPU Fingerprinting with PSI Memory Pressure Defense.
 """
 
 import os
@@ -26,6 +26,7 @@ try:
     from core.safety_guard import SafetyGuard
     from core.cgroup_manager import CgroupManager
     from core.bpf_sensor import BPFSensor
+    from core.psi_sensor import PSISensor
 except ImportError as e:
     logger.critical(f"Fatal import error: {e}")
     sys.exit(1)
@@ -44,7 +45,8 @@ def start_ipc_server(cgroup_mgr, safety_guard):
                     now = time.time()
                     
                     if hasattr(cgroup_mgr, 'throttled_pids'):
-                        for pid, unthrottle_time in list(cgroup_mgr.throttled_pids.items()):
+                        for pid, info in list(cgroup_mgr.throttled_pids.items()):
+                            unthrottle_time = info.get("expires", 0)
                             time_left = max(0, unthrottle_time - now)
                             throttled.append({"pid": pid, "time_left": time_left})
                     
@@ -61,65 +63,101 @@ def start_ipc_server(cgroup_mgr, safety_guard):
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
 
-def bpf_hog_detector(cgroup_mgr, safety_guard):
-    """Actively queries the eBPF kernel maps for behavioral CPU hogs."""
-    cgroup_mgr.throttled_pids = {}
+def find_largest_memory_hog(safety_guard):
+    """Finds the unprotected process using the most RSS memory."""
+    max_rss = 0
+    target_pid = None
+    
+    pids = [int(p) for p in os.listdir('/proc') if p.isdigit()]
+    for pid in pids:
+        if safety_guard.is_protected(pid):
+            continue
+            
+        try:
+            # Read status file for VmRSS (Resident Set Size in KB)
+            with open(f"/proc/{pid}/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1])
+                        if rss_kb > max_rss:
+                            max_rss = rss_kb
+                            target_pid = pid
+                        break
+        except (FileNotFoundError, ProcessLookupError, IndexError):
+            continue
+            
+    return target_pid, max_rss
+
+def system_defense_loop(cgroup_mgr, safety_guard):
+    """Actively queries eBPF for CPU hogs and PSI for Memory thrashing."""
+    cgroup_mgr.throttled_pids = {}  # {pid: {"expires": float, "type": "cpu|mem"}}
     COOLDOWN_SECONDS = 15
 
-    sensor = BPFSensor()
+    bpf_sensor = BPFSensor()
+    psi_sensor = PSISensor()
+    
     try:
-        sensor.start()
+        bpf_sensor.start()
     except Exception as e:
         logger.critical(f"Failed to start eBPF sensor: {e}")
         sys.exit(1)
         
-    logger.info("👁️ eBPF Behavioral Sensor armed. Mapping kernel scheduler...")
+    logger.info("🛡️ SENTRY Defense Engine Armed (eBPF CPU + PSI Memory).")
     
     while True:
         try:
             now = time.time()
             
-            # 1. Release processes whose penalty time is up
+            # --- 1. RECONCILIATION: Release expired penalties ---
             for pid in list(cgroup_mgr.throttled_pids.keys()):
-                if now > cgroup_mgr.throttled_pids[pid]:
-                    logger.info(f"⏳ Cooldown expired for {pid}. Restoring CPU.")
-                    cgroup_mgr.reset_cpu_throttle(pid)
-                    try:
-                        os.setpriority(os.PRIO_PROCESS, pid, 0)
-                    except Exception:
-                        pass
+                info = cgroup_mgr.throttled_pids[pid]
+                if now > info["expires"]:
+                    logger.info(f"⏳ Cooldown expired for {pid} ({info['type']}). Restoring resources.")
+                    if info["type"] == "cpu":
+                        cgroup_mgr.reset_cpu_throttle(pid)
+                        try:
+                            os.setpriority(os.PRIO_PROCESS, pid, 0)
+                        except Exception: pass
+                    elif info["type"] == "mem":
+                        cgroup_mgr.reset_memory_throttle(pid)
+                        
                     del cgroup_mgr.throttled_pids[pid]
 
-            # 2. Query the eBPF map for processes that burned > 500ms of CPU in the last second
-            # 500,000,000 nanoseconds = 500ms
-            hog_pids = sensor.get_top_hogs(threshold_ns=500000000)
+            # --- 2. PHASE 2 DEFENSE: Memory Pressure (PSI) ---
+            if psi_sensor.is_thrashing(threshold=5.0):
+                rogue_pid, rss_kb = find_largest_memory_hog(safety_guard)
+                if rogue_pid and rogue_pid not in cgroup_mgr.throttled_pids:
+                    logger.warning(f"🚨 MEMORY LEAK DEFENSE: Clamping PID {rogue_pid} ({rss_kb / 1024:.1f} MB RSS)")
+                    
+                    # Choke the memory bandwidth (Clamp to 50MB)
+                    CLAMP_BYTES = 50 * 1024 * 1024
+                    cgroup_mgr.throttled_pids[rogue_pid] = {"expires": now + COOLDOWN_SECONDS, "type": "mem"}
+                    cgroup_mgr.throttle_memory(rogue_pid, CLAMP_BYTES)
+
+            # --- 3. PHASE 1 DEFENSE: CPU Scheduler Abuse (eBPF) ---
+            hog_pids = bpf_sensor.get_top_hogs(threshold_ns=200000000) # 200ms
             
             for pid in hog_pids:
                 if pid not in cgroup_mgr.throttled_pids:
-                    # THE CRITICAL CHECK: Are you looking at it? Is it a core daemon?
                     if not safety_guard.is_protected(pid):
-                        
-                        # Grab the name just for logging purposes
                         comm = "unknown"
                         try:
                             with open(f"/proc/{pid}/comm", "r") as f:
                                 comm = f.read().strip()
                         except: pass
                             
-                        logger.warning(f"🚨 eBPF BEHAVIORAL HOG DETECTED ({comm} - {pid})! Slamming into Penalty Box.")
+                        logger.warning(f"🚨 CPU ABUSE DETECTED: {comm} ({pid}). Slamming into Penalty Box.")
                         
-                        cgroup_mgr.throttled_pids[pid] = now + COOLDOWN_SECONDS
+                        cgroup_mgr.throttled_pids[pid] = {"expires": now + COOLDOWN_SECONDS, "type": "cpu"}
                         if not cgroup_mgr.throttle_cpu(pid, 20):
-                            logger.warning(f"⚠️ Cgroup bypass detected. Deploying OS-level Scheduler Penalty (Nice 19) for {pid}.")
                             try:
                                 os.setpriority(os.PRIO_PROCESS, pid, 19)
-                            except Exception:
-                                pass
+                            except Exception: pass
                                 
         except Exception as e:
-            logger.debug(f"Scanner error: {e}")
+            logger.debug(f"Engine cycle error: {e}")
             
-        time.sleep(1) # Poll the eBPF map once a second
+        time.sleep(1)
 
 def main():
     logger.info("Initializing SENTRY Kernel Daemon...")
@@ -128,11 +166,8 @@ def main():
     
     start_ipc_server(cgroup_mgr, safety_guard)
     
-    # Start our eBPF sensor in a background thread
-    sensor_thread = threading.Thread(target=bpf_hog_detector, args=(cgroup_mgr, safety_guard), daemon=True)
-    sensor_thread.start()
-    
-    logger.info("🛡️ SENTRY daemon fully armed. Entering watch state.")
+    defense_thread = threading.Thread(target=system_defense_loop, args=(cgroup_mgr, safety_guard), daemon=True)
+    defense_thread.start()
     
     try:
         while True:
