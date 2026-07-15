@@ -1,52 +1,58 @@
 """
 core/psi_sensor.py
-Reads the Linux Pressure Stall Information (PSI) interface to detect
-if the system is actively thrashing or starving for RAM.
+
+Native Linux Pressure Stall Information (PSI) reader.
+Detects memory starvation before the OOM-killer activates.
 """
 
 import os
-import logging
-
-logger = logging.getLogger(__name__)
+from typing import Optional
 
 class PSISensor:
-    def __init__(self):
-        self.psi_file = "/proc/pressure/memory"
-        self._verify_psi_support()
+    def __init__(self, threshold: float = 5.0) -> None:
+        self.threshold = threshold
+        self.psi_path = "/proc/pressure/memory"
+        self.is_supported = os.path.exists(self.psi_path)
 
-    def _verify_psi_support(self):
-        """Ensures the Linux kernel was compiled with CONFIG_PSI=y."""
-        if not os.path.exists(self.psi_file):
-            logger.error(f"PSI not supported or disabled. Cannot find {self.psi_file}.")
-            logger.error("You may need to add 'psi=1' to your GRUB kernel boot parameters.")
-
-    def get_memory_pressure(self) -> float:
-        """
-        Reads the 10-second moving average of memory pressure.
-        Returns a float representing the percentage of time tasks were stalled.
-        """
-        try:
-            with open(self.psi_file, "r") as f:
-                for line in f:
-                    # We look at "some", meaning at least one task was stalled waiting for RAM
-                    # Format: some avg10=0.00 avg60=0.00 avg300=0.00 total=12345
-                    if line.startswith("some"):
-                        parts = line.split()
-                        for part in parts:
-                            if part.startswith("avg10="):
-                                return float(part.split("=")[1])
-        except Exception as e:
-            logger.debug(f"Failed to read PSI memory pressure: {e}")
+    def check_memory_pressure(self) -> bool:
+        """Returns True if memory 'some' avg10 exceeds the threshold."""
+        if not self.is_supported:
+            return False
             
-        return 0.0
-
-    def is_thrashing(self, threshold=10.0) -> bool:
-        """
-        Returns True if the system is spending more than `threshold`% of its time 
-        stalled waiting for memory in the last 10 seconds.
-        """
-        pressure = self.get_memory_pressure()
-        if pressure > threshold:
-            logger.warning(f"⚠️ HIGH MEMORY PRESSURE DETECTED: {pressure}% stall time!")
-            return True
+        try:
+            with open(self.psi_path, "r") as f:
+                for line in f:
+                    if line.startswith("some"):
+                        # format: some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+                        parts = line.split()
+                        avg10_str = parts[1].split("=")[1]
+                        if float(avg10_str) >= self.threshold:
+                            return True
+                        break
+        except Exception:
+            return False
+            
         return False
+
+    def find_largest_memory_hog(self) -> int:
+        """Rapidly scans /proc to find the process with the largest RSS."""
+        max_rss = 0
+        hog_pid = -1
+        
+        try:
+            for pid_str in os.listdir("/proc"):
+                if not pid_str.isdigit():
+                    continue
+                pid = int(pid_str)
+                try:
+                    with open(f"/proc/{pid}/statm", "r") as f:
+                        rss_pages = int(f.read().split()[1])
+                        if rss_pages > max_rss:
+                            max_rss = rss_pages
+                            hog_pid = pid
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+        except Exception:
+            pass
+                
+        return hog_pid
