@@ -31,12 +31,13 @@ class SentryDaemon:
         self.logger = StructuredLogger(name="SENTRY_DAEMON")
         
         # 2. Configuration (Fallback defaults if YAML or methods are missing)
+        self.config: Any = None
         try:
-            self.config: Any = SentryConfig("sentry_config.yaml")  # type: ignore
+            self.config = SentryConfig("sentry_config.yaml")  # type: ignore
         except TypeError:
-            self.config: Any = SentryConfig()  # type: ignore
+            self.config = SentryConfig()  # type: ignore
         except Exception:
-            self.config: Any = None
+            self.config = None
 
         self.mem_clamp_bytes = self._get_cfg_val("memory_clamp_bytes", 52428800)  # 50MB
         self.cooldown_sec = self._get_cfg_val("cooldown_seconds", 60)
