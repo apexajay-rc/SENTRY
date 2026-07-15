@@ -82,17 +82,6 @@ class SentryDaemon:
         self.logger.info("All Ring-0 limits released. SENTRY going dark.")
         sys.exit(0)
 
-    def process_cooldowns(self, current_time: float) -> None:
-        """Releases processes whose penalty time has expired."""
-        expired_pids = []
-        for pid, unlock_time in self.cgroup_mgr.throttled_tasks.items():
-            if current_time >= unlock_time:
-                expired_pids.append(pid)
-                
-        for pid in expired_pids:
-            self.cgroup_mgr.release_memory_throttle(pid)
-            del self.cgroup_mgr.throttled_tasks[pid]
-
     def run(self) -> None:
         self.logger.info("SENTRY Ring-0 Daemon online. Event loop armed.")
         
@@ -110,18 +99,18 @@ class SentryDaemon:
             try:
                 now = time.time()
                 
-                # 1. Housekeeping: Release expired penalties
-                self.process_cooldowns(now)
+                # 1. Housekeeping: Reconcile cooldowns and purge recycled PIDs
+                self.cgroup_mgr.reconcile_cooldowns(now)
                 
-                # 2. Memory Defense (Phase 2 Roadmap)
+                # 2. Memory Defense (PSI Stalls)
                 if self.psi_sensor.check_memory_pressure():
                     hog_pid = self.psi_sensor.find_largest_memory_hog()
                     
-                    if hog_pid > 0 and hog_pid not in self.cgroup_mgr.throttled_tasks:
+                    if hog_pid > 0 and not self.cgroup_mgr.is_throttled(hog_pid):
                         if not self.safety_guard.is_immune(hog_pid):
-                            # Lock it down
+                            # Lock it down and register the kernel start time
                             self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
-                            self.cgroup_mgr.throttled_tasks[hog_pid] = now + self.cooldown_sec
+                            self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec)
                         else:
                             self.logger.info(f"PSI Spike detected, but PID {hog_pid} has infrastructure immunity.")
 
@@ -129,10 +118,10 @@ class SentryDaemon:
                 if self.bpf_sensor is not None:
                     top_cpu_hogs = self.bpf_sensor.get_top_hogs()
                     for pid in top_cpu_hogs:
-                        if pid not in self.cgroup_mgr.throttled_tasks and not self.safety_guard.is_immune(pid):
+                        if not self.cgroup_mgr.is_throttled(pid) and not self.safety_guard.is_immune(pid):
                             self.logger.warning(f"Throttling CPU hog PID: {pid}")
                             self.cgroup_mgr._apply_scheduler_fallback(pid)
-                            self.cgroup_mgr.throttled_tasks[pid] = now + self.cooldown_sec
+                            self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
                 
                 time.sleep(1)  # Base polling cadence
                 
