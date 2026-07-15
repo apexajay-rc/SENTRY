@@ -3,13 +3,15 @@
 daemon/main.py
 
 The Production-Grade Composition Root for SENTRY.
-Orchestrates eBPF, PSI, Cgroups, and Zero-Trust Spatial Immunity.
+Orchestrates eBPF, PSI, Cgroups, Zero-Trust Spatial Immunity, and UDP IPC.
 """
 
 import sys
 import time
 import signal
 import traceback
+import socket
+import json
 from typing import Optional, Any
 
 from core.logger import StructuredLogger
@@ -27,10 +29,9 @@ except ImportError:
 
 class SentryDaemon:
     def __init__(self) -> None:
-        # 1. Initialize Audit Logging
         self.logger = StructuredLogger(name="SENTRY_DAEMON")
         
-        # 2. Configuration (Fallback defaults if YAML or methods are missing)
+        # 1. Configuration
         self.config: Any = None
         try:
             self.config = SentryConfig("sentry_config.yaml")  # type: ignore
@@ -42,7 +43,7 @@ class SentryDaemon:
         self.mem_clamp_bytes = self._get_cfg_val("memory_clamp_bytes", 52428800)  # 50MB
         self.cooldown_sec = self._get_cfg_val("cooldown_seconds", 60)
         
-        # 3. Core Subsystems
+        # 2. Core Subsystems
         self.cgroup_mgr = CgroupManager(self.logger)
         self.safety_guard = SafetyGuard()
         self.psi_sensor = PSISensor(threshold=5.0)
@@ -54,14 +55,26 @@ class SentryDaemon:
             except Exception as e:
                 self.logger.error(f"Failed to initialize BPFSensor: {e}")
         
-        self.running = True
+        # 3. Inter-Process Communication (IPC) Sockets
+        self.spatial_pid: Optional[int] = None
         
-        # Register graceful shutdown hooks
+        # Socket for receiving Spatial Telemetry from desktop_bridge.py
+        self.bridge_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.bridge_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.bridge_sock.bind(("127.0.0.1", 50505))
+        self.bridge_sock.setblocking(False)
+
+        # Socket for transmitting state to sentry_top.py HUD
+        self.hud_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.hud_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.hud_sock.bind(("127.0.0.1", 50506))
+        self.hud_sock.setblocking(False)
+        
+        self.running = True
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
     def _get_cfg_val(self, key: str, default: int) -> int:
-        """Safely extracts config values regardless of SentryConfig's internal schema."""
         if self.config is None:
             return default
         try:
@@ -75,10 +88,47 @@ class SentryDaemon:
         except Exception:
             return default
 
+    def _process_ipc(self, now: float) -> None:
+        """Non-blocking read of IPC sockets to sync with user-space tools."""
+        # 1. Read Spatial VIP target from desktop_bridge
+        try:
+            while True:
+                data, _ = self.bridge_sock.recvfrom(1024)
+                pid_str = data.decode().strip()
+                if pid_str.isdigit():
+                    self.spatial_pid = int(pid_str)
+        except BlockingIOError:
+            pass
+        except Exception as e:
+            self.logger.error(f"Bridge IPC error: {e}")
+
+        # 2. Respond to sentry_top.py dashboard pings
+        try:
+            while True:
+                data, addr = self.hud_sock.recvfrom(1024)
+                if data == b"STATUS":
+                    throttled = []
+                    for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
+                        throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
+                    state = {
+                        "spatial_pid": self.spatial_pid,
+                        "throttled_tasks": throttled
+                    }
+                    self.hud_sock.sendto(json.dumps(state).encode(), addr)
+        except BlockingIOError:
+            pass
+        except Exception as e:
+            self.logger.error(f"HUD IPC error: {e}")
+
     def shutdown(self, signum: Any = None, frame: Any = None) -> None:
         self.logger.warning("SIGTERM/SIGINT received. Initiating fail-safe shutdown.")
         self.running = False
         self.cgroup_mgr.release_all()
+        try:
+            self.bridge_sock.close()
+            self.hud_sock.close()
+        except Exception:
+            pass
         self.logger.info("All Ring-0 limits released. SENTRY going dark.")
         sys.exit(0)
 
@@ -99,7 +149,8 @@ class SentryDaemon:
             try:
                 now = time.time()
                 
-                # 1. Housekeeping: Reconcile cooldowns and purge recycled PIDs
+                # 1. Housekeeping: Sync sockets and reconcile cooldowns
+                self._process_ipc(now)
                 self.cgroup_mgr.reconcile_cooldowns(now)
                 
                 # 2. Memory Defense (PSI Stalls)
@@ -107,28 +158,30 @@ class SentryDaemon:
                     hog_pid = self.psi_sensor.find_largest_memory_hog()
                     
                     if hog_pid > 0 and not self.cgroup_mgr.is_throttled(hog_pid):
-                        if not self.safety_guard.is_immune(hog_pid):
-                            # Lock it down and register the kernel start time
+                        if hog_pid == self.spatial_pid:
+                            self.logger.info(f"Spatial VIP Immunity protecting active PID {hog_pid}.")
+                        elif not self.safety_guard.is_immune(hog_pid):
                             self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
                             self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec)
-                        else:
-                            self.logger.info(f"PSI Spike detected, but PID {hog_pid} has infrastructure immunity.")
 
                 # 3. CPU Defense (eBPF)
                 if self.bpf_sensor is not None:
                     top_cpu_hogs = self.bpf_sensor.get_top_hogs()
                     for pid in top_cpu_hogs:
-                        if not self.cgroup_mgr.is_throttled(pid) and not self.safety_guard.is_immune(pid):
-                            self.logger.warning(f"Throttling CPU hog PID: {pid}")
-                            self.cgroup_mgr._apply_scheduler_fallback(pid)
-                            self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
+                        if not self.cgroup_mgr.is_throttled(pid):
+                            if pid == self.spatial_pid:
+                                self.logger.info(f"Spatial VIP Immunity protecting active PID {pid}.")
+                            elif not self.safety_guard.is_immune(pid):
+                                self.logger.warning(f"Throttling CPU hog PID: {pid}")
+                                self.cgroup_mgr._apply_scheduler_fallback(pid)
+                                self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
                 
-                time.sleep(1)  # Base polling cadence
+                time.sleep(0.5)  # 500ms polling cadence
                 
             except Exception as e:
                 self.logger.error(f"Critical Event Loop Failure: {e}")
                 self.logger.error(traceback.format_exc())
-                time.sleep(2)  # Backoff to prevent log flooding
+                time.sleep(2)
 
 if __name__ == "__main__":
     import os
