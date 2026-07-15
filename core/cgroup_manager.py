@@ -7,13 +7,14 @@ Strictly uses safe file I/O and native syscalls to prevent shell injection.
 
 import os
 import time
+from typing import Optional
 
 class CgroupManager:
     def __init__(self, logger):
         self.logger = logger
         self.throttled_tasks = {} # Format: {pid: expiration_timestamp}
 
-    def _get_cgroup_v2_path(self, pid: int) -> str:
+    def _get_cgroup_v2_path(self, pid: int) -> Optional[str]:
         """Dynamically locates a process's specific cgroup v2 path."""
         try:
             with open(f"/proc/{pid}/cgroup", "r") as f:
