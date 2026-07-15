@@ -1,168 +1,80 @@
 """
 core/cgroup_manager.py
 
-Provides native interfaces to manage Linux cgroups v2 boundaries.
-Used to apply reversible throttling to resource-heavy processes.
+Native Cgroups v2 and OS Scheduler manipulator.
+Strictly uses safe file I/O and native syscalls to prevent shell injection.
 """
 
 import os
-import logging
-from typing import Optional
-
-logger = logging.getLogger(__name__)
+import time
 
 class CgroupManager:
-    """
-    Manages resource limits via the unified cgroup v2 hierarchy.
-    """
+    def __init__(self, logger):
+        self.logger = logger
+        self.throttled_tasks = {} # Format: {pid: expiration_timestamp}
 
-    CGROUP_ROOT = "/sys/fs/cgroup"
-
-    def __init__(self) -> None:
-        self._verify_cgroup_v2()
-
-    def _delegate_controller(self, cgroup_path: str, controller: str = "cpu") -> None:
-        """
-        Walks from the cgroup root down to the parent of the target,
-        enabling the specified controller in cgroup.subtree_control.
-        """
-        rel_path = os.path.relpath(cgroup_path, self.CGROUP_ROOT)
-        if rel_path == ".":
-            return
-            
-        parts = rel_path.split(os.sep)
-        current_path = self.CGROUP_ROOT
-        
-        # FIX: Iterate through ALL parts (removed [:-1]). 
-        # Writing before appending the part perfectly hits every parent directory,
-        # ensuring the immediate parent of the target gets the delegation command.
-        for part in parts: 
-            subtree_file = os.path.join(current_path, "cgroup.subtree_control")
-            try:
-                with open(subtree_file, "w") as f:
-                    f.write(f"+{controller}\n")
-            except OSError as e:
-                # Systemd locks some internal nodes. We log as debug and continue.
-                logger.debug(f"Failed to delegate {controller} at {current_path}: {e}")
-            
-            current_path = os.path.join(current_path, part)
-
-    def throttle_cpu(self, pid: int, cpu_quota_pct: int = 20) -> bool:
-        """
-        Clamps the CPU usage of a process using cgroups v2 cpu.max.
-        """
-        cgroup_path = self.get_process_cgroup(pid)
-        if not cgroup_path:
-            return False
-            
-        # 1. Force the kernel to enable the CPU controller for this path
-        self._delegate_controller(cgroup_path, "cpu")
-        
-        cpu_max_file = os.path.join(cgroup_path, "cpu.max")
-        
-        # 2. Verify the file actually materialized
-        if not os.path.exists(cpu_max_file):
-            logger.error(f"CPU controller delegation failed. {cpu_max_file} does not exist.")
-            return False
-            
-        quota = int((cpu_quota_pct / 100.0) * 100000)
-        
+    def _get_cgroup_v2_path(self, pid: int) -> str:
+        """Dynamically locates a process's specific cgroup v2 path."""
         try:
-            with open(cpu_max_file, 'w') as f:
-                f.write(f"{quota} 100000\n")
-            logger.info(f"Successfully set cpu.max to '{quota} 100000' ({cpu_quota_pct}%) for {cgroup_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to set CPU throttle: {e}")
-            return False
-
-    def reset_cpu_throttle(self, pid: int) -> bool:
-        """Removes the CPU limit, allowing unlimited CPU access."""
-        cgroup_path = self.get_process_cgroup(pid)
-        if not cgroup_path:
-            return False
-            
-        cpu_max_file = os.path.join(cgroup_path, "cpu.max")
-        if not os.path.exists(cpu_max_file):
-            return False
-            
-        try:
-            with open(cpu_max_file, 'w') as f:
-                f.write("max 100000\n")
-            logger.info(f"Successfully removed CPU throttle for {cgroup_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to reset CPU throttle: {e}")
-            return False
-
-    def _verify_cgroup_v2(self) -> None:
-        """Ensures the system is booted with cgroups v2 unified hierarchy."""
-        controllers_path = os.path.join(self.CGROUP_ROOT, "cgroup.controllers")
-        if not os.path.exists(controllers_path):
-            raise RuntimeError(
-                f"cgroup v2 not detected at {self.CGROUP_ROOT}. "
-                "SENTRY requires a unified cgroup hierarchy."
-            )
-
-    def get_process_cgroup(self, pid: int) -> Optional[str]:
-        """Resolves the cgroup path for a given PID."""
-        cgroup_file = f"/proc/{pid}/cgroup"
-        try:
-            with open(cgroup_file, "r") as f:
-                for line in f:
+            with open(f"/proc/{pid}/cgroup", "r") as f:
+                lines = f.readlines()
+                for line in lines:
                     if line.startswith("0::"):
-                        cgroup_path = line.strip().split("::", 1)[1]
-                        if cgroup_path.startswith("/"):
-                            cgroup_path = cgroup_path[1:]
-                        return os.path.join(self.CGROUP_ROOT, cgroup_path)
-        except FileNotFoundError:
-            logger.debug(f"PID {pid} no longer exists; cannot resolve cgroup.")
+                        cgroup_path = line.strip().split("0::")[1]
+                        return f"/sys/fs/cgroup{cgroup_path}"
+        except Exception:
             return None
-        except Exception as e:
-            logger.warning(f"Failed to read cgroup for PID {pid}: {e}")
-            return None
-            
-        logger.warning(f"No unified cgroup v2 path found for PID {pid}")
         return None
 
-    def read_limit(self, cgroup_path: str, limit_file: str) -> Optional[str]:
-        target = os.path.join(cgroup_path, limit_file)
-        try:
-            with open(target, "r") as f:
-                return f.read().strip()
-        except FileNotFoundError:
-            return None
-        except OSError as e:
-            logger.error(f"Failed to read {limit_file} from {cgroup_path}: {e}")
-            return None
+    def apply_memory_throttle(self, pid: int, limit_bytes: int):
+        """Applies a soft memory.high clamp via native file writes."""
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if not cgroup_path:
+            self.logger.warning(f"Could not resolve cgroup for PID {pid}. Falling back to OS scheduler.")
+            self._apply_scheduler_fallback(pid)
+            return
 
-    def write_limit(self, cgroup_path: str, limit_file: str, value: str) -> bool:
-        target = os.path.join(cgroup_path, limit_file)
+        mem_high_path = os.path.join(cgroup_path, "memory.high")
         try:
-            with open(target, "w") as f:
-                f.write(value)
-            logger.info(f"Successfully set {limit_file} to '{value}' for {cgroup_path}")
-            return True
-        except FileNotFoundError:
-            logger.debug(f"Cgroup {cgroup_path} no longer exists.")
-            return False
+            with open(mem_high_path, "w") as f:
+                f.write(str(limit_bytes))
+            self.logger.audit("CLAMP_MEMORY", pid, cgroup_path, f"Limit set to {limit_bytes} bytes")
         except PermissionError:
-            logger.error(f"Permission denied writing to {target}. Does SENTRY have root?")
-            return False
-        except OSError as e:
-            logger.error(f"OS Error writing {value} to {target}: {e}")
-            return False
+            self.logger.error(f"Permission denied writing to {mem_high_path}")
+        except Exception as e:
+            self.logger.warning(f"Cgroup write failed: {e}. Executing fallback.")
+            self._apply_scheduler_fallback(pid)
 
-    def throttle_memory(self, pid: int, limit_bytes: int) -> bool:
-        cgroup = self.get_process_cgroup(pid)
-        if not cgroup:
-            return False
-        # Enable memory controller up the tree
-        self._delegate_controller(cgroup, "memory")
-        return self.write_limit(cgroup, "memory.high", str(limit_bytes))
+    def release_memory_throttle(self, pid: int):
+        """Restores memory to maximum via native file writes."""
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if cgroup_path:
+            mem_high_path = os.path.join(cgroup_path, "memory.high")
+            try:
+                with open(mem_high_path, "w") as f:
+                    f.write("max")
+                self.logger.info(f"Released memory clamp for PID {pid}")
+            except Exception:
+                pass
+        
+        # Always release scheduler fallback just in case
+        try:
+            os.setpriority(os.PRIO_PROCESS, pid, 0)
+        except Exception:
+            pass
 
-    def reset_memory_throttle(self, pid: int) -> bool:
-        cgroup = self.get_process_cgroup(pid)
-        if not cgroup:
-            return False
-        return self.write_limit(cgroup, "memory.high", "max")
+    def _apply_scheduler_fallback(self, pid: int):
+        """Native OS syscall fallback if Cgroups are locked by systemd."""
+        try:
+            os.setpriority(os.PRIO_PROCESS, pid, 19)
+            self.logger.audit("CLAMP_CPU_SCHEDULER", pid, "OS", "Priority reduced to +19")
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            self.logger.error(f"Scheduler fallback failed for PID {pid}: {e}")
+
+    def release_all(self):
+        """Emergency release for daemon shutdown."""
+        for pid in list(self.throttled_tasks.keys()):
+            self.release_memory_throttle(pid)
+        self.throttled_tasks.clear()
