@@ -6,7 +6,7 @@ This version integrates the eBPF sensor and Cgroup manager to create
 a functional resource enforcement loop.
 """
 
-import logging
+import logger
 import signal
 import sys
 import time
