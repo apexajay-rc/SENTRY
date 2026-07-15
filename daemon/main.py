@@ -19,31 +19,60 @@ from core.psi_sensor import PSISensor
 from core.config import SentryConfig
 
 try:
-    from core.bpf_sensor import BPFSensor  # type: ignore
+    from core.bpf_sensor import BPFSensor
+    _BPF_AVAILABLE = True
 except ImportError:
-    BPFSensor = None  # Fail gracefully if BCC tools are missing in CI
+    _BPF_AVAILABLE = False
+
 
 class SentryDaemon:
     def __init__(self) -> None:
         # 1. Initialize Audit Logging
         self.logger = StructuredLogger(name="SENTRY_DAEMON")
         
-        # 2. Configuration (Fallback defaults if YAML is missing)
-        self.config = SentryConfig(config_path="sentry_config.yaml")
-        self.mem_clamp_bytes = int(self.config.get("memory_clamp_bytes", 52428800))  # 50MB
-        self.cooldown_sec = int(self.config.get("cooldown_seconds", 60))
+        # 2. Configuration (Fallback defaults if YAML or methods are missing)
+        try:
+            self.config: Any = SentryConfig("sentry_config.yaml")  # type: ignore
+        except TypeError:
+            self.config: Any = SentryConfig()  # type: ignore
+        except Exception:
+            self.config: Any = None
+
+        self.mem_clamp_bytes = self._get_cfg_val("memory_clamp_bytes", 52428800)  # 50MB
+        self.cooldown_sec = self._get_cfg_val("cooldown_seconds", 60)
         
         # 3. Core Subsystems
         self.cgroup_mgr = CgroupManager(self.logger)
         self.safety_guard = SafetyGuard()
         self.psi_sensor = PSISensor(threshold=5.0)
-        self.bpf_sensor: Optional[Any] = BPFSensor() if BPFSensor else None
+        
+        self.bpf_sensor: Optional[Any] = None
+        if _BPF_AVAILABLE:
+            try:
+                self.bpf_sensor = BPFSensor()  # type: ignore
+            except Exception as e:
+                self.logger.error(f"Failed to initialize BPFSensor: {e}")
         
         self.running = True
         
         # Register graceful shutdown hooks
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
+
+    def _get_cfg_val(self, key: str, default: int) -> int:
+        """Safely extracts config values regardless of SentryConfig's internal schema."""
+        if self.config is None:
+            return default
+        try:
+            if hasattr(self.config, "get") and callable(self.config.get):
+                return int(self.config.get(key, default))
+            if hasattr(self.config, key):
+                return int(getattr(self.config, key))
+            if hasattr(self.config, "config") and isinstance(self.config.config, dict):
+                return int(self.config.config.get(key, default))
+            return int(self.config[key])
+        except Exception:
+            return default
 
     def shutdown(self, signum: Any = None, frame: Any = None) -> None:
         self.logger.warning("SIGTERM/SIGINT received. Initiating fail-safe shutdown.")
@@ -69,9 +98,12 @@ class SentryDaemon:
         if not self.psi_sensor.is_supported:
             self.logger.error("Kernel PSI not detected. Run kernel with psi=1.")
             
-        if self.bpf_sensor:
+        if self.bpf_sensor is not None:
             self.logger.info("Initializing Ring-0 eBPF Sensor...")
-            self.bpf_sensor.start()
+            try:
+                self.bpf_sensor.start()
+            except Exception as e:
+                self.logger.error(f"Failed to start eBPF Sensor: {e}")
         
         while self.running:
             try:
@@ -93,7 +125,7 @@ class SentryDaemon:
                             self.logger.info(f"PSI Spike detected, but PID {hog_pid} has infrastructure immunity.")
 
                 # 3. CPU Defense (eBPF)
-                if self.bpf_sensor:
+                if self.bpf_sensor is not None:
                     top_cpu_hogs = self.bpf_sensor.get_top_hogs()
                     for pid in top_cpu_hogs:
                         if pid not in self.cgroup_mgr.throttled_tasks and not self.safety_guard.is_immune(pid):
