@@ -108,8 +108,11 @@ class SentryDaemon:
                 data, addr = self.hud_sock.recvfrom(1024)
                 if data == b"STATUS":
                     throttled = []
-                    for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
-                        throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
+                    # Robust state assembly
+                    if hasattr(self.cgroup_mgr, 'throttled_tasks'):
+                        for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
+                            throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
+                    
                     state = {
                         "spatial_pid": self.spatial_pid,
                         "throttled_tasks": throttled
@@ -149,7 +152,7 @@ class SentryDaemon:
             try:
                 now = time.time()
                 
-                # 1. Housekeeping: Sync sockets and reconcile cooldowns
+                # 1. Housekeeping
                 self._process_ipc(now)
                 self.cgroup_mgr.reconcile_cooldowns(now)
                 
@@ -176,7 +179,7 @@ class SentryDaemon:
                                 self.cgroup_mgr._apply_scheduler_fallback(pid)
                                 self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
                 
-                time.sleep(0.5)  # 500ms polling cadence
+                time.sleep(0.2)  # Reduced to 200ms for smoother HUD updates
                 
             except Exception as e:
                 self.logger.error(f"Critical Event Loop Failure: {e}")
