@@ -3,10 +3,11 @@
 daemon/main.py
 
 The Production-Grade Composition Root for SENTRY.
-Orchestrates eBPF, PSI, Cgroups, Zero-Trust Spatial Immunity, and UDP IPC.
+Orchestrates eBPF, PSI, Cgroups, Zero-Trust Spatial Immunity, and Unix Domain IPC.
 """
 
 import sys
+import os
 import time
 import signal
 import traceback
@@ -55,24 +56,51 @@ class SentryDaemon:
             except Exception as e:
                 self.logger.error(f"Failed to initialize BPFSensor: {e}")
         
-        # 3. Inter-Process Communication (IPC) Sockets
+        # 3. Inter-Process Communication (Unix Domain Sockets)
         self.spatial_pid: Optional[int] = None
         
+        self.bridge_sock_path = "/run/sentry_bridge.sock"
+        self.hud_sock_path = "/run/sentry_hud.sock"
+        
+        self._cleanup_sockets()
+
         # Socket for receiving Spatial Telemetry from desktop_bridge.py
-        self.bridge_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.bridge_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.bridge_sock.bind(("127.0.0.1", 50505))
+        self.bridge_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.bridge_sock.bind(self.bridge_sock_path)
+        os.chmod(self.bridge_sock_path, 0o666)  # Allow user-space write access
         self.bridge_sock.setblocking(False)
 
         # Socket for transmitting state to sentry_top.py HUD
-        self.hud_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.hud_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.hud_sock.bind(("127.0.0.1", 50506))
+        self.hud_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.hud_sock.bind(self.hud_sock_path)
+        os.chmod(self.hud_sock_path, 0o666)  # Allow user-space write access
         self.hud_sock.setblocking(False)
         
         self.running = True
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
+
+    def _cleanup_sockets(self) -> None:
+        """Removes stale socket files to prevent bind errors."""
+        for path in [self.bridge_sock_path, self.hud_sock_path]:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def _sd_notify(self, state: str) -> None:
+        """Natively alert systemd of daemon state changes without external libraries."""
+        notify_socket = os.environ.get('NOTIFY_SOCKET')
+        if not notify_socket:
+            return
+        # Handle abstract namespaces
+        if notify_socket.startswith('@'):
+            notify_socket = '\0' + notify_socket[1:]
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.sendto(state.encode(), notify_socket) # type: ignore
+        except Exception as e:
+            self.logger.error(f"Failed to notify systemd: {e}")
 
     def _get_cfg_val(self, key: str, default: int) -> int:
         if self.config is None:
@@ -89,7 +117,7 @@ class SentryDaemon:
             return default
 
     def _process_ipc(self, now: float) -> None:
-        """Non-blocking read of IPC sockets to sync with user-space tools."""
+        """Non-blocking read of UNIX sockets to sync with user-space tools."""
         # 1. Read Spatial VIP target from desktop_bridge
         try:
             while True:
@@ -106,7 +134,7 @@ class SentryDaemon:
         try:
             while True:
                 data, addr = self.hud_sock.recvfrom(1024)
-                if data == b"STATUS":
+                if data == b"STATUS" and addr:
                     throttled = []
                     # Robust state assembly
                     if hasattr(self.cgroup_mgr, 'throttled_tasks'):
@@ -126,10 +154,12 @@ class SentryDaemon:
     def shutdown(self, signum: Any = None, frame: Any = None) -> None:
         self.logger.warning("SIGTERM/SIGINT received. Initiating fail-safe shutdown.")
         self.running = False
+        self._sd_notify("STOPPING=1")
         self.cgroup_mgr.release_all()
         try:
             self.bridge_sock.close()
             self.hud_sock.close()
+            self._cleanup_sockets()
         except Exception:
             pass
         self.logger.info("All Ring-0 limits released. SENTRY going dark.")
@@ -137,6 +167,7 @@ class SentryDaemon:
 
     def run(self) -> None:
         self.logger.info("SENTRY Ring-0 Daemon online. Event loop armed.")
+        self._sd_notify("READY=1\nSTATUS=SENTRY Ring-0 Daemon online.")
         
         if not self.psi_sensor.is_supported:
             self.logger.error("Kernel PSI not detected. Run kernel with psi=1.")
@@ -179,6 +210,9 @@ class SentryDaemon:
                                 self.cgroup_mgr.apply_cpu_throttle(pid, 20)
                                 self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
                 
+                # Systemd heartbeat
+                self._sd_notify("WATCHDOG=1")
+                
                 time.sleep(0.2)  # Reduced to 200ms for smoother HUD updates
                 
             except Exception as e:
@@ -187,7 +221,6 @@ class SentryDaemon:
                 time.sleep(2)
 
 if __name__ == "__main__":
-    import os
     if os.geteuid() != 0:
         print("FATAL: SENTRY must be executed with root privileges (sudo).")
         sys.exit(1)
