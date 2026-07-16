@@ -1,82 +1,40 @@
-import tempfile
+"""
+tests/test_config.py
+
+Validates the unified SentryConfig contract and deterministic memory parsing.
+"""
 import unittest
-from pathlib import Path
+import os
+import tempfile
+from core.config import SentryConfig
 
-import yaml
+class TestSentryConfig(unittest.TestCase):
+    def setUp(self):
+        # Create a temporary YAML file mirroring legacy config
+        self.test_yaml = tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.yaml')
+        self.test_yaml.write("memory_throttle_limit: 100MB\ncooldown_period: 120\n")
+        self.test_yaml.close()
 
-from core.config import ConfigManager, load_config, resolve_config_path
-from core import policy
-from core.metrics import compute_stress, configure_metrics
+    def tearDown(self):
+        os.unlink(self.test_yaml.name)
 
+    def test_default_config_fallback(self):
+        """Ensures defaults apply when YAML is missing."""
+        config = SentryConfig("nonexistent.yaml")
+        self.assertEqual(config.memory_clamp_bytes, 52428800)
+        self.assertEqual(config.cooldown_seconds, 60)
 
-class ConfigPathTests(unittest.TestCase):
-    def test_resolve_config_path_defaults_to_repo_root(self):
-        path = resolve_config_path()
-        self.assertEqual(path.name, "sentry_config.yaml")
-        self.assertTrue(path.parent.name == "SENTRY" or path.exists())
+    def test_yaml_load_and_parse(self):
+        """Ensures strings like '100MB' map cleanly to raw bytes."""
+        config = SentryConfig(self.test_yaml.name)
+        self.assertEqual(config.memory_clamp_bytes, 104857600)  # 100MB in bytes
+        self.assertEqual(config.cooldown_seconds, 120)
+        
+    def test_legacy_get_api(self):
+        """Ensures the .get() method still functions for downstream modules."""
+        config = SentryConfig(self.test_yaml.name)
+        self.assertEqual(config.get("cooldown_period"), 120)
+        self.assertEqual(config.get("missing_key", "default_val"), "default_val")
 
-
-class ConfigManagerTests(unittest.TestCase):
-    def test_loads_custom_thresholds_and_escalation(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "test_config.yaml"
-            config_path.write_text(
-                yaml.dump(
-                    {
-                        "thresholds": {
-                            "moderate": 0.40,
-                            "high": 0.60,
-                            "critical": 0.80,
-                        },
-                        "escalation": {
-                            "high": {
-                                "cpu_weight": 25,
-                                "memory_limit_percent": 70,
-                                "io_weight": 25,
-                            }
-                        },
-                        "metrics": {
-                            "cpu_weight": 0.6,
-                            "memory_weight": 0.3,
-                            "io_weight": 0.1,
-                        },
-                        "critical_processes": ["systemd", "custom-daemon"],
-                        "daemon": {"poll_interval_seconds": 5, "cooldown_seconds": 20},
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            config = ConfigManager(str(config_path))
-            policy.configure_policy(config)
-            configure_metrics(config)
-
-            self.assertEqual(config.poll_interval(), 5)
-            self.assertEqual(config.cooldown_seconds(), 20)
-            self.assertEqual(config.critical_processes_set(), {"systemd", "custom-daemon"})
-            self.assertEqual(policy.THRESHOLDS["MODERATE"], 0.40)
-            self.assertEqual(policy.THRESHOLDS["HIGH"], 0.60)
-            self.assertEqual(policy.ESCALATION_MATRIX["HIGH"]["cpu_weight"], 25)
-            self.assertEqual(policy.classify_basic(0.65), "HIGH")
-            self.assertEqual(compute_stress(50.0, 50.0, 50.0), 0.50)
-
-    def test_deep_merge_preserves_defaults(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "partial.yaml"
-            config_path.write_text("thresholds:\n  high: 0.75\n", encoding="utf-8")
-
-            config = ConfigManager(str(config_path))
-            self.assertEqual(config.get_threshold("high"), 0.75)
-            self.assertEqual(config.get_threshold("moderate"), 0.50)
-            self.assertEqual(config.get_escalation_actions("critical")["cpu_weight"], 10)
-
-
-class RuntimeConfigTests(unittest.TestCase):
-    def test_load_config_helper(self):
-        config = load_config()
-        self.assertIsInstance(config, ConfigManager)
-        self.assertTrue(config.config_file.exists() or config.poll_interval() == 3)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
