@@ -176,7 +176,7 @@ class SentryDaemon:
                                 self.logger.info(f"Spatial VIP Immunity protecting active PID {pid}.")
                             elif not self.safety_guard.is_immune(pid):
                                 self.logger.warning(f"Throttling CPU hog PID: {pid}")
-                                self.cgroup_mgr._apply_scheduler_fallback(pid)
+                                self.cgroup_mgr.apply_cpu_throttle(pid, 20)
                                 self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
                 
                 time.sleep(0.2)  # Reduced to 200ms for smoother HUD updates
