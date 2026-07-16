@@ -16,8 +16,7 @@ import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-SENTRY_PORT = 50505
-UDP_IP = "127.0.0.1"
+SENTRY_BRIDGE_SOCK = "/run/sentry_bridge.sock"
 
 class UniversalDesktopResolver:
     def __init__(self):
@@ -97,10 +96,10 @@ def main():
     print("=====================================================")
     
     resolver = UniversalDesktopResolver()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     last_pid = None
     
-    print(f"📡 Beaming spatial telemetry to SENTRY on UDP {SENTRY_PORT}...\n")
+    print(f"📡 Beaming spatial telemetry to SENTRY Unix Socket: {SENTRY_BRIDGE_SOCK}...\n")
     
     while True:
         active_pid = resolver.get_active_pid()
@@ -108,11 +107,15 @@ def main():
         # Only beam a network packet if the user actually shifted their gaze
         if active_pid and active_pid != last_pid:
             try:
-                sock.sendto(str(active_pid).encode(), (UDP_IP, SENTRY_PORT))
-                logging.info(f"🎯 Gaze Shift Detected -> Active Foreground PID: {active_pid}")
+                # Send datagram payload directly to the daemon's Unix socket
+                sock.sendto(str(active_pid).encode(), SENTRY_BRIDGE_SOCK)
+                logging.info(f"Gaze Shift Detected -> Active Foreground PID: {active_pid}")
                 last_pid = active_pid
+            except FileNotFoundError:
+                # Daemon is offline, suppress errors to avoid spamming the console
+                pass
             except Exception as e:
-                logging.error(f"Failed to transmit UDP heartbeat to SENTRY: {e}")
+                logging.error(f"Failed to transmit heartbeat to SENTRY: {e}")
                 
         time.sleep(0.3)  # 300ms polling rate (Zero measurable CPU overhead)
 
