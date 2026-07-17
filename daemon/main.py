@@ -200,7 +200,8 @@ class SentryDaemon:
 
                 # 3. CPU Defense (eBPF)
                 if self.bpf_sensor is not None:
-                    top_cpu_hogs = self.bpf_sensor.get_top_hogs()
+                    # FIX: Lower the threshold to 150ms to fit inside the 200ms polling window!
+                    top_cpu_hogs = self.bpf_sensor.get_top_hogs(threshold_ns=150000000)
                     for pid in top_cpu_hogs:
                         if not self.cgroup_mgr.is_throttled(pid):
                             if pid == self.spatial_pid:
