@@ -16,7 +16,9 @@ class SafetyGuard:
             "xdg-desktop-por", "xdg-desktop-portal-gnome", "xdg-document-po",
             "docker", "containerd", "dockerd", "grafana",
             "sshd", "pipewire", "wireplumber", "pulseaudio",
-            "sentry", "python3" # Do not clamp the daemon itself
+            "sentry", "python3", # Do not clamp the daemon itself
+            "firefox", "chrome", "chromium", "brave", # Protect web browsers
+            "gnome-terminal", "alacritty", "kitty", "wezterm" # Protect terminals
         }
 
     def is_immune(self, pid: int) -> bool:
