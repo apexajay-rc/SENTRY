@@ -93,14 +93,13 @@ class SentryDaemon:
         notify_socket = os.environ.get('NOTIFY_SOCKET')
         if not notify_socket:
             return
-        # Handle abstract namespaces
         if notify_socket.startswith('@'):
             notify_socket = '\0' + notify_socket[1:]
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
                 sock.sendto(state.encode(), notify_socket) # type: ignore
-        except Exception as e:
-            self.logger.error(f"Failed to notify systemd: {e}")
+        except Exception:
+            pass
 
     def _get_cfg_val(self, key: str, default: int) -> int:
         if self.config is None:
@@ -118,38 +117,44 @@ class SentryDaemon:
 
     def _process_ipc(self, now: float) -> None:
         """Non-blocking read of UNIX sockets to sync with user-space tools."""
-        # 1. Read Spatial VIP target from desktop_bridge
+        # 1. Read Spatial VIP target
         try:
             while True:
-                data, _ = self.bridge_sock.recvfrom(1024)
-                pid_str = data.decode().strip()
-                if pid_str.isdigit():
-                    self.spatial_pid = int(pid_str)
-        except BlockingIOError:
+                try:
+                    data, _ = self.bridge_sock.recvfrom(1024)
+                    pid_str = data.decode().strip()
+                    if pid_str.isdigit():
+                        self.spatial_pid = int(pid_str)
+                except BlockingIOError:
+                    break
+                except Exception:
+                    pass
+        except Exception:
             pass
-        except Exception as e:
-            self.logger.error(f"Bridge IPC error: {e}")
 
         # 2. Respond to sentry_top.py dashboard pings
         try:
             while True:
-                data, addr = self.hud_sock.recvfrom(1024)
-                if data == b"STATUS" and addr:
-                    throttled = []
-                    # Robust state assembly
-                    if hasattr(self.cgroup_mgr, 'throttled_tasks'):
-                        for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
-                            throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
-                    
-                    state = {
-                        "spatial_pid": self.spatial_pid,
-                        "throttled_tasks": throttled
-                    }
-                    self.hud_sock.sendto(json.dumps(state).encode(), addr)
-        except BlockingIOError:
+                try:
+                    data, addr = self.hud_sock.recvfrom(1024)
+                    if data == b"STATUS" and addr:
+                        throttled = []
+                        if hasattr(self.cgroup_mgr, 'throttled_tasks'):
+                            for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
+                                throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
+                        
+                        state = {
+                            "spatial_pid": self.spatial_pid,
+                            "throttled_tasks": throttled
+                        }
+                        self.hud_sock.sendto(json.dumps(state).encode(), addr)
+                except BlockingIOError:
+                    break
+                except Exception:
+                    # Silently drop failed packets to dead TUI sockets to prevent log spam
+                    pass
+        except Exception:
             pass
-        except Exception as e:
-            self.logger.error(f"HUD IPC error: {e}")
 
     def shutdown(self, signum: Any = None, frame: Any = None) -> None:
         self.logger.warning("SIGTERM/SIGINT received. Initiating fail-safe shutdown.")
