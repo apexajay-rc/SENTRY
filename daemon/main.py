@@ -117,7 +117,7 @@ class SentryDaemon:
 
     def _process_ipc(self, now: float) -> None:
         """Non-blocking read of UNIX sockets to sync with user-space tools."""
-        # 1. Read Spatial VIP target
+        # 1. Read Spatial VIP target from desktop_bridge
         try:
             while True:
                 try:
@@ -127,8 +127,6 @@ class SentryDaemon:
                         self.spatial_pid = int(pid_str)
                 except BlockingIOError:
                     break
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -139,6 +137,7 @@ class SentryDaemon:
                     data, addr = self.hud_sock.recvfrom(1024)
                     if data == b"STATUS" and addr:
                         throttled = []
+                        # Robust state assembly
                         if hasattr(self.cgroup_mgr, 'throttled_tasks'):
                             for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
                                 throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
@@ -150,9 +149,6 @@ class SentryDaemon:
                         self.hud_sock.sendto(json.dumps(state).encode(), addr)
                 except BlockingIOError:
                     break
-                except Exception:
-                    # Silently drop failed packets to dead TUI sockets to prevent log spam
-                    pass
         except Exception:
             pass
 
@@ -205,7 +201,7 @@ class SentryDaemon:
 
                 # 3. CPU Defense (eBPF)
                 if self.bpf_sensor is not None:
-                    # FIX: Lower the threshold to 100ms (100,000,000 ns) to fit inside the 200ms polling window!
+                    # FIX: Lower the threshold to 100ms to fit inside the 200ms polling window!
                     top_cpu_hogs = self.bpf_sensor.get_top_hogs(threshold_ns=100000000)
                     for pid in top_cpu_hogs:
                         if not self.cgroup_mgr.is_throttled(pid):
