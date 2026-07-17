@@ -17,7 +17,7 @@ class SafetyGuard:
             "docker", "containerd", "dockerd", "grafana",
             "sshd", "pipewire", "wireplumber", "pulseaudio",
             "sentry", "python3", # Do not clamp the daemon itself
-            "firefox", "chrome", "chromium", "brave", # Protect web browsers
+            "firefox", "chrome", "chromium", "brave", # Protect primary browser threads
             "gnome-terminal", "alacritty", "kitty", "wezterm" # Protect terminals
         }
 
@@ -26,13 +26,24 @@ class SafetyGuard:
             return True
             
         try:
+            # 1. Primary check: The base command name (max 15 chars in Linux)
             with open(f"/proc/{pid}/comm", "r") as f:
                 comm = f.read().strip()
                 
-            # Truncate check for Linux 15-char comm limit
             for immune_proc in self.infrastructure_immunity:
                 if comm == immune_proc or comm == immune_proc[:15]:
                     return True
+            
+            # 2. Deep check: Web browsers spawn child processes (e.g., "Web Content")
+            # We must check the actual execution command line to prevent friendly fire.
+            with open(f"/proc/{pid}/cmdline", "r") as f:
+                cmdline = f.read().replace('\0', ' ').lower()
+                
+            critical_parent_apps = ["firefox", "chrome", "chromium", "brave", "code", "cursor"]
+            for app in critical_parent_apps:
+                if app in cmdline:
+                    return True
+                    
             return False
             
         except (FileNotFoundError, ProcessLookupError):
