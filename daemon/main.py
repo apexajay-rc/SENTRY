@@ -120,35 +120,32 @@ class SentryDaemon:
         # 1. Read Spatial VIP target from desktop_bridge
         try:
             while True:
-                try:
-                    data, _ = self.bridge_sock.recvfrom(1024)
-                    pid_str = data.decode().strip()
-                    if pid_str.isdigit():
-                        self.spatial_pid = int(pid_str)
-                except BlockingIOError:
-                    break
+                data, _ = self.bridge_sock.recvfrom(1024)
+                pid_str = data.decode().strip()
+                if pid_str.isdigit():
+                    self.spatial_pid = int(pid_str)
+        except BlockingIOError:
+            pass
         except Exception:
             pass
 
         # 2. Respond to sentry_top.py dashboard pings
         try:
             while True:
-                try:
-                    data, addr = self.hud_sock.recvfrom(1024)
-                    if data == b"STATUS" and addr:
-                        throttled = []
-                        # Robust state assembly
-                        if hasattr(self.cgroup_mgr, 'throttled_tasks'):
-                            for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
-                                throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
-                        
-                        state = {
-                            "spatial_pid": self.spatial_pid,
-                            "throttled_tasks": throttled
-                        }
-                        self.hud_sock.sendto(json.dumps(state).encode(), addr)
-                except BlockingIOError:
-                    break
+                data, addr = self.hud_sock.recvfrom(1024)
+                if data == b"STATUS" and addr:
+                    throttled = []
+                    if hasattr(self.cgroup_mgr, 'throttled_tasks'):
+                        for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
+                            throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
+                    
+                    state = {
+                        "spatial_pid": self.spatial_pid,
+                        "throttled_tasks": throttled
+                    }
+                    self.hud_sock.sendto(json.dumps(state).encode(), addr)
+        except BlockingIOError:
+            pass
         except Exception:
             pass
 
@@ -201,8 +198,9 @@ class SentryDaemon:
 
                 # 3. CPU Defense (eBPF)
                 if self.bpf_sensor is not None:
-                    # FIX: Lower the threshold to 100ms to fit inside the 200ms polling window!
-                    top_cpu_hogs = self.bpf_sensor.get_top_hogs(threshold_ns=100000000)
+                    # CRITICAL FIX: The daemon polls every 200ms and wipes the BPF map.
+                    # We MUST use a threshold lower than 200ms. Setting to 50ms (50000000 ns).
+                    top_cpu_hogs = self.bpf_sensor.get_top_hogs(threshold_ns=50000000)
                     for pid in top_cpu_hogs:
                         if not self.cgroup_mgr.is_throttled(pid):
                             if pid == self.spatial_pid:
