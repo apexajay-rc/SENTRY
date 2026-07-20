@@ -32,17 +32,10 @@ class SentryDaemon:
     def __init__(self) -> None:
         self.logger = StructuredLogger(name="SENTRY_DAEMON")
         
-        # 1. Configuration
-        self.config: Any = None
-        try:
-            self.config = SentryConfig("sentry_config.yaml")  # type: ignore
-        except TypeError:
-            self.config = SentryConfig()  # type: ignore
-        except Exception:
-            self.config = None
-
-        self.mem_clamp_bytes = self._get_cfg_val("memory_clamp_bytes", 52428800)  # 50MB
-        self.cooldown_sec = self._get_cfg_val("cooldown_seconds", 60)
+        # 1. Configuration (The Artist's Touch: Strict, predictable contracts)
+        self.config = SentryConfig("sentry_config.yaml")
+        self.mem_clamp_bytes = self.config.memory_clamp_bytes
+        self.cooldown_sec = self.config.cooldown_seconds
         
         # 2. Core Subsystems
         self.cgroup_mgr = CgroupManager(self.logger)
@@ -98,22 +91,8 @@ class SentryDaemon:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
                 sock.sendto(state.encode(), notify_socket) # type: ignore
-        except Exception:
-            pass
-
-    def _get_cfg_val(self, key: str, default: int) -> int:
-        if self.config is None:
-            return default
-        try:
-            if hasattr(self.config, "get") and callable(self.config.get):
-                return int(self.config.get(key, default))
-            if hasattr(self.config, key):
-                return int(getattr(self.config, key))
-            if hasattr(self.config, "config") and isinstance(self.config.config, dict):
-                return int(self.config.config.get(key, default))
-            return int(self.config[key])
-        except Exception:
-            return default
+        except Exception as e:
+            self.logger.error(f"Failed to notify systemd: {e}")
 
     def _process_ipc(self, now: float) -> None:
         """Non-blocking read of UNIX sockets to sync with user-space tools."""
@@ -126,8 +105,8 @@ class SentryDaemon:
                     self.spatial_pid = int(pid_str)
         except BlockingIOError:
             pass
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.error(f"Bridge IPC error: {e}")
 
         # 2. Respond to sentry_top.py dashboard pings
         try:
@@ -143,10 +122,15 @@ class SentryDaemon:
                         "spatial_pid": self.spatial_pid,
                         "throttled_tasks": throttled
                     }
-                    self.hud_sock.sendto(json.dumps(state).encode(), addr)
+                    try:
+                        self.hud_sock.sendto(json.dumps(state).encode(), addr)
+                    except FileNotFoundError:
+                        # Client disconnected between ping and pong, safe to ignore
+                        pass
         except BlockingIOError:
             pass
         except Exception:
+            # Suppress remaining IPC noise to prevent daemon crashing
             pass
 
     def shutdown(self, signum: Any = None, frame: Any = None) -> None:
@@ -191,29 +175,25 @@ class SentryDaemon:
                     
                     if hog_pid > 0 and not self.cgroup_mgr.is_throttled(hog_pid):
                         if hog_pid == self.spatial_pid:
-                            self.logger.info(f"Spatial VIP Immunity protecting active PID {hog_pid}.")
+                            pass
                         elif not self.safety_guard.is_immune(hog_pid):
                             self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
                             self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec)
 
                 # 3. CPU Defense (eBPF)
                 if self.bpf_sensor is not None:
-                    # CRITICAL FIX: The daemon polls every 200ms and wipes the BPF map.
-                    # We MUST use a threshold lower than 200ms. Setting to 50ms (50000000 ns).
                     top_cpu_hogs = self.bpf_sensor.get_top_hogs(threshold_ns=50000000)
                     for pid in top_cpu_hogs:
                         if not self.cgroup_mgr.is_throttled(pid):
                             if pid == self.spatial_pid:
-                                self.logger.info(f"Spatial VIP Immunity protecting active PID {pid}.")
+                                pass
                             elif not self.safety_guard.is_immune(pid):
                                 self.logger.warning(f"Throttling CPU hog PID: {pid}")
                                 self.cgroup_mgr.apply_cpu_throttle(pid, 20)
                                 self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
                 
-                # Systemd heartbeat
                 self._sd_notify("WATCHDOG=1")
-                
-                time.sleep(0.2)  # 200ms polling window
+                time.sleep(0.2)  # 200ms
                 
             except Exception as e:
                 self.logger.error(f"Critical Event Loop Failure: {e}")
