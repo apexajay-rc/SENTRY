@@ -10,11 +10,17 @@ This guarantees we catch CPU hogs even if they NEVER context switch.
 import time
 import logging
 import sys
+import os
+
+# --- THE BRUTE-FORCE PATH FIX ---
+# Force Python to look in the Ubuntu system directory where 'apt' installs BCC
+sys.path.append("/usr/lib/python3/dist-packages")
 
 try:
     from bcc import BPF, PerfType, PerfSwIds
 except ImportError:
-    logging.critical("BCC module not found. Please run: sudo apt-get install python3-bpfcc")
+    logging.critical("BCC module not found even after path injection.")
+    logging.critical("Please ensure: sudo apt-get install -y python3-bpfcc bpfcc-tools linux-headers-$(uname -r)")
     sys.exit(1)
 
 logger = logging.getLogger(__name__)
