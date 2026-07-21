@@ -18,9 +18,12 @@ sys.path.append("/usr/lib/python3/dist-packages")
 
 try:
     from bcc import BPF, PerfType, PerfSwIds
-except ImportError:
-    logging.critical("BCC module not found even after path injection.")
-    logging.critical("Please ensure: sudo apt-get install -y python3-bpfcc bpfcc-tools linux-headers-$(uname -r)")
+except Exception as e:
+    import traceback
+    logging.critical(f"EXACT IMPORT ERROR: {e}")
+    logging.critical(f"PYTHON EXECUTABLE: {sys.executable}")
+    logging.critical(f"PYTHON PATH: {sys.path}")
+    logging.critical(f"TRACEBACK:\n{traceback.format_exc()}")
     sys.exit(1)
 
 logger = logging.getLogger(__name__)
