@@ -17,7 +17,7 @@ import os
 sys.path.append("/usr/lib/python3/dist-packages")
 
 try:
-    from bcc import BPF, PerfType, PerfSwIds
+    from bcc import BPF, PerfType, PerfSwId
 except Exception as e:
     import traceback
     logging.critical(f"EXACT IMPORT ERROR: {e}")
@@ -67,7 +67,7 @@ class BPFSensor:
         # This bypasses the scheduler and forces visibility on raw CPU usage
         self.b.attach_perf_event(
             ev_type=PerfType.SOFTWARE, 
-            ev_config=PerfSwIds.CPU_CLOCK, 
+            ev_config=PerfSwId.CPU_CLOCK, 
             fn_name="do_perf_event", 
             sample_period=0, 
             sample_freq=100
