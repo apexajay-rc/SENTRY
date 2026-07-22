@@ -2,9 +2,9 @@
 core/bpf_sensor.py
 
 The Ring-0 eBPF Sensor.
-Uses a Kprobe on `scheduler_tick` which is guaranteed to fire on every 
-core continuously, even if the CPU is 100% pinned in a Virtual Machine.
-Bypasses broken Hypervisor Perf Events entirely.
+Uses native sched:sched_switch tracepoints.
+Captures both rapid context-switchers AND 100% pinned CPU hogs 
+without relying on unsupported PerfEvents or restricted Kprobes.
 """
 
 import time
@@ -29,27 +29,36 @@ bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 
+BPF_HASH(start_time, u32, u64);
 BPF_HASH(cpu_time, u32, u64);
 
-// Kprobe on the kernel's native scheduler tick.
-// BCC automatically attaches functions starting with `kprobe__` to the kernel.
-// This is called periodically by the system timer on every core (1-4ms intervals).
-int kprobe__scheduler_tick(struct pt_regs *ctx) {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    
-    // Ignore idle kernel threads (PID 0)
-    if (pid == 0) return 0;
+// Hooks into the universally stable kernel context switch tracepoint.
+// Automatically attached by BCC.
+TRACEPOINT_PROBE(sched, sched_switch) {
+    // bpf_ktime_get_ns() exactly matches Python's time.monotonic_ns()
+    u64 ts = bpf_ktime_get_ns();
+    u32 prev_pid = args->prev_pid;
+    u32 next_pid = args->next_pid;
 
-    // Approximate tick time as 4ms (4,000,000 ns).
-    // Since we are looking for massive hogs relative to others, 
-    // the exact nanosecond precision here isn't as important as the frequency.
-    u64 delta = 4000000; 
-    
-    u64 *total = cpu_time.lookup(&pid);
-    if (total != 0) {
-        delta += *total;
+    // 1. Process switching OUT: Calculate how long it held the CPU
+    if (prev_pid > 0) {
+        u64 *start = start_time.lookup(&prev_pid);
+        if (start != 0) {
+            u64 delta = ts - *start;
+            u64 *total = cpu_time.lookup(&prev_pid);
+            if (total != 0) {
+                delta += *total;
+            }
+            cpu_time.update(&prev_pid, &delta);
+            start_time.delete(&prev_pid); // Remove active lock
+        }
     }
-    cpu_time.update(&pid, &delta);
+
+    // 2. Process switching IN: Record the exact start time
+    if (next_pid > 0) {
+        start_time.update(&next_pid, &ts);
+    }
+
     return 0;
 }
 """
@@ -60,40 +69,55 @@ class BPFSensor:
         self.tick_counter = 0
         
     def start(self):
-        logger.info("Injecting eBPF Kprobe into the Linux Kernel...")
+        logger.info("Injecting eBPF Tracepoint into the Linux Kernel...")
         self.b = BPF(text=bpf_text)
-        logger.info("✅ eBPF Profiler successfully attached to scheduler_tick.")
+        logger.info("✅ eBPF Profiler successfully attached to sched_switch.")
 
-    def get_top_hogs(self, threshold_ns=20000000):
+    def get_top_hogs(self, threshold_ns=50000000):
         """
-        Reads the BPF map, finds processes exceeding the 20ms threshold.
+        Reads the BPF map, finds processes exceeding the 50ms threshold.
         """
         if not self.b:
             return []
             
-        hog_pids = []
+        hog_pids = set()
+        current_ts = time.monotonic_ns()
+        
         cpu_time_map = self.b["cpu_time"]
+        start_time_map = self.b["start_time"]
+        
+        # --- 1. Catch Rapid Context-Switchers ---
         items = list(cpu_time_map.items())
-        
-        # --- DIAGNOSTIC LOGGING ---
-        self.tick_counter += 1
-        if self.tick_counter % 10 == 0:  # Print every 2 seconds (10 ticks * 200ms)
-            logger.info(f"[DIAGNOSTIC] eBPF Map is tracking {len(items)} active PIDs.")
-            if len(items) == 0:
-                logger.warning("[DIAGNOSTIC] The BPF map is completely empty! Kprobe failed to fire.")
-        
         for k, v in items:
             pid = k.value
             total_time_ns = v.value
             
-            # Check against the 20ms threshold
             if total_time_ns > threshold_ns and pid > 0:
-                hog_pids.append(pid)
+                hog_pids.add(pid)
                 
             # SAFE DELETION: Manual deletion to bypass BCC map.clear() bugs
             try:
                 del cpu_time_map[k]
             except KeyError:
                 pass
+                
+        # --- 2. Catch 100% Pinned Tasks (The Blindspot Fix) ---
+        # If stress-ng pins a core, it never switches out, so cpu_time_map is empty.
+        # But it IS actively running in start_time_map! We compare its start time 
+        # to the current physical clock.
+        active_items = list(start_time_map.items())
+        for k, v in active_items:
+            pid = k.value
+            start_ts = v.value
+            run_time_ns = current_ts - start_ts
+            
+            if run_time_ns > threshold_ns and pid > 0:
+                hog_pids.add(pid)
+                # We do NOT delete from start_time_map, because the task is still holding the CPU!
+                
+        # --- DIAGNOSTIC LOGGING ---
+        self.tick_counter += 1
+        if self.tick_counter % 10 == 0:  # Print every 2 seconds
+            logger.info(f"[DIAGNOSTIC] eBPF tracking {len(active_items)} pinned/active PIDs and processed {len(items)} switches.")
         
-        return hog_pids
+        return list(hog_pids)
