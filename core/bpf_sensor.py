@@ -4,7 +4,7 @@ core/bpf_sensor.py
 The Ring-0 eBPF Sensor.
 Uses native sched:sched_switch tracepoints.
 Captures both rapid context-switchers AND 100% pinned CPU hogs 
-without relying on unsupported PerfEvents or restricted Kprobes.
+without relying on unsupported PerfEvents, restricted Kprobes, or clock synchronization.
 """
 
 import time
@@ -22,8 +22,6 @@ except ImportError as e:
     logging.critical(f"PYTHON EXECUTABLE: {sys.executable}")
     sys.exit(1)
 
-logger = logging.getLogger(__name__)
-
 # --- THE KERNEL C CODE ---
 bpf_text = """
 #include <uapi/linux/ptrace.h>
@@ -33,9 +31,7 @@ BPF_HASH(start_time, u32, u64);
 BPF_HASH(cpu_time, u32, u64);
 
 // Hooks into the universally stable kernel context switch tracepoint.
-// Automatically attached by BCC.
 TRACEPOINT_PROBE(sched, sched_switch) {
-    // bpf_ktime_get_ns() exactly matches Python's time.monotonic_ns()
     u64 ts = bpf_ktime_get_ns();
     u32 prev_pid = args->prev_pid;
     u32 next_pid = args->next_pid;
@@ -67,11 +63,12 @@ class BPFSensor:
     def __init__(self):
         self.b = None
         self.tick_counter = 0
+        self.pinned_candidates = {}
         
     def start(self):
-        logger.info("Injecting eBPF Tracepoint into the Linux Kernel...")
+        print("[INFO] Injecting eBPF Tracepoint into the Linux Kernel...")
         self.b = BPF(text=bpf_text)
-        logger.info("✅ eBPF Profiler successfully attached to sched_switch.")
+        print("[INFO] ✅ eBPF Profiler successfully attached to sched_switch.")
 
     def get_top_hogs(self, threshold_ns=50000000):
         """
@@ -81,7 +78,6 @@ class BPFSensor:
             return []
             
         hog_pids = set()
-        current_ts = time.monotonic_ns()
         
         cpu_time_map = self.b["cpu_time"]
         start_time_map = self.b["start_time"]
@@ -101,23 +97,28 @@ class BPFSensor:
             except KeyError:
                 pass
                 
-        # --- 2. Catch 100% Pinned Tasks (The Blindspot Fix) ---
-        # If stress-ng pins a core, it never switches out, so cpu_time_map is empty.
-        # But it IS actively running in start_time_map! We compare its start time 
-        # to the current physical clock.
+        # --- 2. Catch 100% Pinned Tasks (The Clock-Immune Fix) ---
+        # If a task is 100% pinning the CPU, it never switches out.
+        # We record its start timestamp. If it has the EXACT same timestamp
+        # on our next sweep (200ms later), it never left the CPU!
+        current_active_tasks = {}
         active_items = list(start_time_map.items())
+        
         for k, v in active_items:
-            pid = k.value
-            start_ts = v.value
-            run_time_ns = current_ts - start_ts
-            
-            if run_time_ns > threshold_ns and pid > 0:
+            if k.value > 0:
+                current_active_tasks[k.value] = v.value
+                
+        for pid, start_ts in current_active_tasks.items():
+            if pid in self.pinned_candidates and self.pinned_candidates[pid] == start_ts:
+                # The timestamp is identical. It NEVER switched out. Convicted.
                 hog_pids.add(pid)
-                # We do NOT delete from start_time_map, because the task is still holding the CPU!
+                
+        # Update candidates for the next tick
+        self.pinned_candidates = current_active_tasks
                 
         # --- DIAGNOSTIC LOGGING ---
         self.tick_counter += 1
         if self.tick_counter % 10 == 0:  # Print every 2 seconds
-            logger.info(f"[DIAGNOSTIC] eBPF tracking {len(active_items)} pinned/active PIDs and processed {len(items)} switches.")
+            print(f"[BPF DIAGNOSTIC] Tracking {len(current_active_tasks)} active/pinned PIDs and processed {len(items)} switches.")
         
         return list(hog_pids)
