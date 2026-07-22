@@ -1,16 +1,13 @@
 """
 core/bpf_sensor.py
 
-The Final, Bulletproof Ring-0 eBPF Sensor.
-Uses dual-map tracking (cpu_time + start_time) to catch both rapid-switching 
-tasks and pinned CPU hogs, immune to VM clock drift and Kprobe restrictions.
+The drift-immune, diagnostic-rich eBPF CPU Profiler.
 """
 
 import time
 import sys
 import os
 
-# Bypass Ubuntu virtual environment isolation
 sys.path.append("/usr/lib/python3/dist-packages")
 
 try:
@@ -23,10 +20,7 @@ bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 
-// Tracks when a thread enters the CPU (TID -> timestamp)
 BPF_HASH(start_time, u32, u64);
-
-// Aggregates total CPU time (TGID -> total nanoseconds)
 BPF_HASH(cpu_time, u32, u64);
 
 TRACEPOINT_PROBE(sched, sched_switch) {
@@ -63,21 +57,18 @@ TRACEPOINT_PROBE(sched, sched_switch) {
 
 class BPFSensor:
     def __init__(self):
-        print("\n[BPF SENSOR] Initializing Object...", flush=True)
         self.b = None
-        self.tick_counter = 0
+        self.last_pinned = {}
         
     def start(self):
-        print("[BPF SENSOR] Compiling C code and attaching to sched_switch...", flush=True)
         try:
             self.b = BPF(text=bpf_text)
-            print("[INFO] ✅ eBPF Profiler successfully attached. Dual-map tracking active.", flush=True)
+            print("=> ✅ eBPF Profiler successfully attached to sched_switch tracepoint.", flush=True)
         except Exception as e:
-            print(f"[CRITICAL] BPF Compilation failed: {e}", flush=True)
+            print(f"❌ [CRITICAL] BPF Compilation failed: {e}", flush=True)
             raise
 
     def _get_tgid_from_tid(self, tid):
-        """Converts a Thread ID to its parent Process ID to pass the SafetyGuard."""
         try:
             with open(f"/proc/{tid}/status", "r") as f:
                 for line in f:
@@ -87,17 +78,15 @@ class BPFSensor:
             pass
         return tid
 
-    def get_top_hogs(self, threshold_ns=50000000): # 50ms default
+    def get_top_hogs(self, threshold_ns=50000000):
         if not self.b:
-            return []
+            return [], 0
             
         hog_pids = set()
+        max_time_ns = 0
         
         try:
-            # We must use clock_gettime_ns(CLOCK_MONOTONIC) to perfectly match bpf_ktime_get_ns()
-            now_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
-            
-            # --- MAP 1: Catch Rapidly Switching Tasks ---
+            # MAP 1: Rapid Switchers
             cpu_time_map = self.b["cpu_time"]
             items = list(cpu_time_map.items())
             
@@ -105,36 +94,40 @@ class BPFSensor:
                 tgid = k.value
                 total_time_ns = v.value
                 
+                if total_time_ns > max_time_ns:
+                    max_time_ns = total_time_ns
+                    
                 if total_time_ns > threshold_ns and tgid > 0:
                     hog_pids.add(tgid)
                     
-                # Safely delete to prep for next 200ms sweep
                 try:
                     del cpu_time_map[k]
                 except KeyError:
                     pass
                     
-            # --- MAP 2: Catch Pinned Tasks (Stress-ng) ---
+            # MAP 2: Pinned / 100% Core Hogs
             start_time_map = self.b["start_time"]
             pinned_items = list(start_time_map.items())
+            current_pinned = {}
             
             for k, v in pinned_items:
                 tid = k.value
                 start_ns = v.value
+                current_pinned[tid] = start_ns
                 
-                delta_ns = now_ns - start_ns
-                if delta_ns > threshold_ns and tid > 0:
-                    # Convert the thread ID to the main process ID
+                if tid in self.last_pinned and self.last_pinned[tid] == start_ns:
                     tgid = self._get_tgid_from_tid(tid)
-                    hog_pids.add(tgid)
+                    if tgid > 0:
+                        hog_pids.add(tgid)
+                    
+                    # If pinned, it technically took the entire 200ms window
+                    if max_time_ns < 200000000:
+                        max_time_ns = 200000000
 
-            # --- DIAGNOSTICS ---
-            self.tick_counter += 1
-            if self.tick_counter % 5 == 0:  # Print every 1 second exactly
-                print(f"[BPF DIAGNOSTIC] Sweeping... {len(items)} rapid, {len(pinned_items)} pinned. Hogs >50ms: {list(hog_pids)}", flush=True)
-                
-            return list(hog_pids)
+            self.last_pinned = current_pinned
+            
+            return list(hog_pids), max_time_ns
             
         except Exception as e:
-            print(f"[BPF ERROR] Loop crashed: {e}", flush=True)
-            return []
+            print(f"❌ [BPF ERROR] Loop crashed: {e}", flush=True)
+            return [], 0
