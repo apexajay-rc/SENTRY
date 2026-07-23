@@ -2,21 +2,20 @@
 """
 daemon/main.py
 
-The Production-Grade Composition Root for SENTRY.
-Restored to its beautiful, live-telemetry glory.
+The Basecamp Architecture for SENTRY.
+Restored to pure, flawless user-space polling with beautiful live telemetry.
 """
 
 import sys
 import os
 import time
 import signal
-import traceback
 import socket
 import json
+import psutil
 from typing import Optional, Any
 
-# 1. IMMEDIATE PRIORITY ELEVATION
-# SENTRY must never be starved of CPU by the rogue processes it is trying to catch.
+# IMMEDIATE PRIORITY ELEVATION: Prevent SENTRY from being starved by hogs
 try:
     os.nice(-20)
 except Exception:
@@ -28,17 +27,48 @@ from core.safety_guard import SafetyGuard
 from core.psi_sensor import PSISensor
 from core.config import SentryConfig
 
-try:
-    from core.bpf_sensor import BPFSensor
-    _BPF_AVAILABLE = True
-except ImportError:
-    _BPF_AVAILABLE = False
+class ProcSensor:
+    """The flawless, kernel-agnostic Basecamp CPU profiler."""
+    def __init__(self):
+        self.procs = {}
+        self.tick_count = 0
 
+    def get_top_hogs(self, threshold=85.0):
+        self.tick_count += 1
+        hogs = []
+        max_cpu = 0.0
+        
+        # Every 10 ticks, refresh the process list completely to catch new spawns and drop dead ones
+        if self.tick_count % 10 == 0:
+            current_pids = set(psutil.pids())
+            dead_pids = set(self.procs.keys()) - current_pids
+            for pid in dead_pids:
+                del self.procs[pid]
+
+        for pid in psutil.pids():
+            try:
+                if pid not in self.procs:
+                    p = psutil.Process(pid)
+                    p.cpu_percent() # Prime the psutil counter
+                    self.procs[pid] = p
+                else:
+                    # psutil natively aggregates all thread CPU usage into this single Process ID call
+                    cpu = self.procs[pid].cpu_percent()
+                    if cpu > max_cpu:
+                        max_cpu = cpu
+                    if cpu > threshold:
+                        hogs.append(pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                if pid in self.procs:
+                    del self.procs[pid]
+            except Exception:
+                pass
+                
+        return hogs, max_cpu
 
 class SentryDaemon:
     def __init__(self) -> None:
         self.logger = StructuredLogger(name="SENTRY_DAEMON")
-        
         self.config = SentryConfig("sentry_config.yaml")
         self.mem_clamp_bytes = self.config.memory_clamp_bytes
         self.cooldown_sec = self.config.cooldown_seconds
@@ -46,13 +76,7 @@ class SentryDaemon:
         self.cgroup_mgr = CgroupManager(self.logger)
         self.safety_guard = SafetyGuard()
         self.psi_sensor = PSISensor(threshold=5.0)
-        
-        self.bpf_sensor: Optional[Any] = None
-        if _BPF_AVAILABLE:
-            try:
-                self.bpf_sensor = BPFSensor()  # type: ignore
-            except Exception as e:
-                self.logger.error(f"Failed to initialize BPFSensor: {e}")
+        self.proc_sensor = ProcSensor()
         
         self.spatial_pid: Optional[int] = None
         self.bridge_sock_path = "/run/sentry_bridge.sock"
@@ -60,6 +84,7 @@ class SentryDaemon:
         
         self._cleanup_sockets()
 
+        # IPC Sockets
         self.bridge_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.bridge_sock.bind(self.bridge_sock_path)
         os.chmod(self.bridge_sock_path, 0o666)  
@@ -94,7 +119,7 @@ class SentryDaemon:
             pass
 
     def _process_ipc(self, now: float) -> None:
-        """Safe, single-pass non-blocking read to absolutely prevent freeze loops."""
+        """Safe, non-blocking read to absolutely prevent freeze loops."""
         try:
             data, _ = self.bridge_sock.recvfrom(1024)
             pid_str = data.decode().strip()
@@ -134,23 +159,15 @@ class SentryDaemon:
         sys.exit(0)
 
     def run(self) -> None:
-        # THE BEAUTIFUL BOOT SEQUENCE
         print("\n" + "="*60, flush=True)
-        print(" 🛡️  SENTRY RING-0 COMMAND DAEMON ONLINE ", flush=True)
+        print(" 🛡️  SENTRY RING-0 COMMAND DAEMON ONLINE (BASECAMP) ", flush=True)
         print("="*60 + "\n", flush=True)
         
-        self.logger.info("SENTRY Ring-0 Daemon online. Event loop armed.")
-        self._sd_notify("READY=1\nSTATUS=SENTRY Ring-0 Daemon online.")
+        self._sd_notify("READY=1\nSTATUS=SENTRY Basecamp Daemon online.")
+        print("=> ✅ High-Speed PSUtil Profiler armed.", flush=True)
         
         if not self.psi_sensor.is_supported:
-            print("❌ Kernel PSI not detected. Run kernel with psi=1.", flush=True)
-            
-        if self.bpf_sensor is not None:
-            print("=> Arming eBPF Behavioral Probes...", flush=True)
-            try:
-                self.bpf_sensor.start()
-            except Exception as e:
-                print(f"❌ Failed to start eBPF Sensor: {e}", flush=True)
+            print("=> ⚠️  Kernel PSI not detected. Memory defenses disabled.", flush=True)
         
         while self.running:
             try:
@@ -160,24 +177,22 @@ class SentryDaemon:
                 self.cgroup_mgr.reconcile_cooldowns(now)
                 
                 action_taken = False
-                max_slice_ms = 0.0
                 
-                # 1. CPU Defense (eBPF)
-                if self.bpf_sensor is not None:
-                    top_cpu_hogs, max_ns = self.bpf_sensor.get_top_hogs(threshold_ns=50000000)
-                    max_slice_ms = max_ns / 1000000.0
-                    
-                    for pid in top_cpu_hogs:
-                        if not self.cgroup_mgr.is_throttled(pid):
-                            if pid == self.spatial_pid:
-                                pass
-                            elif not os.path.exists(f"/proc/{pid}"):
-                                pass # Prevent ghosts from triggering exceptions
-                            elif not self.safety_guard.is_immune(pid):
-                                action_taken = True
-                                print(f"\n🚨 => ACTION: Throttling CPU hog (PID {pid}) to 20% hardware clamp.", flush=True)
-                                self.cgroup_mgr.apply_cpu_throttle(pid, 20)
-                                self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
+                # 1. CPU Defense (Basecamp proc polling)
+                # psutil cpu_percent > 85.0 means it is burning almost an entire core
+                top_cpu_hogs, max_cpu = self.proc_sensor.get_top_hogs(threshold=85.0)
+                
+                for pid in top_cpu_hogs:
+                    if not self.cgroup_mgr.is_throttled(pid):
+                        if pid == self.spatial_pid:
+                            pass # Spatial Immunity
+                        elif not os.path.exists(f"/proc/{pid}"):
+                            pass # Prevent ghosts
+                        elif not self.safety_guard.is_immune(pid):
+                            action_taken = True
+                            print(f"\n🚨 => ACTION: Throttling CPU hog (PID {pid}). cpu.slice set to low, cpu.max clamped to 20%.", flush=True)
+                            self.cgroup_mgr.apply_cpu_throttle(pid, 20)
+                            self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
                 
                 # 2. Memory Defense (PSI)
                 if self.psi_sensor.check_memory_pressure():
@@ -185,15 +200,14 @@ class SentryDaemon:
                     if hog_pid > 0 and not self.cgroup_mgr.is_throttled(hog_pid):
                         if hog_pid != self.spatial_pid and os.path.exists(f"/proc/{hog_pid}") and not self.safety_guard.is_immune(hog_pid):
                             action_taken = True
-                            print(f"\n🚨 => ACTION: Clamping memory.high for PID {hog_pid} to {self.mem_clamp_bytes} bytes.", flush=True)
+                            print(f"\n🚨 => ACTION: Memory starvation detected. memory.high clamped to {self.mem_clamp_bytes} bytes for PID {hog_pid}.", flush=True)
                             self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
                             self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec)
                 
                 # --- The Continuous Aesthetic Logging ---
                 if not hasattr(self, '_last_print') or now - self._last_print > 3.0:
                     if not action_taken and not self.cgroup_mgr.throttled_tasks:
-                        # Displays live proof that the kernel BPF is feeding it data
-                        print(f"✨ [SYSTEM NOMINAL] No action needed. Foreground workflow prioritized. (Max CPU slice: {max_slice_ms:.1f}ms)", flush=True)
+                        print(f"✨ [SYSTEM NOMINAL] No action needed. Nothing is happening now. (Max CPU Load: {max_cpu:.1f}%)", flush=True)
                     self._last_print = now
                 
                 self._sd_notify("WATCHDOG=1")
