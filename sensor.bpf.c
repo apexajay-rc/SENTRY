@@ -1,63 +1,52 @@
+#include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 
-// 1. The Data Payload
-// We added a new 64-bit integer to hold the exact nanoseconds spent on the CPU.
+// 1. Data Payload: Report TGID, comm, and accumulated CPU time
 struct event_t {
-    u32 pid;
+    u32 tgid;
     char comm[16];
-    u64 duration_ns;
+    u64 cpu_time_ns;
 };
 
-// 2. The Kernel Scratchpad (Hash Map)
-// Key = PID (32-bit int), Value = Start Timestamp (64-bit int)
-BPF_HASH(start_time, u32, u64);
+// 2. Per-TGID CPU time accumulator (updated on every sched_switch OUT)
+BPF_HASH(cpu_time, u32, u64);
 
-// 3. The Bridge to Python
+// 3. Ring buffer for high-consumption events
 BPF_RINGBUF_OUTPUT(events, 256);
 
-// 4. The Scheduler Hook
-// This fires every single time the CPU switches tasks.
+// 4. Per-TID last-seen timestamp (start time when switched IN)
+BPF_HASH(start_time, u32, u64);
+
+// Threshold: report if a TGID accumulates > 50ms in one scheduling window
+#define REPORT_THRESHOLD_NS 50000000ULL
+
 TRACEPOINT_PROBE(sched, sched_switch) {
-    u32 prev_pid = args->prev_pid;  // The process getting kicked OFF the CPU
-    u32 next_pid = args->next_pid;  // The process stepping ONTO the CPU
-    
-    // Get the current time directly from the CPU hardware in nanoseconds
     u64 now = bpf_ktime_get_ns();
 
-    // ----------------------------------------------------
-    // STEP A: Start the stopwatch for the incoming process
-    // ----------------------------------------------------
-    start_time.update(&next_pid, &now);
+    // --- Outgoing task (prev) ---
+    u64 prev_pid_tgid = bpf_get_current_pid_tgid();
+    u32 prev_tid = prev_pid_tgid;
+    u32 prev_tgid = prev_pid_tgid >> 32;
 
-    // ----------------------------------------------------
-    // STEP B: Stop the stopwatch for the outgoing process
-    // ----------------------------------------------------
-    // Look up when the outgoing process started
-    u64 *tsp = start_time.lookup(&prev_pid);
-    if (tsp != NULL) {
-        // Calculate total nanoseconds spent on the CPU
-        u64 duration = now - *tsp;
-        
-        // Delete the timestamp to save kernel memory
-        start_time.delete(&prev_pid);
+    if (prev_tid > 0 && prev_tgid > 0) {
+        u64 *start = start_time.lookup(&prev_tid);
+        if (start != 0) {
+            u64 delta = now - *start;
 
-        // FILTER: The CPU switches tasks thousands of times a second. 
-        // To avoid flooding Python, we only report bursts longer than 1 millisecond (1,000,000 ns).
-        if (duration > 1000000) {
-            
-            // Reserve space on the Ring Buffer
-            struct event_t *e = events.ringbuf_reserve(sizeof(struct event_t));
-            if (e) {
-                e->pid = prev_pid;
-                e->duration_ns = duration;
-                
-                // Safely copy the command name of the outgoing process
-                bpf_probe_read_kernel_str(&e->comm, sizeof(e->comm), args->prev_comm);
-                
-                // Submit to Python
-                events.ringbuf_submit(e, 0);
+            u64 zero = 0;
+            u64 *total = cpu_time.lookup_or_try_init(&prev_tgid, &zero);
+            if (total) {
+                *total += delta;
             }
+            start_time.delete(&prev_tid);
         }
     }
+
+    // --- Incoming task (next) ---
+    u32 next_tid = args->next_pid;
+    if (next_tid > 0) {
+        start_time.update(&next_tid, &now);
+    }
+
     return 0;
 }
