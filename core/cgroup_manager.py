@@ -1,8 +1,8 @@
 """
 core/cgroup_manager.py
 
-Native Cgroups v2 enforcement with PID recycling defense.
-Verifies writes and falls back to scheduler priority if cgroups unavailable.
+Native Cgroups v2 enforcement with TOCTOU-safe boot tick capturing
+and startup reconciliation to prevent permanent locks on crash-restarts.
 """
 
 import os
@@ -14,6 +14,34 @@ class CgroupManager:
         self.logger = logger
         # {pid: (kernel_start_ticks, expiration_timestamp)}
         self.throttled_tasks: Dict[int, Tuple[int, float]] = {}
+
+    def clear_orphaned_throttles(self) -> None:
+        """Scans running processes on startup and clears orphaned SENTRY cgroup limits."""
+        self.logger.info("Scanning for orphaned SENTRY throttles from previous crashes...")
+        try:
+            for pid_str in os.listdir("/proc"):
+                if not pid_str.isdigit():
+                    continue
+                pid = int(pid_str)
+                
+                cgroup_path = self._get_cgroup_v2_path(pid)
+                if not cgroup_path:
+                    continue
+                    
+                cpu_max_path = os.path.join(cgroup_path, "cpu.max")
+                try:
+                    if os.path.exists(cpu_max_path):
+                        with open(cpu_max_path, "r") as f:
+                            actual = f.read().strip()
+                        # 20000 100000 is our exact hardcoded 20% clamp signature
+                        if actual == "20000 100000":
+                            with open(cpu_max_path, "w") as f:
+                                f.write("max 100000")
+                            self.logger.info(f"Cleared orphaned CPU throttle on PID {pid}")
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.warning(f"Orphan scan failed: {e}")
 
     def _get_cgroup_v2_path(self, pid: int) -> Optional[str]:
         """Dynamically locate a process's cgroup v2 path."""
@@ -34,17 +62,13 @@ class CgroupManager:
                 stat_data = f.read()
             comm_end = stat_data.rindex(")")
             fields = stat_data[comm_end + 1:].split()
-            return int(fields[19])  # Field 22 (1-indexed) = index 19 (0-indexed after comm)
+            return int(fields[19])
         except Exception:
             return None
 
-    def register_throttle(self, pid: int, unlock_time: float) -> bool:
-        """Record a throttle event locked to the process's unique kernel boot tick."""
-        start_time = self._get_process_start_time(pid)
-        if start_time is None:
-            return False
+    def register_throttle(self, pid: int, unlock_time: float, start_time: int) -> None:
+        """Record a throttle event locked to the pre-captured kernel boot tick."""
         self.throttled_tasks[pid] = (start_time, unlock_time)
-        return True
 
     def is_throttled(self, pid: int) -> bool:
         """Check if PID is actively throttled, defending against PID recycling."""
@@ -54,7 +78,6 @@ class CgroupManager:
         recorded_start, _ = self.throttled_tasks[pid]
         current_start = self._get_process_start_time(pid)
 
-        # Process exited or PID recycled
         if current_start is None or current_start != recorded_start:
             del self.throttled_tasks[pid]
             return False
@@ -92,13 +115,17 @@ class CgroupManager:
         except Exception:
             return False
 
-    def apply_memory_throttle(self, pid: int, limit_bytes: int) -> None:
-        """Apply memory.high clamp via native file writes."""
+    def apply_memory_throttle(self, pid: int, limit_bytes: int) -> Optional[int]:
+        """Apply memory.high clamp via native file writes. TOCTOU safe."""
+        start_time = self._get_process_start_time(pid)
+        if start_time is None:
+            return None
+
         cgroup_path = self._get_cgroup_v2_path(pid)
         if not cgroup_path:
             self.logger.warning(f"Could not resolve cgroup for PID {pid}. Falling back to scheduler.")
             self._apply_scheduler_fallback(pid)
-            return
+            return start_time
 
         mem_high_path = os.path.join(cgroup_path, "memory.high")
         limit_str = str(limit_bytes)
@@ -117,35 +144,24 @@ class CgroupManager:
         except Exception as e:
             self.logger.warning(f"Cgroup memory write failed: {e}. Executing fallback.")
             self._apply_scheduler_fallback(pid)
+            
+        return start_time
 
-    def release_memory_throttle(self, pid: int) -> None:
-        """Restore memory.high to max."""
-        cgroup_path = self._get_cgroup_v2_path(pid)
-        if cgroup_path:
-            mem_high_path = os.path.join(cgroup_path, "memory.high")
-            try:
-                with open(mem_high_path, "w") as f:
-                    f.write("max")
-            except Exception:
-                pass
-        self._release_scheduler_fallback(pid)
+    def apply_cpu_throttle(self, pid: int, quota_pct: int = 20) -> Optional[int]:
+        """Apply cpu.max clamp. TOCTOU safe."""
+        start_time = self._get_process_start_time(pid)
+        if start_time is None:
+            return None
 
-    def apply_cpu_throttle(self, pid: int, quota_pct: int = 20) -> None:
-        """
-        Apply cpu.max clamp.
-        quota_pct: percentage of ONE CPU core (e.g., 20 = 20% of one core).
-        cpu.max format: "quota period" where quota/period = CPU fraction.
-        period default = 100000us. quota = quota_pct * 1000.
-        """
         cgroup_path = self._get_cgroup_v2_path(pid)
         if not cgroup_path:
             self.logger.warning(f"Could not resolve cgroup for PID {pid}. Falling back to OS scheduler.")
             self._apply_scheduler_fallback(pid)
-            return
+            return start_time
 
         cpu_max_path = os.path.join(cgroup_path, "cpu.max")
         period = 100000
-        quota = quota_pct * 1000  # 20% -> 20000us per 100000us period
+        quota = quota_pct * 1000  
         value = f"{quota} {period}"
 
         try:
@@ -159,9 +175,23 @@ class CgroupManager:
         except Exception as e:
             self.logger.warning(f"Cgroup CPU write failed: {e}. Executing fallback.")
             self._apply_scheduler_fallback(pid)
+            
+        return start_time
+
+    def release_memory_throttle(self, pid: int) -> None:
+        """Restore memory.high to max."""
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if cgroup_path:
+            mem_high_path = os.path.join(cgroup_path, "memory.high")
+            try:
+                with open(mem_high_path, "w") as f:
+                    f.write("max")
+                self.logger.info(f"Released Memory clamp for PID {pid}")
+            except Exception:
+                pass
+        self._release_scheduler_fallback(pid)
 
     def release_cpu_throttle(self, pid: int) -> None:
-        """Restore cpu.max to max."""
         cgroup_path = self._get_cgroup_v2_path(pid)
         if cgroup_path:
             cpu_max_path = os.path.join(cgroup_path, "cpu.max")
@@ -174,7 +204,6 @@ class CgroupManager:
         self._release_scheduler_fallback(pid)
 
     def _apply_scheduler_fallback(self, pid: int) -> None:
-        """Native OS syscall fallback if cgroups are locked by systemd."""
         try:
             os.setpriority(os.PRIO_PROCESS, pid, 19)
             self.logger.audit("CLAMP_CPU_SCHEDULER", pid, "OS", "Priority reduced to +19")
@@ -188,7 +217,6 @@ class CgroupManager:
             pass
 
     def release_all(self) -> None:
-        """Emergency release for daemon shutdown."""
         for pid in list(self.throttled_tasks.keys()):
             self.release_memory_throttle(pid)
             self.release_cpu_throttle(pid)

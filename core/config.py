@@ -3,7 +3,7 @@ core/config.py
 
 Unified Configuration Manager.
 Resolves the dual-API technical debt by combining dataclass defaults
-with safe YAML loading and legacy dictionary access.
+with safe YAML loading, while correctly parsing nested policy dictionaries.
 """
 import os
 import yaml
@@ -23,19 +23,20 @@ class SentryConfig:
                     if loaded and isinstance(loaded, dict):
                         self._raw_config = loaded
                         self._map_config()
-            except Exception as e:
-                # Log warning in real implementation; fallback to defaults
+            except Exception:
                 pass
 
     def _map_config(self) -> None:
-        """Safely maps YAML keys to internal properties, handling legacy naming."""
-        # 1. Memory mapping (handles old 'memory_throttle_limit' and new 'memory_clamp_bytes')
-        mem_val = self._raw_config.get("memory_throttle_limit") or self._raw_config.get("memory_clamp_bytes")
+        """Safely maps YAML keys to internal properties, handling both nested and flat structures."""
+        policy = self._raw_config.get("policy", {})
+        
+        # 1. Memory mapping (Checks nested policy dict first, then flat legacy keys)
+        mem_val = policy.get("memory_throttle_limit") or self._raw_config.get("memory_throttle_limit") or self._raw_config.get("memory_clamp_bytes")
         if mem_val:
             self.memory_clamp_bytes = self._parse_memory(str(mem_val))
 
         # 2. Cooldown mapping
-        cool_val = self._raw_config.get("cooldown_period") or self._raw_config.get("cooldown_seconds")
+        cool_val = policy.get("cooldown_period") or self._raw_config.get("cooldown_period") or self._raw_config.get("cooldown_seconds")
         if cool_val is not None:
             try:
                 self.cooldown_seconds = int(cool_val)
@@ -57,7 +58,6 @@ class SentryConfig:
             return 52428800  # Fallback to 50MB on parsing failure
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Legacy dictionary access support for core/runtime.py compatibility."""
         return self._raw_config.get(key, default)
 
     def __getitem__(self, key: str) -> Any:

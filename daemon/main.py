@@ -163,6 +163,10 @@ class SentryDaemon:
         print(" 🛡️  SENTRY RING-0 COMMAND DAEMON ONLINE (BASECAMP) ", flush=True)
         print("="*60 + "\n", flush=True)
         
+        # --- CRITICAL FIX: Start-up Reconciliation ---
+        # Scan and clear any leftover cgroups limits from a previous crash
+        self.cgroup_mgr.clear_orphaned_throttles()
+        
         self._sd_notify("READY=1\nSTATUS=SENTRY Basecamp Daemon online.")
         print("=> ✅ High-Speed PSUtil Profiler armed.", flush=True)
         
@@ -179,7 +183,6 @@ class SentryDaemon:
                 action_taken = False
                 
                 # 1. CPU Defense (Basecamp proc polling)
-                # psutil cpu_percent > 85.0 means it is burning almost an entire core
                 top_cpu_hogs, max_cpu = self.proc_sensor.get_top_hogs(threshold=85.0)
                 
                 for pid in top_cpu_hogs:
@@ -191,8 +194,11 @@ class SentryDaemon:
                         elif not self.safety_guard.is_immune(pid):
                             action_taken = True
                             print(f"\n🚨 => ACTION: Throttling CPU hog (PID {pid}). cpu.slice set to low, cpu.max clamped to 20%.", flush=True)
-                            self.cgroup_mgr.apply_cpu_throttle(pid, 20)
-                            self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
+                            
+                            # TOCTOU FIX: apply_cpu_throttle securely grabs the boot tick BEFORE writing
+                            start_tick = self.cgroup_mgr.apply_cpu_throttle(pid, 20)
+                            if start_tick is not None:
+                                self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec, start_tick)
                 
                 # 2. Memory Defense (PSI)
                 if self.psi_sensor.check_memory_pressure():
@@ -201,13 +207,15 @@ class SentryDaemon:
                         if hog_pid != self.spatial_pid and os.path.exists(f"/proc/{hog_pid}") and not self.safety_guard.is_immune(hog_pid):
                             action_taken = True
                             print(f"\n🚨 => ACTION: Memory starvation detected. memory.high clamped to {self.mem_clamp_bytes} bytes for PID {hog_pid}.", flush=True)
-                            self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
-                            self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec)
+                            
+                            start_tick = self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
+                            if start_tick is not None:
+                                self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec, start_tick)
                 
                 # --- The Continuous Aesthetic Logging ---
                 if not hasattr(self, '_last_print') or now - self._last_print > 3.0:
                     if not action_taken and not self.cgroup_mgr.throttled_tasks:
-                        print(f"✨ [SYSTEM NOMINAL] No action needed. Nothing is happening now. (Max CPU Load: {max_cpu:.1f}%)", flush=True)
+                        print(f"[SYSTEM NOMINAL] No action needed. Nothing is happening now. (Max CPU Load: {max_cpu:.1f}%)", flush=True)
                     self._last_print = now
                 
                 self._sd_notify("WATCHDOG=1")

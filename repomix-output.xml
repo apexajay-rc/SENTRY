@@ -1,0 +1,4532 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+core/
+  platform/
+    linux.py
+  __init__.py
+  action_tracker.py
+  bpf_sensor.py
+  cgroup_manager.py
+  cgroups.py
+  classifier.py
+  config.py
+  ipc.py
+  logger.py
+  metrics.py
+  platform_adapter.py
+  policy.py
+  process.py
+  procfs.py
+  psi_sensor.py
+  runtime.py
+  safety_guard.py
+daemon/
+  __init__.py
+  main.py
+  systemd_integration.py
+dashboard/
+  main_gui.py
+engine/
+  __init__.py
+  aggregator.py
+  classifier.py
+  feedback.py
+  pressure.py
+  reconciliation.py
+  selector.py
+  timeseries.py
+model/
+  __init__.py
+  action_outcome.py
+  candidate.py
+  pressure.py
+packaging/
+  sentry.service
+tests/
+  fixtures/
+    proc/
+      pressure/
+        cpu
+        io
+        memory
+      meminfo
+      stat
+  test_classifier.py
+  test_config.py
+  test_ipc.py
+  test_pressure_engine.py
+tools/
+  desktop_bridge.py
+  sentry_top.py
+.gitignore
+LICENSE
+Makefile
+README.md
+requirements.txt
+sensor.bpf.c
+sentry_config.yaml
+stress_test.sh
+tmux_orchestrate.sh
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="core/platform/linux.py">
+import time
+import subprocess
+
+
+def _read_proc_stat():
+    with open('/proc/stat', 'r') as f:
+        values = list(map(int, f.readline().split()[1:]))
+    idle = values[3]
+    iowait = values[4]
+    total = sum(values)
+    return idle, iowait, total
+
+
+def calculate_cpu():
+    idle1, _, total1 = _read_proc_stat()
+    time.sleep(0.5)
+    idle2, _, total2 = _read_proc_stat()
+
+    idle_delta = idle2 - idle1
+    total_delta = total2 - total1
+
+    if total_delta == 0:
+        return 0.0
+
+    cpu = 100 * (1 - idle_delta / total_delta)
+    return round(cpu, 2)
+
+
+def get_memory_usage():
+    with open('/proc/meminfo', 'r') as f:
+        lines = f.readlines()
+
+    mem_total = int(lines[0].split()[1])
+    mem_available = int(lines[2].split()[1])
+
+    mem_used = mem_total - mem_available
+
+    if mem_total == 0:
+        return 0.0
+
+    return round((mem_used / mem_total) * 100, 2)
+
+
+def get_io_wait():
+    _, iowait, total = _read_proc_stat()
+
+    if total == 0:
+        return 0.0
+
+    return round((iowait / total) * 100, 2)
+
+
+def get_top_process():
+    """
+    Returns:
+        (pid:str, name:str, score:float)
+        or (None, None, None)
+    """
+    try:
+        output = subprocess.check_output(
+            ["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"],
+            stderr=subprocess.DEVNULL
+        ).decode().splitlines()
+
+        best_pid = None
+        best_name = None
+        best_score = -1.0
+
+        for line in output[1:]:
+            parts = line.split()
+
+            if len(parts) < 4:
+                continue
+
+            pid = parts[0]
+            name = parts[1]
+
+            try:
+                cpu = float(parts[2])
+                mem = float(parts[3])
+            except ValueError:
+                continue
+
+            score = (0.7 * cpu) + (0.3 * mem)
+
+            if score > best_score:
+                best_score = score
+                best_pid = pid
+                best_name = name
+
+        if best_pid:
+            return best_pid, best_name, round(best_score, 2)
+
+        return None, None, None
+
+    except Exception:
+        return None, None, None
+</file>
+
+<file path="core/__init__.py">
+"""SENTRY core: metrics, process sampling, and classification."""
+</file>
+
+<file path="core/action_tracker.py">
+"""
+Action tracking and timeout management for SENTRY.
+
+Tracks applied mitigation actions and manages
+automatic resume timeouts.
+
+This module intentionally tracks:
+
+    What action was applied
+    When it was applied
+
+It does NOT evaluate effectiveness.
+
+That responsibility belongs to the Feedback Engine.
+"""
+
+import time
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+
+@dataclass
+class ActionRecord:
+    """
+    Represents a mitigation action currently active
+    against a process.
+    """
+
+    pid: int
+
+    action_type: str
+
+    timestamp: float
+
+    cpu_weight: Optional[int] = None
+    memory_limit: Optional[int] = None
+    io_weight: Optional[int] = None
+
+    stress_before: Optional[float] = None
+    pressure_before: Optional[str] = None
+
+
+class ActionTracker:
+    """
+    Tracks active mitigation actions.
+
+    Responsibilities:
+        - Record actions
+        - Prevent duplicate actions
+        - Manage timeout expiration
+        - Support action lookup
+
+    Non-responsibilities:
+        - Evaluating effectiveness
+        - Selecting mitigation targets
+        - Applying cgroup changes
+    """
+
+    def __init__(self, resume_seconds: int = 10):
+        self.resume_seconds = resume_seconds
+        self.actions: Dict[int, ActionRecord] = {}
+
+    def record_action(
+        self,
+        pid: int,
+        action_type: str,
+        cpu_weight: Optional[int] = None,
+        memory_limit: Optional[int] = None,
+        io_weight: Optional[int] = None,
+        stress_before: Optional[float] = None,
+        pressure_before: Optional[str] = None,
+    ) -> None:
+        """
+        Record a newly applied mitigation action.
+        """
+
+        self.actions[pid] = ActionRecord(
+            pid=pid,
+            action_type=action_type,
+            timestamp=time.time(),
+            cpu_weight=cpu_weight,
+            memory_limit=memory_limit,
+            io_weight=io_weight,
+            stress_before=stress_before,
+            pressure_before=pressure_before,
+        )
+
+    def is_active(self, pid: int) -> bool:
+        """
+        Check whether a PID currently has an active action.
+        """
+
+        return pid in self.actions
+
+    def should_resume(self, pid: int) -> bool:
+        """
+        Determine whether the action timeout expired.
+        """
+
+        record = self.actions.get(pid)
+
+        if record is None:
+            return False
+
+        elapsed = time.time() - record.timestamp
+
+        return elapsed >= self.resume_seconds
+
+    def get_expired_pids(self) -> list[int]:
+        """
+        Return all PIDs whose timeout expired.
+        """
+
+        return [
+            pid
+            for pid in self.actions
+            if self.should_resume(pid)
+        ]
+
+    def resume_action(self, pid: int) -> Optional[ActionRecord]:
+        """
+        Remove active action and return its record.
+        """
+
+        return self.actions.pop(pid, None)
+
+    def get_action_info(
+        self,
+        pid: int,
+    ) -> Optional[ActionRecord]:
+        """
+        Lookup active action.
+        """
+
+        return self.actions.get(pid)
+
+    def cleanup_expired(self) -> list[int]:
+        """
+        Remove expired actions.
+
+        Returns:
+            list[int]: expired PIDs
+        """
+
+        expired = self.get_expired_pids()
+
+        for pid in expired:
+            self.resume_action(pid)
+
+        return expired
+
+    def get_active_actions_count(self) -> int:
+        """
+        Number of active mitigation actions.
+        """
+
+        return len(self.actions)
+
+    def get_active_actions(self) -> list[ActionRecord]:
+        """
+        Return all active action records.
+        """
+
+        return list(self.actions.values())
+
+    def clear(self) -> None:
+        """
+        Remove all tracked actions.
+
+        Primarily useful for tests.
+        """
+
+        self.actions.clear()
+</file>
+
+<file path="core/cgroups.py">
+"""
+cgroups v2 resource control module for SENTRY.
+Manages CPU, memory, and I/O limits via kernel cgroups.
+"""
+
+import logging
+import os
+from typing import Optional
+
+CGROUP_PATH = "/sys/fs/cgroup/sentry_bg"
+logger = logging.getLogger(__name__)
+
+
+def configure_cgroup(path: str) -> None:
+    global CGROUP_PATH
+    CGROUP_PATH = path
+
+
+def setup_cgroup(path: Optional[str] = None):
+    """Initialize SENTRY cgroup hierarchy."""
+    global CGROUP_PATH
+    if path is not None:
+        CGROUP_PATH = path
+
+    try:
+        os.makedirs(CGROUP_PATH, exist_ok=True)
+        logger.info(f"Cgroup initialized at {CGROUP_PATH}")
+    except Exception as e:
+        logger.warning(f"Failed to setup cgroup: {e}")
+
+
+def add_process(pid):
+    """
+    Add process to SENTRY cgroup.
+    
+    Args:
+        pid (int/str): Process ID to add
+    """
+    try:
+        cgroup_procs = f"{CGROUP_PATH}/cgroup.procs"
+        with open(cgroup_procs, "w") as f:
+            f.write(str(pid))
+        logger.debug(f"Added PID {pid} to cgroup")
+    except Exception as e:
+        logger.warning(f"Failed to add PID {pid} to cgroup: {e}")
+
+
+def set_cpu_weight(weight=50):
+    """
+    Set CPU weight for cgroup (cgroups v2).
+    
+    Args:
+        weight (int): CPU weight [1-10000]. 
+                      1 = heavily throttled, 10000 = no limit
+                      Default 100 = proportional, 50 = 50% share
+    """
+    try:
+        cpu_weight_file = f"{CGROUP_PATH}/cpu.weight"
+        with open(cpu_weight_file, "w") as f:
+            f.write(str(weight))
+        logger.debug(f"Set CPU weight to {weight}")
+    except Exception as e:
+        logger.warning(f"Failed to set CPU weight: {e}")
+
+
+def set_memory_limit(memory_bytes):
+    """
+    Set hard memory limit for cgroup.
+    
+    Args:
+        memory_bytes (int): Hard limit in bytes
+                           0 = no limit
+    """
+    try:
+        if memory_bytes <= 0:
+            # Remove limit if invalid
+            memory_limit_file = f"{CGROUP_PATH}/memory.max"
+            with open(memory_limit_file, "w") as f:
+                f.write("max")
+            logger.debug("Removed memory limit")
+        else:
+            memory_limit_file = f"{CGROUP_PATH}/memory.max"
+            with open(memory_limit_file, "w") as f:
+                f.write(str(memory_bytes))
+            logger.debug(f"Set memory limit to {memory_bytes} bytes")
+    except Exception as e:
+        logger.warning(f"Failed to set memory limit: {e}")
+
+
+def set_memory_limit_percent(percent):
+    """
+    Set memory limit as percentage of process RSS.
+    
+    Args:
+        percent (int): Percentage [1-100]
+    """
+    try:
+        if percent < 1 or percent > 100:
+            logger.warning(f"Invalid memory percent: {percent}")
+            return
+        
+        # Get current memory usage
+        memory_current_file = f"{CGROUP_PATH}/memory.current"
+        try:
+            with open(memory_current_file, "r") as f:
+                current_bytes = int(f.read().strip())
+        except:
+            logger.warning("Could not read current memory usage")
+            return
+        
+        # Calculate limit
+        limit_bytes = max(1, int(current_bytes * percent / 100))
+        set_memory_limit(limit_bytes)
+        
+    except Exception as e:
+        logger.warning(f"Failed to set memory limit percent: {e}")
+
+
+def set_io_weight(weight=50):
+    """
+    Set I/O weight for cgroup (cgroups v2).
+    
+    Args:
+        weight (int): I/O weight [1-10000].
+                      1 = heavily throttled, 10000 = no limit
+                      Default 100 = proportional
+    """
+    try:
+        io_weight_file = f"{CGROUP_PATH}/io.weight"
+        with open(io_weight_file, "w") as f:
+            f.write(str(weight))
+        logger.debug(f"Set I/O weight to {weight}")
+    except Exception as e:
+        logger.warning(f"Failed to set I/O weight: {e}")
+
+
+def set_io_max(device, riops, wiops):
+    """
+    Set I/O rate limits per device.
+    
+    Args:
+        device (str): Device name (e.g., "8:0" for /dev/sda)
+        riops (int): Read IOPS limit (0 = unlimited)
+        wiops (int): Write IOPS limit (0 = unlimited)
+    """
+    try:
+        io_max_file = f"{CGROUP_PATH}/io.max"
+        
+        if riops <= 0 and wiops <= 0:
+            # Remove limit for device
+            with open(io_max_file, "w") as f:
+                f.write(f"{device} riops=max wiops=max\n")
+            logger.debug(f"Removed I/O limits for {device}")
+        else:
+            riops_str = f"riops={riops}" if riops > 0 else "riops=max"
+            wiops_str = f"wiops={wiops}" if wiops > 0 else "wiops=max"
+            
+            with open(io_max_file, "w") as f:
+                f.write(f"{device} {riops_str} {wiops_str}\n")
+            logger.debug(f"Set I/O limits for {device}: {riops_str}, {wiops_str}")
+            
+    except Exception as e:
+        logger.warning(f"Failed to set I/O limits: {e}")
+
+
+def reset_all_limits():
+    """Remove all limits from SENTRY cgroup."""
+    try:
+        # Reset CPU weight to default (100)
+        set_cpu_weight(100)
+        
+        # Reset memory limit to max
+        set_memory_limit(0)
+        
+        # Reset I/O weight to default (100)
+        set_io_weight(100)
+        
+        logger.info("Reset all cgroup limits to defaults")
+    except Exception as e:
+        logger.warning(f"Failed to reset cgroup limits: {e}")
+
+
+def get_cgroup_memory_usage():
+    """
+    Get current memory usage of cgroup.
+    
+    Returns:
+        int: Memory in bytes, or None if unavailable
+    """
+    try:
+        memory_current_file = f"{CGROUP_PATH}/memory.current"
+        with open(memory_current_file, "r") as f:
+            return int(f.read().strip())
+    except Exception as e:
+        logger.debug(f"Could not read cgroup memory: {e}")
+        return None
+
+
+def get_cgroup_memory_limit():
+    """
+    Get current memory limit of cgroup.
+    
+    Returns:
+        int: Memory limit in bytes, or None if no limit
+    """
+    try:
+        memory_max_file = f"{CGROUP_PATH}/memory.max"
+        with open(memory_max_file, "r") as f:
+            content = f.read().strip()
+            if content == "max":
+                return None
+            return int(content)
+    except Exception as e:
+        logger.debug(f"Could not read cgroup memory limit: {e}")
+        return None
+</file>
+
+<file path="core/classifier.py">
+"""
+Stress classification and trend analysis.
+
+NOTE: This module now delegates to core/policy.py for all stress level classification
+to ensure daemon and dashboard agree on system levels. The thresholds come from the
+config (YAML), not hardcoded defaults here.
+
+trend_rising() and trend_label() remain here as they are trend-specific, not
+threshold-specific.
+"""
+
+from collections import deque
+from typing import Deque, Iterable, Optional
+
+from core.policy import classify_basic
+
+
+def classify_stress(score: float, mode: str = "Balanced") -> str:
+    """
+    Classify system stress level based on score and mode.
+    
+    DEPRECATED: Use core/policy.py::classify_basic() instead, which is config-driven.
+    
+    This function now delegates to classify_basic() to ensure consistency between
+    daemon and dashboard. The mode parameter is ignored (it's stored in DaemonState
+    but the daemon doesn't currently use it to adjust thresholds).
+    
+    Future: Once DaemonState.mode is wired into policy decisions, this will
+    respect mode to adjust thresholds dynamically.
+    
+    Args:
+        score: Stress score [0, 1]
+        mode: System mode (Gaming/Editing/Balanced) — currently unused
+    
+    Returns:
+        One of ["LOW", "MODERATE", "HIGH", "CRITICAL"]
+    """
+    # Ignore mode for now; use config-driven thresholds
+    return classify_basic(score)
+
+
+def trend_rising(history: Iterable[float], minimum: int = 5) -> bool:
+    """
+    Detect whether stress is rising based on recent history.
+    
+    Compares the average of the first 2 samples to the average of the last 2 samples.
+    Returns True if stress is trending upward.
+    
+    Args:
+        history: Iterable of stress scores (typically a deque)
+        minimum: Minimum number of samples required (default 5)
+    
+    Returns:
+        True if trend is rising, False otherwise
+    """
+    values = list(history)
+    if len(values) < minimum:
+        return False
+
+    first_half = values[:2]
+    second_half = values[-2:]
+    return (sum(second_half) / len(second_half)) > (sum(first_half) / len(first_half))
+
+
+def trend_label(history: Deque[float], minimum: int = 5) -> str:
+    """
+    Summarize stress trend as a human-readable label.
+    
+    Args:
+        history: Deque of stress scores
+        minimum: Minimum samples required before making a determination
+    
+    Returns:
+        "Rising", "Stable", or "Collecting" (insufficient data)
+    """
+    if len(history) < minimum:
+        return "Collecting"
+    return "Rising" if trend_rising(history, minimum) else "Stable"
+
+
+def decision_hint(level: str, trend: str) -> str:
+    """
+    Provide a human-readable hint about the current decision situation.
+    
+    Args:
+        level: Current stress level (LOW/MODERATE/HIGH/CRITICAL)
+        trend: Current trend (Rising/Stable/Collecting)
+    
+    Returns:
+        A short string describing the recommended action
+    """
+    if level == "HIGH" and trend == "Rising":
+        return "Mitigation advised"
+    if level == "MODERATE":
+        return "Observe closely"
+    return "Stable"
+</file>
+
+<file path="core/ipc.py">
+import json
+import os
+import socket
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+DEFAULT_TCP_HOST = "127.0.0.1"
+DEFAULT_TCP_PORT = 17481
+
+
+def default_unix_socket_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return os.path.join(runtime, "sentry.sock")
+    if os.name == "nt":
+        return os.path.join(os.environ.get("TEMP", "."), "sentry.sock")
+    return "/tmp/sentry.sock"
+
+
+def resolve_ipc_endpoint() -> tuple[Any, ...]:
+    override = os.environ.get("SENTRY_IPC_ENDPOINT")
+    if override:
+        return _parse_endpoint(override)
+
+    if os.name != "nt":
+        return ("unix", os.environ.get("SENTRY_IPC_SOCKET", default_unix_socket_path()))
+    return ("tcp", DEFAULT_TCP_HOST, DEFAULT_TCP_PORT)
+
+
+def _parse_endpoint(value: str) -> tuple[Any, ...]:
+    if value.startswith("unix:"):
+        return ("unix", value[5:])
+    if value.startswith("tcp:"):
+        host, port = value[4:].rsplit(":", 1)
+        return ("tcp", host, int(port))
+    raise ValueError(f"Invalid SENTRY IPC endpoint: {value}")
+
+
+@dataclass
+class DaemonState:
+    platform: str = "unknown"
+    mode: str = "Balanced"
+    armed: bool = False
+    observe_only: bool = True
+    dry_run: bool = False
+    cpu_percent: float = 0.0
+    memory_percent: float = 0.0
+    io_wait_percent: float = 0.0
+    stress_score: float = 0.0
+    utilization_score: float = 0.0
+    psi_score: Optional[float] = None
+    level: str = "LOW"
+    trend: str = "Collecting"
+    target_pid: Optional[int] = None
+    target_comm: Optional[str] = None
+    target_score: Optional[float] = None
+    last_action: str = "No action executed"
+    stress_history: list[float] = field(default_factory=list)
+    top_processes: list[dict[str, Any]] = field(default_factory=list)
+    psi_cpu_some_avg10: Optional[float] = None
+    psi_memory_some_avg10: Optional[float] = None
+    psi_io_some_avg10: Optional[float] = None
+    updated_at: str = ""
+
+    def __post_init__(self):
+        self._lock = threading.RLock()
+
+    def update(self, **kwargs) -> None:
+        with self._lock:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "platform": self.platform,
+                "mode": self.mode,
+                "armed": self.armed,
+                "observe_only": self.observe_only,
+                "dry_run": self.dry_run,
+                "cpu_percent": self.cpu_percent,
+                "memory_percent": self.memory_percent,
+                "io_wait_percent": self.io_wait_percent,
+                "stress_score": self.stress_score,
+                "utilization_score": self.utilization_score,
+                "psi_score": self.psi_score,
+                "level": self.level,
+                "trend": self.trend,
+                "target_pid": self.target_pid,
+                "target_comm": self.target_comm,
+                "target_score": self.target_score,
+                "last_action": self.last_action,
+                "stress_history": list(self.stress_history),
+                "top_processes": list(self.top_processes),
+                "psi": {
+                    "cpu": self.psi_cpu_some_avg10,
+                    "memory": self.psi_memory_some_avg10,
+                    "io": self.psi_io_some_avg10,
+                },
+                "updated_at": self.updated_at,
+            }
+
+    def apply_command(self, command: dict[str, Any]) -> dict[str, Any]:
+        cmd_type = command.get("type")
+        if cmd_type == "get_state":
+            return {"ok": True, "state": self.snapshot()}
+
+        with self._lock:
+            if cmd_type == "set_mode":
+                mode = command.get("mode")
+                if mode not in {"Gaming", "Editing", "Balanced"}:
+                    return {"ok": False, "error": "Invalid mode"}
+                self.mode = mode
+            elif cmd_type == "set_armed":
+                self.armed = bool(command.get("armed", False))
+            elif cmd_type == "set_observe_only":
+                self.observe_only = bool(command.get("observe_only", True))
+            elif cmd_type == "set_dry_run":
+                self.dry_run = bool(command.get("dry_run", False))
+            elif cmd_type == "ping":
+                return {"ok": True, "pong": True}
+            else:
+                return {"ok": False, "error": f"Unknown command: {cmd_type}"}
+
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+            return {"ok": True, "state": self.snapshot()}
+
+
+class IpcServer:
+    def __init__(
+        self,
+        state: DaemonState,
+        endpoint: Optional[tuple[Any, ...]] = None,
+    ):
+        self.state = state
+        self.endpoint = endpoint or resolve_ipc_endpoint()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._socket: Optional[socket.socket] = None
+        self.address: Optional[tuple[Any, ...]] = None
+
+    def start_background(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except OSError:
+                pass
+
+    def _serve(self) -> None:
+        kind = self.endpoint[0]
+        sock = socket.socket(socket.AF_UNIX if kind == "unix" else socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket = sock
+
+        if kind == "unix":
+            path = self.endpoint[1]
+            if os.path.exists(path):
+                os.unlink(path)
+            sock.bind(path)
+            self.address = ("unix", path)
+        else:
+            host, port = self.endpoint[1], self.endpoint[2]
+            sock.bind((host, port))
+            self.address = ("tcp", host, sock.getsockname()[1])
+
+        sock.listen(5)
+        sock.settimeout(0.5)
+
+        while not self._stop.is_set():
+            try:
+                conn, _addr = sock.accept()
+            except (TimeoutError, socket.timeout):
+                continue
+            except OSError:
+                break
+
+            threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+
+    def _handle_client(self, conn: socket.socket) -> None:
+        with conn:
+            conn.settimeout(2.0)
+            try:
+                payload = _recv_line(conn)
+                if not payload:
+                    return
+                request = json.loads(payload)
+                response = self.state.apply_command(request)
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                response = {"ok": False, "error": str(exc)}
+            _send_line(conn, json.dumps(response))
+
+
+class IpcClient:
+    def __init__(self, endpoint: Optional[tuple[Any, ...]] = None):
+        self.endpoint = endpoint or resolve_ipc_endpoint()
+        self.timeout = 1.0
+
+    def request(self, command: dict[str, Any]) -> dict[str, Any]:
+        kind = self.endpoint[0]
+        sock = socket.socket(socket.AF_UNIX if kind == "unix" else socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            if kind == "unix":
+                sock.connect(self.endpoint[1])
+            else:
+                sock.connect((self.endpoint[1], self.endpoint[2]))
+            _send_line(sock, json.dumps(command))
+            payload = _recv_line(sock)
+            if not payload:
+                return {"ok": False, "error": "Empty response"}
+            return json.loads(payload)
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            sock.close()
+
+    def ping(self) -> bool:
+        return self.request({"type": "ping"}).get("ok", False)
+
+    def get_state(self) -> Optional[dict[str, Any]]:
+        response = self.request({"type": "get_state"})
+        if response.get("ok"):
+            return response.get("state")
+        return None
+
+    def set_mode(self, mode: str) -> Optional[dict[str, Any]]:
+        response = self.request({"type": "set_mode", "mode": mode})
+        if response.get("ok"):
+            return response.get("state")
+        return None
+
+    def set_armed(self, armed: bool) -> Optional[dict[str, Any]]:
+        response = self.request({"type": "set_armed", "armed": armed})
+        if response.get("ok"):
+            return response.get("state")
+        return None
+
+    def set_observe_only(self, observe_only: bool) -> Optional[dict[str, Any]]:
+        response = self.request({"type": "set_observe_only", "observe_only": observe_only})
+        if response.get("ok"):
+            return response.get("state")
+        return None
+
+    def set_dry_run(self, dry_run: bool) -> Optional[dict[str, Any]]:
+        response = self.request({"type": "set_dry_run", "dry_run": dry_run})
+        if response.get("ok"):
+            return response.get("state")
+        return None
+
+
+def _send_line(conn: socket.socket, message: str) -> None:
+    conn.sendall((message + "\n").encode("utf-8"))
+
+
+def _recv_line(conn: socket.socket) -> str:
+    chunks: list[bytes] = []
+    while True:
+        data = conn.recv(4096)
+        if not data:
+            break
+        chunks.append(data)
+        if b"\n" in data:
+            break
+    if not chunks:
+        return ""
+    return b"".join(chunks).split(b"\n", 1)[0].decode("utf-8")
+</file>
+
+<file path="core/metrics.py">
+import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
+
+from core.procfs import (
+    PROC_ROOT,
+    CpuStatSnapshot,
+    cpu_usage_percent,
+    io_wait_percent,
+    read_memory_usage_percent,
+    read_psi,
+    read_system_stat,
+)
+from engine.pressure import DEFAULT_PRESSURE_WEIGHTS, PressureEngine, compute_pressure_score
+from model.pressure import PsiSample, UtilizationSample
+
+if TYPE_CHECKING:
+    from core.config import ConfigParser
+
+DEFAULT_METRIC_WEIGHTS = DEFAULT_PRESSURE_WEIGHTS
+
+_metric_weights = DEFAULT_METRIC_WEIGHTS.copy()
+
+
+def configure_metrics(config: "ConfigParser") -> None:
+    global _metric_weights
+    weights = config.metric_weights()  # type: ignore[attr-defined]
+    _metric_weights = {
+        key: weights.get(key, DEFAULT_METRIC_WEIGHTS[key])
+        for key in DEFAULT_METRIC_WEIGHTS
+    }
+
+
+@dataclass(frozen=True)
+class StressBreakdown:
+    total: float
+    utilization: float
+    psi: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class SystemMetrics:
+    cpu_percent: float
+    memory_percent: float
+    io_wait_percent: float
+    stress_score: float
+    utilization_score: float
+    psi_score: Optional[float] = None
+    psi_cpu_some_avg10: Optional[float] = None
+    psi_memory_some_avg10: Optional[float] = None
+    psi_io_some_avg10: Optional[float] = None
+
+
+def compute_utilization_score(
+    cpu: float,
+    memory: float,
+    io: float,
+    weights: Optional[dict[str, float]] = None,
+) -> float:
+    return PressureEngine(weights or _metric_weights).utilization_score(
+        UtilizationSample(cpu_percent=cpu, memory_percent=memory, io_wait_percent=io)
+    )
+
+
+def compute_psi_score(
+    psi_cpu: Optional[float],
+    psi_memory: Optional[float],
+    psi_io: Optional[float],
+    weights: Optional[dict[str, float]] = None,
+) -> Optional[float]:
+    return PressureEngine(weights or _metric_weights).psi_score(
+        PsiSample(
+            cpu_some_avg10=psi_cpu,
+            memory_some_avg10=psi_memory,
+            io_some_avg10=psi_io,
+        )
+    )
+
+
+def compute_stress_breakdown(
+    cpu: float,
+    memory: float,
+    io: float,
+    weights: Optional[dict[str, float]] = None,
+    psi_cpu: Optional[float] = None,
+    psi_memory: Optional[float] = None,
+    psi_io: Optional[float] = None,
+) -> StressBreakdown:
+    score = compute_pressure_score(
+        cpu,
+        memory,
+        io,
+        weights or _metric_weights,
+        psi_cpu=psi_cpu,
+        psi_memory=psi_memory,
+        psi_io=psi_io,
+    )
+    return StressBreakdown(total=score.total, utilization=score.utilization, psi=score.psi)
+
+
+def compute_stress(
+    cpu: float,
+    memory: float,
+    io: float,
+    weights: Optional[dict[str, float]] = None,
+    psi_cpu: Optional[float] = None,
+    psi_memory: Optional[float] = None,
+    psi_io: Optional[float] = None,
+) -> float:
+    return compute_stress_breakdown(
+        cpu,
+        memory,
+        io,
+        weights,
+        psi_cpu=psi_cpu,
+        psi_memory=psi_memory,
+        psi_io=psi_io,
+    ).total
+
+
+class SystemMetricsSampler:
+    """Delta-based system metrics from /proc/stat and /proc/meminfo."""
+
+    def __init__(
+        self,
+        proc_root: str = PROC_ROOT,
+        interval: float = 0.5,
+        metric_weights: Optional[dict[str, float]] = None,
+    ):
+        self.proc_root = proc_root
+        self.interval = interval
+        self.metric_weights = metric_weights
+        self._previous: Optional[CpuStatSnapshot] = None
+
+    def warmup(self) -> SystemMetrics:
+        self._previous = read_system_stat(self.proc_root)
+        time.sleep(self.interval)
+        return self.sample()
+
+    def sample(self) -> SystemMetrics:
+        current = read_system_stat(self.proc_root)
+        memory = read_memory_usage_percent(self.proc_root)
+        psi_fields = _read_psi_fields(self.proc_root)
+
+        if self._previous is None:
+            self._previous = current
+            breakdown = compute_stress_breakdown(
+                0.0,
+                memory,
+                0.0,
+                self.metric_weights,
+                psi_cpu=psi_fields["psi_cpu_some_avg10"],
+                psi_memory=psi_fields["psi_memory_some_avg10"],
+                psi_io=psi_fields["psi_io_some_avg10"],
+            )
+            return SystemMetrics(
+                cpu_percent=0.0,
+                memory_percent=memory,
+                io_wait_percent=0.0,
+                stress_score=breakdown.total,
+                utilization_score=breakdown.utilization,
+                psi_score=breakdown.psi,
+                **psi_fields,
+            )
+
+        cpu = cpu_usage_percent(self._previous, current)
+        io = io_wait_percent(self._previous, current)
+        self._previous = current
+
+        breakdown = compute_stress_breakdown(
+            cpu,
+            memory,
+            io,
+            self.metric_weights,
+            psi_cpu=psi_fields["psi_cpu_some_avg10"],
+            psi_memory=psi_fields["psi_memory_some_avg10"],
+            psi_io=psi_fields["psi_io_some_avg10"],
+        )
+
+        return SystemMetrics(
+            cpu_percent=cpu,
+            memory_percent=memory,
+            io_wait_percent=io,
+            stress_score=breakdown.total,
+            utilization_score=breakdown.utilization,
+            psi_score=breakdown.psi,
+            **psi_fields,
+        )
+
+    def sample_blocking(self) -> SystemMetrics:
+        if self._previous is None:
+            return self.warmup()
+
+        time.sleep(self.interval)
+        return self.sample()
+
+
+def _read_psi_fields(proc_root: str) -> dict[str, Optional[float]]:
+    cpu = read_psi("cpu", proc_root)
+    memory = read_psi("memory", proc_root)
+    io = read_psi("io", proc_root)
+
+    return {
+        "psi_cpu_some_avg10": cpu.some_avg10 if cpu else None,
+        "psi_memory_some_avg10": memory.some_avg10 if memory else None,
+        "psi_io_some_avg10": io.some_avg10 if io else None,
+    }
+
+
+_default_sampler = SystemMetricsSampler()
+
+
+def calculate_cpu() -> float:
+    return _default_sampler.sample_blocking().cpu_percent
+
+
+def get_memory_usage() -> float:
+    return read_memory_usage_percent()
+
+
+def get_io_wait() -> float:
+    return _default_sampler.sample_blocking().io_wait_percent
+
+
+def sample_system_metrics(blocking: bool = True) -> SystemMetrics:
+    if blocking:
+        return _default_sampler.sample_blocking()
+    return _default_sampler.sample()
+</file>
+
+<file path="core/platform_adapter.py">
+import platform
+
+if platform.system() == "Linux":
+    from core.platform.linux import (
+        calculate_cpu,
+        get_memory_usage,
+        get_io_wait,
+        get_top_process,
+    )
+    PLATFORM = "Linux"
+
+elif platform.system() == "Windows":
+    from core.platform.windows import (  # type: ignore[no-redef]
+        calculate_cpu,
+        get_memory_usage,
+        get_io_wait,
+        get_top_process,
+    )
+    PLATFORM = "Windows"
+
+else:
+    raise Exception("Unsupported platform")
+</file>
+
+<file path="core/policy.py">
+"""
+Policy classification module for SENTRY.
+Defines stress levels and escalation thresholds.
+"""
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.config import ConfigParser
+
+# Stress level thresholds (customize based on workload)
+THRESHOLDS = {
+    "LOW": 0.35,
+    "MODERATE": 0.50,
+    "HIGH": 0.70,
+    "CRITICAL": 0.85,
+}
+
+# Action escalation mapping: stress level → (cpu_weight, memory_limit_percent, io_weight)
+ESCALATION_MATRIX = {
+    "LOW": {
+        "cpu_weight": 100,      # No limit
+        "memory_limit_percent": 100,  # No limit
+        "io_weight": 100,       # No limit
+    },
+    "MODERATE": {
+        "cpu_weight": 50,       # 50% CPU throttle
+        "memory_limit_percent": 90,   # 90% of process memory
+        "io_weight": 50,        # 50% I/O throttle
+    },
+    "HIGH": {
+        "cpu_weight": 30,       # 30% CPU throttle
+        "memory_limit_percent": 75,   # 75% of process memory
+        "io_weight": 30,        # 30% I/O throttle
+    },
+    "CRITICAL": {
+        "cpu_weight": 10,       # 10% CPU throttle
+        "memory_limit_percent": 50,   # 50% of process memory (hard limit)
+        "io_weight": 10,        # 10% I/O throttle
+    },
+}
+
+
+def configure_policy(config: "ConfigParser") -> None:
+    """Apply thresholds and escalation matrix from sentry_config.yaml."""
+    global THRESHOLDS, ESCALATION_MATRIX
+
+    thresholds = config.all_thresholds()  # type: ignore[attr-defined]
+    THRESHOLDS = {
+        "LOW": thresholds.get("low", 0.35),
+        "MODERATE": thresholds.get("moderate", 0.50),
+        "HIGH": thresholds.get("high", 0.70),
+        "CRITICAL": thresholds.get("critical", 0.85),
+    }
+
+    ESCALATION_MATRIX = {}
+    for level in ["LOW", "MODERATE", "HIGH", "CRITICAL"]:
+        ESCALATION_MATRIX[level] = config.get_escalation_actions(level)  # type: ignore[attr-defined]
+
+
+def classify_basic(stress_score):
+    """
+    Classify system stress level based on computed stress score.
+    
+    Args:
+        stress_score (float): Normalized stress score in [0, 1]
+    
+    Returns:
+        str: One of ["LOW", "MODERATE", "HIGH", "CRITICAL"]
+    """
+    if stress_score >= THRESHOLDS["CRITICAL"]:
+        return "CRITICAL"
+    elif stress_score >= THRESHOLDS["HIGH"]:
+        return "HIGH"
+    elif stress_score >= THRESHOLDS["MODERATE"]:
+        return "MODERATE"
+    else:
+        return "LOW"
+
+
+def get_action_limits(stress_level):
+    """
+    Get resource limit actions for a given stress level.
+    
+    Args:
+        stress_level (str): One of ["LOW", "MODERATE", "HIGH", "CRITICAL"]
+    
+    Returns:
+        dict: Actions with cpu_weight, memory_limit, io_weight
+    """
+    return ESCALATION_MATRIX.get(stress_level, ESCALATION_MATRIX["LOW"])
+
+
+def is_critical_level(stress_level):
+    """Check if stress level requires immediate action."""
+    return stress_level in ["HIGH", "CRITICAL"]
+</file>
+
+<file path="core/process.py">
+from dataclasses import dataclass
+from typing import Optional
+
+from core.procfs import PROC_ROOT, ProcessSnapshot, list_process_ids, read_process_snapshot
+
+
+@dataclass(frozen=True)
+class ProcessMetrics:
+    pid: int
+    comm: str
+    cpu_percent: float
+    memory_percent: float
+    score: float
+
+
+class ProcessSampler:
+    """Instantaneous per-process CPU from /proc/[pid]/stat deltas."""
+
+    def __init__(self, proc_root: str = PROC_ROOT):
+        self.proc_root = proc_root
+        self._previous: dict[int, ProcessSnapshot] = {}
+
+    def sample(self, system_total_delta: int, total_memory_kb: int) -> list[ProcessMetrics]:
+        if system_total_delta <= 0 or total_memory_kb <= 0:
+            return []
+
+        current = self._read_all_processes()
+        metrics: list[ProcessMetrics] = []
+
+        for pid, snapshot in current.items():
+            previous = self._previous.get(pid)
+            if previous is None:
+                continue
+
+            proc_delta = snapshot.cpu_jiffies - previous.cpu_jiffies
+            if proc_delta < 0:
+                continue
+
+            cpu_percent = round(100 * proc_delta / system_total_delta, 2)
+            memory_percent = round(100 * snapshot.rss_kb / total_memory_kb, 2)
+            score = round((0.7 * cpu_percent) + (0.3 * memory_percent), 2)
+
+            metrics.append(
+                ProcessMetrics(
+                    pid=pid,
+                    comm=snapshot.comm,
+                    cpu_percent=cpu_percent,
+                    memory_percent=memory_percent,
+                    score=score,
+                )
+            )
+
+        self._previous = current
+        return sorted(metrics, key=lambda item: item.score, reverse=True)
+
+    def prime(self) -> None:
+        self._previous = self._read_all_processes()
+
+    def top_process(
+        self,
+        system_total_delta: int,
+        total_memory_kb: int,
+        protected_comm: Optional[set[str]] = None,
+    ) -> tuple[Optional[int], Optional[str], Optional[float]]:
+        protected = protected_comm or set()
+        for process in self.sample(system_total_delta, total_memory_kb):
+            if process.comm in protected:
+                continue
+            return process.pid, process.comm, process.score
+        return None, None, None
+
+    def top_processes(
+        self,
+        system_total_delta: int,
+        total_memory_kb: int,
+        limit: int = 3,
+    ) -> list[ProcessMetrics]:
+        return self.sample(system_total_delta, total_memory_kb)[:limit]
+
+    def _read_all_processes(self) -> dict[int, ProcessSnapshot]:
+        processes: dict[int, ProcessSnapshot] = {}
+        for pid in list_process_ids(self.proc_root):
+            snapshot = read_process_snapshot(pid, self.proc_root)
+            if snapshot is not None:
+                processes[pid] = snapshot
+        return processes
+
+
+def read_total_memory_kb(proc_root: str = PROC_ROOT) -> int:
+    with open(f"{proc_root}/meminfo", "r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1])
+    return 0
+</file>
+
+<file path="core/procfs.py">
+import os
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+PROC_ROOT = os.environ.get("SENTRY_PROC_ROOT", "/proc")
+
+
+def proc_path(*parts: str) -> str:
+    return os.path.join(PROC_ROOT, *parts)
+
+
+@dataclass(frozen=True)
+class CpuStatSnapshot:
+    idle: int
+    iowait: int
+    total: int
+
+
+@dataclass(frozen=True)
+class ProcessSnapshot:
+    pid: int
+    comm: str
+    utime: int
+    stime: int
+    rss_kb: int
+
+    @property
+    def cpu_jiffies(self) -> int:
+        return self.utime + self.stime
+
+
+@dataclass(frozen=True)
+class PsiReading:
+    some_avg10: float
+    full_avg10: float
+
+
+def read_system_stat(proc_root: str = PROC_ROOT) -> CpuStatSnapshot:
+    with open(os.path.join(proc_root, "stat"), "r", encoding="utf-8") as handle:
+        values = list(map(int, handle.readline().split()[1:]))
+
+    idle = values[3]
+    iowait = values[4]
+    total = sum(values)
+    return CpuStatSnapshot(idle=idle, iowait=iowait, total=total)
+
+
+def cpu_usage_percent(previous: CpuStatSnapshot, current: CpuStatSnapshot) -> float:
+    total_delta = current.total - previous.total
+    if total_delta <= 0:
+        return 0.0
+
+    idle_delta = current.idle - previous.idle
+    return round(100 * (1 - idle_delta / total_delta), 2)
+
+
+def io_wait_percent(previous: CpuStatSnapshot, current: CpuStatSnapshot) -> float:
+    total_delta = current.total - previous.total
+    if total_delta <= 0:
+        return 0.0
+
+    iowait_delta = current.iowait - previous.iowait
+    return round(100 * iowait_delta / total_delta, 2)
+
+
+def read_memory_usage_percent(proc_root: str = PROC_ROOT) -> float:
+    meminfo = {}
+    with open(os.path.join(proc_root, "meminfo"), "r", encoding="utf-8") as handle:
+        for line in handle:
+            key, value = line.split(":", 1)
+            meminfo[key.strip()] = int(value.strip().split()[0])
+
+    total = meminfo["MemTotal"]
+    available = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+    used = total - available
+    return round((used / total) * 100, 2)
+
+
+def read_psi(resource: str, proc_root: str = PROC_ROOT) -> Optional[PsiReading]:
+    path = os.path.join(proc_root, "pressure", resource)
+    if not os.path.isfile(path):
+        return None
+
+    with open(path, "r", encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+
+    parsed = {}
+    for line in lines:
+        kind, rest = line.split(None, 1)
+        parsed[kind] = rest
+
+    some = _parse_psi_line(parsed.get("some", ""))
+    full = _parse_psi_line(parsed.get("full", ""))
+    if some is None or full is None:
+        return None
+
+    return PsiReading(some_avg10=some, full_avg10=full)
+
+
+def _parse_psi_line(line: str) -> Optional[float]:
+    match = re.search(r"avg10=([0-9.]+)", line)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def parse_process_stat(raw: str) -> tuple[str, int, int]:
+    close_paren = raw.rfind(")")
+    if close_paren == -1:
+        raise ValueError("Invalid /proc/pid/stat line")
+
+    comm = raw[raw.find("(") + 1 : close_paren]
+    fields = raw[close_paren + 2 :].split()
+    utime = int(fields[11])
+    stime = int(fields[12])
+    return comm, utime, stime
+
+
+def read_process_snapshot(pid: int, proc_root: str = PROC_ROOT) -> Optional[ProcessSnapshot]:
+    stat_path = os.path.join(proc_root, str(pid), "stat")
+    status_path = os.path.join(proc_root, str(pid), "status")
+
+    if not os.path.isfile(stat_path):
+        return None
+
+    try:
+        with open(stat_path, "r", encoding="utf-8") as handle:
+            comm, utime, stime = parse_process_stat(handle.read())
+
+        rss_kb = 0
+        if os.path.isfile(status_path):
+            with open(status_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1])
+                        break
+
+        return ProcessSnapshot(
+            pid=pid,
+            comm=comm,
+            utime=utime,
+            stime=stime,
+            rss_kb=rss_kb,
+        )
+    except (OSError, ValueError, IndexError, PermissionError):
+        return None
+
+
+def list_process_ids(proc_root: str = PROC_ROOT) -> list[int]:
+    pids = []
+    for name in os.listdir(proc_root):
+        if name.isdigit():
+            pids.append(int(name))
+    return pids
+</file>
+
+<file path="daemon/__init__.py">
+
+</file>
+
+<file path="daemon/systemd_integration.py">
+"""
+daemon/systemd_integration.py
+
+Provides native systemd sd_notify integration without requiring external C libraries.
+Allows SENTRY to signal readiness and heartbeat status to the service manager.
+"""
+
+import os
+import socket
+import logging
+
+logger = logging.getLogger(__name__)
+
+class SystemdNotifier:
+    """
+    Implements the sd_notify protocol via the NOTIFY_SOCKET environment variable.
+    """
+
+    def __init__(self) -> None:
+        self.notify_socket_path = os.environ.get("NOTIFY_SOCKET")
+        if self.notify_socket_path:
+            # Handle abstract namespace sockets (which start with '@')
+            if self.notify_socket_path.startswith("@"):
+                self.notify_socket_path = "\0" + self.notify_socket_path[1:]
+            logger.debug(f"Detected systemd NOTIFY_SOCKET at {self.notify_socket_path}")
+        else:
+            logger.debug("NOTIFY_SOCKET not found. Running outside of systemd supervision.")
+
+    def notify(self, state: str) -> bool:
+        """
+        Sends a state string to systemd.
+        
+        Args:
+            state: The state payload (e.g., 'READY=1', 'WATCHDOG=1')
+            
+        Returns:
+            True if the message was sent, False otherwise.
+        """
+        if not self.notify_socket_path:
+            return False
+
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.sendto(state.encode('utf-8'), self.notify_socket_path)
+            return True
+        except OSError as e:
+            logger.warning(f"Failed to send sd_notify message '{state}': {e}")
+            return False
+
+    def ready(self) -> None:
+        """Signals that the daemon has finished initialization."""
+        self.notify("READY=1")
+
+    def stopping(self) -> None:
+        """Signals that the daemon is beginning a graceful shutdown."""
+        self.notify("STOPPING=1")
+
+    def ping_watchdog(self) -> None:
+        """Pings the systemd watchdog to prove the daemon is not deadlocked."""
+        self.notify("WATCHDOG=1")
+</file>
+
+<file path="dashboard/main_gui.py">
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import flet as ft
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.classifier import classify_stress, decision_hint
+from core.ipc import IpcClient
+from core.metrics import SystemMetricsSampler, compute_stress
+from core.platform_adapter import PLATFORM
+from core.process import ProcessSampler, read_total_memory_kb
+from core.procfs import read_system_stat
+
+stress_history = deque(maxlen=10)
+metrics_sampler = SystemMetricsSampler(interval=0.5)
+process_sampler = ProcessSampler()
+ipc_client = IpcClient()
+
+LEVEL_COLORS = {
+    "LOW": ft.Colors.GREEN,
+    "MODERATE": ft.Colors.ORANGE,
+    "HIGH": ft.Colors.RED,
+    "CRITICAL": ft.Colors.PURPLE,
+}
+
+
+def classify_with_color(score, mode):
+    level = classify_stress(score, mode)
+    return level, LEVEL_COLORS[level]
+
+
+def format_top_processes_local(process_sampler, system_total_delta, total_memory_kb):
+    rows = []
+    for process in process_sampler.top_processes(system_total_delta, total_memory_kb, limit=3):
+        rows.append(f"{process.comm} : {process.cpu_percent}% CPU")
+    return "\n".join(rows) if rows else "Collecting"
+
+
+def format_top_processes_ipc(top_processes):
+    if not top_processes:
+        return "Collecting"
+    rows = []
+    for process in top_processes[:3]:
+        rows.append(f"{process['comm']} : {process['cpu_percent']}% CPU")
+    return "\n".join(rows)
+
+
+def format_stress_text(score, util_score=None, psi_score=None):
+    if psi_score is not None:
+        util_value = util_score if util_score is not None else score
+        return f"Unified Stress Score: {score} (util={util_value}, psi={psi_score})"
+    return f"Unified Stress Score: {score}"
+
+
+def sparkline_from_history(history):
+    bars = ""
+    for score in history:
+        if score < 0.25:
+            bars += "▁"
+        elif score < 0.35:
+            bars += "▃"
+        elif score < 0.45:
+            bars += "▅"
+        else:
+            bars += "▇"
+    return bars or "Collecting"
+
+
+def main(page: ft.Page):
+    page.title = "SENTRY"
+    page.theme_mode = "dark"
+    page.window_width = 1200
+    page.window_height = 800
+    page.padding = 20
+    page.bgcolor = "#0b1220"
+
+    connection_text = ft.Text(size=16, color=ft.Colors.ORANGE)
+    cpu_text = ft.Text(size=20)
+    mem_text = ft.Text(size=20)
+    io_text = ft.Text(size=20)
+    psi_text = ft.Text(size=18)
+
+    stress_text = ft.Text(size=22, weight="bold")
+    level_text = ft.Text(size=24, weight="bold")
+    process_text = ft.Text(size=18)
+
+    trend_text = ft.Text(size=18)
+    action_text = ft.Text(size=18)
+
+    spark_text = ft.Text(size=30)
+    decision_text = ft.Text(size=20)
+
+    mode_dropdown = ft.Dropdown(
+        label="System Mode",
+        value="Balanced",
+        options=[
+            ft.dropdown.Option("Gaming"),
+            ft.dropdown.Option("Editing"),
+            ft.dropdown.Option("Balanced"),
+        ],
+    )
+
+    armed_switch = ft.Switch(label="Armed (allow mitigation)", value=False)
+    observe_switch = ft.Switch(label="Observe only", value=True)
+    dry_run_switch = ft.Switch(label="Dry run", value=False)
+
+    ipc_connected = {"value": False}
+    previous_stat = None
+
+    if PLATFORM == "Linux":
+        metrics_sampler.warmup()
+        process_sampler.prime()
+        previous_stat = read_system_stat()
+
+    def push_ipc_command(command_builder):
+        if not ipc_connected["value"]:
+            return
+        command_builder()
+
+    def on_mode_change(_event):
+        push_ipc_command(lambda: ipc_client.set_mode(mode_dropdown.value))
+
+    def on_armed_change(event):
+        push_ipc_command(lambda: ipc_client.set_armed(event.control.value))
+
+    def on_observe_change(event):
+        push_ipc_command(lambda: ipc_client.set_observe_only(event.control.value))
+
+    def on_dry_run_change(event):
+        push_ipc_command(lambda: ipc_client.set_dry_run(event.control.value))
+
+    mode_dropdown.on_change = on_mode_change
+    armed_switch.on_change = on_armed_change
+    observe_switch.on_change = on_observe_change
+    dry_run_switch.on_change = on_dry_run_change
+
+    def apply_state(state):
+        mode = state.get("mode", "Balanced")
+        score = state.get("stress_score", 0.0)
+        trend = state.get("trend", "Collecting")
+        level, color = classify_with_color(score, mode)
+
+        cpu_text.value = f"CPU Usage: {state.get('cpu_percent', 0)}%"
+        mem_text.value = f"Memory Usage: {state.get('memory_percent', 0)}%"
+        io_text.value = f"I/O Wait: {state.get('io_wait_percent', 0)}%"
+        stress_text.value = format_stress_text(
+            score,
+            state.get("utilization_score"),
+            state.get("psi_score"),
+        )
+        level_text.value = f"System Level: {level}"
+        level_text.color = color
+        trend_text.value = f"Trend: {trend}"
+        action_text.value = f"Daemon: {state.get('last_action', 'N/A')}"
+        spark_text.value = sparkline_from_history(state.get("stress_history", []))
+        decision_text.value = f"Decision Engine: {decision_hint(level, trend)}"
+        process_text.value = f"Top Processes:\n{format_top_processes_ipc(state.get('top_processes', []))}"
+
+        psi = state.get("psi", {})
+        if psi.get("cpu") is not None:
+            psi_text.value = (
+                f"PSI (avg10): CPU {psi.get('cpu')} | "
+                f"MEM {psi.get('memory')} | IO {psi.get('io')}"
+            )
+        else:
+            psi_text.value = "PSI: unavailable"
+
+        mode_dropdown.value = mode
+        armed_switch.value = state.get("armed", False)
+        observe_switch.value = state.get("observe_only", True)
+        dry_run_switch.value = state.get("dry_run", False)
+
+    def update_local_metrics():
+        nonlocal previous_stat
+
+        if PLATFORM == "Linux":
+            current_stat = read_system_stat()
+            system_total_delta = current_stat.total - previous_stat.total
+            previous_stat = current_stat
+
+            metrics = metrics_sampler.sample()
+            cpu = metrics.cpu_percent
+            mem = metrics.memory_percent
+            io = metrics.io_wait_percent
+            score = metrics.stress_score
+            util_score = metrics.utilization_score
+            psi_score = metrics.psi_score
+
+            if metrics.psi_cpu_some_avg10 is not None:
+                psi_text.value = (
+                    f"PSI (avg10): CPU {metrics.psi_cpu_some_avg10} | "
+                    f"MEM {metrics.psi_memory_some_avg10} | IO {metrics.psi_io_some_avg10}"
+                )
+            else:
+                psi_text.value = "PSI: unavailable on this kernel"
+
+            total_memory_kb = read_total_memory_kb()
+            process_text.value = (
+                f"Top Processes:\n"
+                f"{format_top_processes_local(process_sampler, system_total_delta, total_memory_kb)}"
+            )
+        else:
+            from core.platform_adapter import calculate_cpu, get_io_wait, get_memory_usage
+
+            cpu = calculate_cpu()
+            mem = get_memory_usage()
+            io = get_io_wait()
+            score = compute_stress(cpu, mem, io)
+            util_score = score
+            psi_score = None
+            psi_text.value = "PSI: Linux only"
+            process_text.value = "Top Processes:\nUnavailable on this platform"
+
+        stress_history.append(score)
+        mode = mode_dropdown.value
+        level, color = classify_with_color(score, mode)
+        trend = "Collecting"
+        if len(stress_history) >= 5:
+            first = list(stress_history)[:2]
+            last = list(stress_history)[-2:]
+            trend = "Rising" if sum(last) > sum(first) else "Stable"
+
+        cpu_text.value = f"CPU Usage: {cpu}%"
+        mem_text.value = f"Memory Usage: {mem}%"
+        io_text.value = f"I/O Wait: {io}%"
+        stress_text.value = format_stress_text(score, util_score, psi_score)
+        level_text.value = f"System Level: {level}"
+        level_text.color = color
+        trend_text.value = f"Trend: {trend}"
+        action_text.value = f"Mode: {mode} ({PLATFORM}) — local fallback"
+        spark_text.value = sparkline_from_history(list(stress_history))
+        decision_text.value = f"Decision Engine: {decision_hint(level, trend)}"
+
+    def refresh_loop():
+        while True:
+            if ipc_client.ping():
+                ipc_connected["value"] = True
+                connection_text.value = "Daemon: connected (IPC)"
+                connection_text.color = ft.Colors.GREEN
+                state = ipc_client.get_state()
+                if state:
+                    apply_state(state)
+            else:
+                ipc_connected["value"] = False
+                connection_text.value = "Daemon: not running — local fallback"
+                connection_text.color = ft.Colors.ORANGE
+                update_local_metrics()
+
+            page.update()
+            time.sleep(2)
+
+    threading.Thread(target=refresh_loop, daemon=True).start()
+
+    left = ft.Column(
+        [
+            ft.Card(ft.Container(connection_text, padding=20)),
+            ft.Card(ft.Container(cpu_text, padding=20)),
+            ft.Card(ft.Container(mem_text, padding=20)),
+            ft.Card(ft.Container(io_text, padding=20)),
+            ft.Card(ft.Container(stress_text, padding=20)),
+            ft.Card(ft.Container(level_text, padding=20)),
+            ft.Card(ft.Container(psi_text, padding=20)),
+        ],
+        expand=1,
+    )
+
+    center = ft.Column(
+        [
+            ft.Text("Stress Intelligence", size=24, weight="bold"),
+            ft.Card(ft.Container(spark_text, padding=20)),
+            ft.Card(ft.Container(decision_text, padding=20)),
+        ],
+        expand=2,
+    )
+
+    right = ft.Column(
+        [
+            ft.Card(ft.Container(process_text, padding=20)),
+            ft.Card(ft.Container(trend_text, padding=20)),
+            ft.Card(ft.Container(action_text, padding=20)),
+            ft.Card(ft.Container(mode_dropdown, padding=20)),
+            ft.Card(ft.Container(armed_switch, padding=20)),
+            ft.Card(ft.Container(observe_switch, padding=20)),
+            ft.Card(ft.Container(dry_run_switch, padding=20)),
+        ],
+        expand=1,
+    )
+
+    page.add(
+        ft.Column(
+            [
+                ft.Text("SENTRY Dashboard", size=30, weight="bold"),
+                ft.Divider(),
+                ft.Row([left, center, right], expand=True),
+            ]
+        )
+    )
+
+
+if __name__ == "__main__":
+    ft.app(target=main)
+</file>
+
+<file path="engine/__init__.py">
+"""Pressure-aware SENTRY decision engines."""
+</file>
+
+<file path="engine/classifier.py">
+"""
+Workload Classification Engine
+
+Responsible for determining the intent of a workload
+based on process metadata.
+
+This module does NOT:
+
+- make mitigation decisions
+- apply cgroups
+- modify priorities
+
+It only answers:
+
+"What kind of workload is this?"
+"""
+
+from enum import Enum
+
+
+class WorkloadType(str, Enum):
+    SYSTEM = "system"
+    INTERACTIVE = "interactive"
+    BACKGROUND = "background"
+    BATCH = "batch"
+    UNKNOWN = "unknown"
+
+
+SYSTEM_PROCESSES = {
+    "systemd",
+    "dbus-daemon",
+    "gnome-shell",
+    "xorg",
+    "pipewire",
+    "pulseaudio",
+    "networkmanager",
+    "sshd",
+    "udevd",
+}
+
+
+INTERACTIVE_PROCESSES = {
+    "firefox",
+    "chrome",
+    "chromium",
+    "code",
+    "cursor",
+    "discord",
+    "kitty",
+    "alacritty",
+    "wezterm",
+    "gnome-terminal",
+    "konsole",
+    "thunderbird",
+    "slack",
+}
+
+
+BATCH_PROCESSES = {
+    "gcc",
+    "g++",
+    "clang",
+    "clang++",
+    "cargo",
+    "rustc",
+    "make",
+    "cmake",
+    "ninja",
+    "ffmpeg",
+    "docker",
+    "podman",
+    "pytest",
+    "python",
+    "python3",
+}
+
+
+BACKGROUND_PROCESSES = {
+    "rsync",
+    "updatedb",
+    "tracker-miner-fs",
+    "tracker-extract",
+    "syncthing",
+    "backupd",
+}
+
+
+def classify_process(process_name: str) -> WorkloadType:
+    """
+    Classify a process into a workload category.
+
+    Args:
+        process_name: Process executable name
+
+    Returns:
+        WorkloadType
+    """
+
+    if not process_name:
+        return WorkloadType.UNKNOWN
+
+    name = process_name.lower().strip()
+
+    if name in SYSTEM_PROCESSES:
+        return WorkloadType.SYSTEM
+
+    if name in INTERACTIVE_PROCESSES:
+        return WorkloadType.INTERACTIVE
+
+    if name in BATCH_PROCESSES:
+        return WorkloadType.BATCH
+
+    if name in BACKGROUND_PROCESSES:
+        return WorkloadType.BACKGROUND
+
+    return WorkloadType.UNKNOWN
+
+
+def workload_priority(workload: WorkloadType) -> int:
+    """
+    Higher number = more important.
+
+    Used later by mitigation policy.
+    """
+
+    priorities = {
+        WorkloadType.SYSTEM: 100,
+        WorkloadType.INTERACTIVE: 80,
+        WorkloadType.UNKNOWN: 50,
+        WorkloadType.BACKGROUND: 30,
+        WorkloadType.BATCH: 20,
+    }
+
+    return priorities[workload]
+
+
+def mitigation_candidate_score(
+    cpu_percent: float,
+    memory_percent: float,
+    workload: WorkloadType,
+) -> float:
+    """
+    Rank how attractive a process is as a mitigation target.
+
+    Higher score = throttle first.
+    """
+
+    resource_score = (0.7 * cpu_percent) + (0.3 * memory_percent)
+
+    priority_penalty = workload_priority(workload)
+
+    return round(resource_score - priority_penalty, 2)
+</file>
+
+<file path="engine/feedback.py">
+"""
+Feedback Engine for SENTRY.
+
+Evaluates whether applied mitigation actions actually improved system pressure.
+Basis for the Verify → Learn stages of Observe→Understand→Predict→Optimize→Act→Verify→Learn.
+"""
+
+from dataclasses import dataclass
+
+
+@dataclass
+class ActionOutcome:
+    """Records the outcome of a mitigation action."""
+    pid: int
+    stress_before: float
+    stress_after: float
+    pressure_before: str
+    pressure_after: str
+    successful: bool
+
+
+class FeedbackEngine:
+    """Evaluates whether actions improved system pressure."""
+    
+    def evaluate(
+        self,
+        pid: int,
+        stress_before: float,
+        stress_after: float,
+        pressure_before: str,
+        pressure_after: str,
+    ) -> ActionOutcome:
+        """
+        Evaluate whether an action was successful.
+        
+        Success is defined as: stress improved AND pressure level did not worsen.
+        
+        Args:
+            pid: Process ID that was throttled
+            stress_before: Stress score before action
+            stress_after: Stress score after action (post-cooldown)
+            pressure_before: Pressure level before action
+            pressure_after: Pressure level after action
+        
+        Returns:
+            ActionOutcome with success/failure determination
+        """
+        stress_improved = stress_after < stress_before
+        pressure_improved = self._is_improvement(pressure_before, pressure_after)
+        successful = stress_improved and pressure_improved
+        
+        return ActionOutcome(
+            pid=pid,
+            stress_before=stress_before,
+            stress_after=stress_after,
+            pressure_before=pressure_before,
+            pressure_after=pressure_after,
+            successful=successful,
+        )
+    
+    @staticmethod
+    def _is_improvement(before: str, after: str) -> bool:
+        """Check if pressure level improved or stayed same (did not worsen)."""
+        level_order = {"LOW": 0, "MODERATE": 1, "HIGH": 2, "CRITICAL": 3}
+        before_rank = level_order.get(before, -1)
+        after_rank = level_order.get(after, 4)
+        return after_rank <= before_rank
+</file>
+
+<file path="engine/pressure.py">
+from typing import Optional
+
+from model.pressure import PressureScore, PressureSnapshot, PsiSample, UtilizationSample
+
+
+DEFAULT_PRESSURE_WEIGHTS = {
+    "cpu_weight": 0.35,
+    "memory_weight": 0.25,
+    "io_weight": 0.15,
+    "psi_cpu_weight": 0.10,
+    "psi_memory_weight": 0.10,
+    "psi_io_weight": 0.05,
+    "psi_blend": 0.40,
+}
+
+
+class PressureEngine:
+    """Build a pressure-first score from utilization context and PSI stalls."""
+
+    def __init__(self, weights: Optional[dict[str, float]] = None):
+        self.weights = {**DEFAULT_PRESSURE_WEIGHTS, **(weights or {})}
+
+    def score(
+        self,
+        utilization: UtilizationSample,
+        psi: Optional[PsiSample] = None,
+    ) -> PressureSnapshot:
+        psi_sample = psi or PsiSample()
+        utilization_score = self.utilization_score(utilization)
+        psi_score = self.psi_score(psi_sample)
+
+        if psi_score is None:
+            total = utilization_score
+        else:
+            blend = self._bounded_weight("psi_blend")
+            total = round(((1 - blend) * utilization_score) + (blend * psi_score), 2)
+
+        return PressureSnapshot(
+            utilization=utilization,
+            psi=psi_sample,
+            score=PressureScore(
+                total=total,
+                utilization=utilization_score,
+                psi=psi_score,
+            ),
+        )
+
+    def utilization_score(self, sample: UtilizationSample) -> float:
+        cpu_w = self.weights["cpu_weight"]
+        memory_w = self.weights["memory_weight"]
+        io_w = self.weights["io_weight"]
+        return round(
+            (
+                cpu_w * sample.cpu_percent
+                + memory_w * sample.memory_percent
+                + io_w * sample.io_wait_percent
+            )
+            / 100,
+            2,
+        )
+
+    def psi_score(self, sample: PsiSample) -> Optional[float]:
+        components = [
+            (sample.cpu_some_avg10, self.weights["psi_cpu_weight"]),
+            (sample.memory_some_avg10, self.weights["psi_memory_weight"]),
+            (sample.io_some_avg10, self.weights["psi_io_weight"]),
+        ]
+        available = [(value / 100, weight) for value, weight in components if value is not None]
+        if not available:
+            return None
+
+        total_weight = sum(weight for _, weight in available)
+        if total_weight <= 0:
+            return None
+
+        return round(sum(value * weight for value, weight in available) / total_weight, 2)
+
+    def _bounded_weight(self, key: str) -> float:
+        return max(0.0, min(1.0, float(self.weights.get(key, 0.0))))
+
+
+def compute_pressure_score(
+    cpu: float,
+    memory: float,
+    io: float,
+    weights: Optional[dict[str, float]] = None,
+    psi_cpu: Optional[float] = None,
+    psi_memory: Optional[float] = None,
+    psi_io: Optional[float] = None,
+) -> PressureScore:
+    snapshot = PressureEngine(weights).score(
+        UtilizationSample(cpu_percent=cpu, memory_percent=memory, io_wait_percent=io),
+        PsiSample(
+            cpu_some_avg10=psi_cpu,
+            memory_some_avg10=psi_memory,
+            io_some_avg10=psi_io,
+        ),
+    )
+    return snapshot.score
+</file>
+
+<file path="engine/reconciliation.py">
+"""
+engine/reconciliation.py
+
+Manages the lifecycle of applied mitigations.
+Ensures processes are un-throttled safely, preventing permanent resource 
+starvation and guarding against Linux PID recycling race conditions.
+"""
+
+import time
+import logging
+from dataclasses import dataclass
+from typing import Dict, List
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ThrottledProcess:
+    """Represents the exact state of a process when SENTRY intervened."""
+    pid: int
+    cgroup_path: str
+    throttled_at: float
+
+class StateReconciler:
+    """
+    Tracks active mitigations and calculates when it is safe to revert them.
+    """
+
+    def __init__(self) -> None:
+        # Maps PID to its historical throttle state
+        self._active_throttles: Dict[int, ThrottledProcess] = {}
+
+    def track(self, pid: int, cgroup_path: str) -> None:
+        """
+        Records a process as actively mitigated.
+        
+        Args:
+            pid: The process ID.
+            cgroup_path: The absolute path to the process's cgroup at the time of throttling.
+        """
+        self._active_throttles[pid] = ThrottledProcess(
+            pid=pid,
+            cgroup_path=cgroup_path,
+            throttled_at=time.time()
+        )
+        logger.debug(f"Tracking mitigation state for PID {pid} at {cgroup_path}")
+
+    def get_releasable_tasks(self, cooldown_seconds: float) -> List[ThrottledProcess]:
+        """
+        Identifies processes that have survived the cooldown period 
+        and are eligible to have their resource limits lifted.
+        
+        Args:
+            cooldown_seconds: Minimum time (in seconds) a process must remain throttled.
+            
+        Returns:
+            A list of ThrottledProcess objects eligible for release.
+        """
+        now = time.time()
+        releasable = []
+
+        for task in self._active_throttles.values():
+            if (now - task.throttled_at) >= cooldown_seconds:
+                releasable.append(task)
+
+        return releasable
+
+    def drop(self, pid: int) -> None:
+        """Removes a process from the tracking state."""
+        self._active_throttles.pop(pid, None)
+
+    def is_tracked(self, pid: int) -> bool:
+        """Checks if SENTRY is currently managing this PID."""
+        return pid in self._active_throttles
+        
+    def active_count(self) -> int:
+        """Returns the number of currently throttled processes."""
+        return len(self._active_throttles)
+</file>
+
+<file path="engine/selector.py">
+"""
+engine/selector.py
+
+Identifies the process consuming the most resources.
+Utilizes Exponential Moving Averages (EMA) to prevent flapping 
+and ignores transient metric spikes.
+"""
+
+import os
+import logging
+from typing import Optional
+
+from engine.timeseries import ProcessEmaTracker
+
+logger = logging.getLogger(__name__)
+
+class TargetSelector:
+    """
+    Scans the process tree on demand to find the best candidate for mitigation.
+    """
+
+    def __init__(self) -> None:
+        # Alpha of 0.4 means recent spikes carry weight, but history still matters.
+        self.ema_tracker = ProcessEmaTracker(alpha=0.4)
+        # Page size is typically 4096 bytes on Linux. Used to calculate RSS.
+        self.page_size = os.sysconf("SC_PAGE_SIZE")
+
+    def _get_rss_bytes(self, pid: int) -> float:
+        """
+        Reads the Resident Set Size (RSS) in bytes for a given PID.
+        RSS is the second field in /proc/[pid]/statm, representing physical memory.
+        """
+        try:
+            with open(f"/proc/{pid}/statm", "r") as f:
+                statm_data = f.read().split()
+                # Field 1 is RSS in pages
+                rss_pages = int(statm_data[1])
+                return float(rss_pages * self.page_size)
+        except (FileNotFoundError, IndexError, ValueError):
+            # Process died or file is malformed
+            return 0.0
+        except OSError as e:
+            logger.debug(f"Failed to read statm for PID {pid}: {e}")
+            return 0.0
+
+    def select_target(self) -> Optional[int]:
+        """
+        Scans all running processes, updates their moving averages,
+        and returns the PID of the highest memory consumer.
+        
+        Returns:
+            The PID (int) of the target, or None if no valid targets exist.
+        """
+        highest_pid: Optional[int] = None
+        highest_ema: float = -1.0
+        active_pids = set()
+
+        try:
+            # Iterate through all numerical directories in /proc
+            for entry in os.scandir("/proc"):
+                if not entry.is_dir() or not entry.name.isdigit():
+                    continue
+
+                pid = int(entry.name)
+                active_pids.add(pid)
+                
+                current_rss = self._get_rss_bytes(pid)
+                if current_rss == 0.0:
+                    continue
+
+                # Smooth the raw metric to prevent flapping
+                smoothed_rss = self.ema_tracker.update(pid, current_rss)
+
+                if smoothed_rss > highest_ema:
+                    highest_ema = smoothed_rss
+                    highest_pid = pid
+
+        except OSError as e:
+            logger.error(f"Error scanning /proc during target selection: {e}")
+
+        # Cleanup: Remove dead processes from the EMA tracker to prevent memory leaks
+        # We check the internal tracker's keys against the active_pids we just saw.
+        tracked_pids = list(self.ema_tracker._emas.keys())
+        for tracked_pid in tracked_pids:
+            if tracked_pid not in active_pids:
+                self.ema_tracker.remove(tracked_pid)
+
+        if highest_pid:
+            mb_usage = highest_ema / (1024 * 1024)
+            logger.info(f"Target selected: PID {highest_pid} with smoothed RSS of {mb_usage:.2f} MB")
+            
+        return highest_pid
+</file>
+
+<file path="engine/timeseries.py">
+"""
+engine/timeseries.py
+
+Provides time-series smoothing for process metrics to prevent 
+control-loop flapping during transient resource spikes.
+"""
+
+import logging
+from typing import Dict
+
+logger = logging.getLogger(__name__)
+
+class ProcessEmaTracker:
+    """
+    Tracks the Exponential Moving Average (EMA) of a metric for active processes.
+    Optimized for low memory overhead (O(1) storage per process).
+    """
+
+    def __init__(self, alpha: float = 0.3) -> None:
+        """
+        Args:
+            alpha: The smoothing factor between 0 and 1. 
+                   A higher alpha discounts older observations faster.
+        """
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("Alpha must be strictly between 0.0 and 1.0")
+        
+        self.alpha = alpha
+        # Maps PID to its current EMA value
+        self._emas: Dict[int, float] = {}
+
+    def update(self, pid: int, current_value: float) -> float:
+        """
+        Updates the EMA for a given process and returns the smoothed value.
+        
+        Args:
+            pid: The process ID.
+            current_value: The raw metric value observed in the current tick.
+            
+        Returns:
+            The newly calculated EMA.
+        """
+        if current_value < 0:
+            logger.warning(f"Negative metric value {current_value} reported for PID {pid}")
+            current_value = 0.0
+
+        if pid not in self._emas:
+            # First observation initializes the EMA
+            self._emas[pid] = float(current_value)
+            return self._emas[pid]
+
+        # EMA Formula
+        previous_ema = self._emas[pid]
+        new_ema = (current_value * self.alpha) + (previous_ema * (1.0 - self.alpha))
+        self._emas[pid] = new_ema
+        
+        return new_ema
+
+    def get_ema(self, pid: int) -> float:
+        """Retrieves the current EMA for a PID without updating it."""
+        return self._emas.get(pid, 0.0)
+
+    def remove(self, pid: int) -> None:
+        """Stops tracking a process (e.g., when it terminates)."""
+        self._emas.pop(pid, None)
+
+    def clear(self) -> None:
+        """Wipes all tracking state."""
+        self._emas.clear()
+</file>
+
+<file path="model/__init__.py">
+"""Canonical SENTRY domain models."""
+</file>
+
+<file path="model/action_outcome.py">
+from dataclasses import dataclass
+
+
+@dataclass
+class ActionOutcome:
+    pid: int
+
+    stress_before: float
+    stress_after: float
+
+    pressure_before: str
+    pressure_after: str
+
+    improvement: float
+
+    successful: bool
+</file>
+
+<file path="model/candidate.py">
+from dataclasses import dataclass
+
+from core.process import ProcessMetrics
+from engine.classifier import WorkloadType
+
+
+@dataclass(frozen=True)
+class MitigationCandidate:
+    """
+    Candidate process for mitigation.
+
+    resource_score:
+        How expensive the process is.
+
+    protection_penalty:
+        How much protection policy grants.
+
+    selection_score:
+        Final ranking score.
+    """
+
+    process: ProcessMetrics
+    workload: WorkloadType
+
+    resource_score: float
+    protection_penalty: float
+
+    selection_score: float
+
+    reason: str
+</file>
+
+<file path="model/pressure.py">
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class UtilizationSample:
+    cpu_percent: float
+    memory_percent: float
+    io_wait_percent: float
+
+
+@dataclass(frozen=True)
+class PsiSample:
+    cpu_some_avg10: Optional[float] = None
+    memory_some_avg10: Optional[float] = None
+    io_some_avg10: Optional[float] = None
+
+    @property
+    def available(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.cpu_some_avg10,
+                self.memory_some_avg10,
+                self.io_some_avg10,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class PressureScore:
+    total: float
+    utilization: float
+    psi: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class PressureSnapshot:
+    utilization: UtilizationSample
+    psi: PsiSample
+    score: PressureScore
+</file>
+
+<file path="packaging/sentry.service">
+[Unit]
+Description=SENTRY Pressure-Aware Resource Daemon
+Documentation=https://github.com/apexajay-rc/SENTRY
+After=sysinit.target local-fs.target
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
+ConditionPathExists=/proc/pressure/memory
+
+[Service]
+Type=notify
+WorkingDirectory=/opt/sentry
+Environment="PYTHONPATH=/opt/sentry"
+ExecStart=/opt/sentry/venv/bin/python /opt/sentry/daemon/main.py
+
+Restart=on-failure
+RestartSec=3
+WatchdogSec=15s
+TimeoutStopSec=10s
+SendSIGKILL=yes
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=no
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+
+RestrictNamespaces=yes
+
+[Install]
+WantedBy=multi-user.target
+</file>
+
+<file path="tests/fixtures/proc/pressure/cpu">
+some avg10=12.34 avg60=8.00 avg300=4.00 total=123456789
+full avg10=4.56 avg60=2.00 avg300=1.00 total=987654321
+</file>
+
+<file path="tests/fixtures/proc/pressure/io">
+some avg10=5.00 avg60=3.00 avg300=1.00 total=123456789
+full avg10=2.00 avg60=1.00 avg300=0.50 total=987654321
+</file>
+
+<file path="tests/fixtures/proc/pressure/memory">
+some avg10=20.00 avg60=10.00 avg300=5.00 total=123456789
+full avg10=8.00 avg60=4.00 avg300=2.00 total=987654321
+</file>
+
+<file path="tests/fixtures/proc/meminfo">
+MemTotal:       8000000 kB
+MemAvailable:   3000000 kB
+MemFree:        2800000 kB
+</file>
+
+<file path="tests/fixtures/proc/stat">
+cpu  1000 0 500 5000 100 0 0 0 0 0
+</file>
+
+<file path="tests/test_classifier.py">
+import unittest
+
+from engine.classifier import (
+    WorkloadType,
+    classify_process,
+    workload_priority,
+)
+
+
+class TestClassifier(unittest.TestCase):
+
+    def test_system_process(self):
+        self.assertEqual(
+            classify_process("systemd"),
+            WorkloadType.SYSTEM,
+        )
+
+    def test_interactive_process(self):
+        self.assertEqual(
+            classify_process("chrome"),
+            WorkloadType.INTERACTIVE,
+        )
+
+    def test_batch_process(self):
+        self.assertEqual(
+            classify_process("gcc"),
+            WorkloadType.BATCH,
+        )
+
+    def test_background_process(self):
+        self.assertEqual(
+            classify_process("rsync"),
+            WorkloadType.BACKGROUND,
+        )
+
+    def test_unknown_process(self):
+        self.assertEqual(
+            classify_process("my-custom-daemon"),
+            WorkloadType.UNKNOWN,
+        )
+
+    def test_case_insensitive(self):
+        self.assertEqual(
+            classify_process("Chrome"),
+            WorkloadType.INTERACTIVE,
+        )
+
+    def test_priority_order(self):
+        self.assertGreater(
+            workload_priority(WorkloadType.SYSTEM),
+            workload_priority(WorkloadType.INTERACTIVE),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path="tests/test_ipc.py">
+import socket
+import threading
+import time
+import unittest
+
+from core.ipc import DaemonState, IpcClient, IpcServer
+
+
+class IpcTests(unittest.TestCase):
+    def setUp(self):
+        self.state = DaemonState(platform="Linux", observe_only=True, armed=False)
+        self.server = IpcServer(self.state, endpoint=("tcp", "127.0.0.1", 0))
+        self.server.start_background()
+
+        deadline = time.time() + 2
+        while self.server.address is None and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert self.server.address is not None
+        _kind, host, port = self.server.address
+        self.client = IpcClient(endpoint=("tcp", host, port))
+
+    def tearDown(self):
+        self.server.stop()
+
+    def test_ping(self):
+        self.assertTrue(self.client.ping())
+
+    def test_get_state(self):
+        self.state.update(cpu_percent=42.0, stress_score=0.42, level="MODERATE")
+        state = self.client.get_state()
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(state["cpu_percent"], 42.0)
+        self.assertEqual(state["stress_score"], 0.42)
+        self.assertEqual(state["level"], "MODERATE")
+        self.assertTrue(state["observe_only"])
+
+    def test_set_mode(self):
+        state = self.client.set_mode("Gaming")
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(state["mode"], "Gaming")
+
+    def test_set_armed_and_observe_only(self):
+        armed_state = self.client.set_armed(True)
+        observe_state = self.client.set_observe_only(False)
+        self.assertTrue(armed_state["armed"])
+        self.assertFalse(observe_state["observe_only"])
+
+    def test_invalid_command(self):
+        response = self.client.request({"type": "unknown"})
+        self.assertFalse(response["ok"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path="tests/test_pressure_engine.py">
+import unittest
+
+from engine.pressure import PressureEngine, compute_pressure_score
+from model.pressure import PsiSample, UtilizationSample
+
+
+class PressureEngineTests(unittest.TestCase):
+    def test_uses_utilization_when_psi_is_unavailable(self):
+        engine = PressureEngine()
+        snapshot = engine.score(
+            UtilizationSample(cpu_percent=70.0, memory_percent=50.0, io_wait_percent=10.0)
+        )
+
+        self.assertIsNone(snapshot.score.psi)
+        self.assertEqual(snapshot.score.total, snapshot.score.utilization)
+
+    def test_pressure_score_is_psi_first_when_stalls_are_present(self):
+        engine = PressureEngine({"psi_blend": 0.75})
+        snapshot = engine.score(
+            UtilizationSample(cpu_percent=10.0, memory_percent=20.0, io_wait_percent=5.0),
+            PsiSample(cpu_some_avg10=70.0, memory_some_avg10=60.0, io_some_avg10=20.0),
+        )
+
+        self.assertGreater(snapshot.score.psi, snapshot.score.utilization)
+        self.assertGreater(snapshot.score.total, snapshot.score.utilization)
+
+    def test_psi_blend_is_bounded(self):
+        low = compute_pressure_score(
+            80.0,
+            80.0,
+            80.0,
+            weights={"psi_blend": -10.0},
+            psi_cpu=0.0,
+        )
+        high = compute_pressure_score(
+            80.0,
+            80.0,
+            80.0,
+            weights={"psi_blend": 10.0},
+            psi_cpu=0.0,
+        )
+
+        self.assertEqual(low.total, low.utilization)
+        self.assertEqual(high.total, high.psi)
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path=".gitignore">
+__pycache__/
+*.py[cod]
+*$py.class
+
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+sentry_log.txt
+sentry_audit.json
+
+.DS_Store
+Thumbs.db
+</file>
+
+<file path="LICENSE">
+MIT License
+
+Copyright (c) 2026 apexajay-rc
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+</file>
+
+<file path="Makefile">
+# SENTRY Installation Makefile
+# ---------------------------------------------------------
+
+# Paths
+PREFIX ?= /opt/sentry
+SYSTEMD_DIR ?= /etc/systemd/system
+VENV_DIR = $(PREFIX)/venv
+PYTHON = python3
+
+.PHONY: all help install uninstall clean
+
+all: help
+
+help:
+	@echo "SENTRY - Predictive Linux Resource Orchestration"
+	@echo "------------------------------------------------"
+	@echo "Usage:"
+	@echo "  sudo make install    - Installs SENTRY to $(PREFIX) and configures systemd"
+	@echo "  sudo make uninstall  - Removes SENTRY and its systemd service"
+	@echo "  make clean           - Cleans local python cache files (__pycache__)"
+
+install:
+	@echo "==> Creating installation directories at $(PREFIX)..."
+	install -d -m 755 $(PREFIX)
+	install -d -m 755 $(PREFIX)/daemon
+	install -d -m 755 $(PREFIX)/core
+	install -d -m 755 $(PREFIX)/engine
+	install -d -m 755 $(PREFIX)/dashboard
+	
+	@echo "==> Copying source files..."
+	cp -r daemon/* $(PREFIX)/daemon/
+	cp -r core/* $(PREFIX)/core/
+	cp -r engine/* $(PREFIX)/engine/
+	cp -r dashboard/* $(PREFIX)/dashboard/
+	cp requirements.txt $(PREFIX)/
+	# Copy config if it exists, don't fail if it doesn't
+	cp sentry_config.yaml $(PREFIX)/ 2>/dev/null || true
+	
+	@echo "==> Setting up isolated Python Virtual Environment..."
+	$(PYTHON) -m venv $(VENV_DIR)
+	$(VENV_DIR)/bin/pip install --upgrade pip
+	$(VENV_DIR)/bin/pip install -r $(PREFIX)/requirements.txt
+	
+	@echo "==> Installing systemd service..."
+	install -m 644 packaging/sentry.service $(SYSTEMD_DIR)/sentry.service
+	systemctl daemon-reload
+	
+	@echo "================================================="
+	@echo "✅ SENTRY Installation Complete!"
+	@echo "================================================="
+	@echo "To enable and start the daemon, run:"
+	@echo "  sudo systemctl enable --now sentry.service"
+	@echo ""
+	@echo "To view live logs, run:"
+	@echo "  journalctl -fu sentry.service"
+
+uninstall:
+	@echo "==> Stopping and disabling systemd service..."
+	systemctl stop sentry.service 2>/dev/null || true
+	systemctl disable sentry.service 2>/dev/null || true
+	
+	@echo "==> Removing systemd service file..."
+	rm -f $(SYSTEMD_DIR)/sentry.service
+	systemctl daemon-reload
+	
+	@echo "==> Removing application files from $(PREFIX)..."
+	rm -rf $(PREFIX)
+	
+	@echo "✅ SENTRY Uninstalled Successfully."
+
+clean:
+	@echo "==> Cleaning Python cache files..."
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+	find . -type d -name ".pytest_cache" -exec rm -rf {} +
+</file>
+
+<file path="sentry_config.yaml">
+# SENTRY Daemon Configuration
+# Values applied dynamically to the control loop.
+
+policy:
+  # The cgroup v2 memory.high limit applied to the heaviest process during a spike.
+  # Accepts standard kernel memory strings (e.g., 500M, 1G, max)
+  memory_throttle_limit: "500M"
+  
+  # Minimum time (in seconds) a process remains throttled before limits are lifted.
+  # Prevents control-loop flapping.
+  cooldown_period: 60.0
+
+daemon:
+  # Interval (in seconds) to ping the systemd watchdog and run the cooldown reconciler.
+  watchdog_interval: 5.0
+</file>
+
+<file path="core/config.py">
+"""
+core/config.py
+
+Unified Configuration Manager.
+Resolves the dual-API technical debt by combining dataclass defaults
+with safe YAML loading and legacy dictionary access.
+"""
+import os
+import yaml
+from typing import Any, Dict
+
+class SentryConfig:
+    def __init__(self, config_path: str = "sentry_config.yaml"):
+        # Fallback Defaults
+        self.memory_clamp_bytes: int = 52428800  # 50MB
+        self.cooldown_seconds: int = 60
+        self._raw_config: Dict[str, Any] = {}
+
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    loaded = yaml.safe_load(f)
+                    if loaded and isinstance(loaded, dict):
+                        self._raw_config = loaded
+                        self._map_config()
+            except Exception as e:
+                # Log warning in real implementation; fallback to defaults
+                pass
+
+    def _map_config(self) -> None:
+        """Safely maps YAML keys to internal properties, handling legacy naming."""
+        # 1. Memory mapping (handles old 'memory_throttle_limit' and new 'memory_clamp_bytes')
+        mem_val = self._raw_config.get("memory_throttle_limit") or self._raw_config.get("memory_clamp_bytes")
+        if mem_val:
+            self.memory_clamp_bytes = self._parse_memory(str(mem_val))
+
+        # 2. Cooldown mapping
+        cool_val = self._raw_config.get("cooldown_period") or self._raw_config.get("cooldown_seconds")
+        if cool_val is not None:
+            try:
+                self.cooldown_seconds = int(cool_val)
+            except ValueError:
+                pass
+
+    def _parse_memory(self, mem_str: str) -> int:
+        """Deterministically converts memory strings (e.g., '100MB') to raw bytes."""
+        mem_str = mem_str.upper().strip()
+        try:
+            if mem_str.endswith("GB") or mem_str.endswith("G"):
+                return int(mem_str.replace("GB", "").replace("G", "")) * 1024**3
+            elif mem_str.endswith("MB") or mem_str.endswith("M"):
+                return int(mem_str.replace("MB", "").replace("M", "")) * 1024**2
+            elif mem_str.endswith("KB") or mem_str.endswith("K"):
+                return int(mem_str.replace("KB", "").replace("K", "")) * 1024
+            return int(mem_str)
+        except ValueError:
+            return 52428800  # Fallback to 50MB on parsing failure
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Legacy dictionary access support for core/runtime.py compatibility."""
+        return self._raw_config.get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._raw_config[key]
+</file>
+
+<file path="core/runtime.py">
+"""Bootstrap SENTRY runtime modules from sentry_config.yaml."""
+
+from typing import Optional, Any
+
+from core.cgroups import setup_cgroup
+from core.config import ConfigParser
+from core.metrics import configure_metrics
+from core.platform_adapter import PLATFORM
+from core.policy import configure_policy
+
+
+def init_runtime(config_file: Optional[str] = None) -> Any:
+    # Nuclear option: 'Any' tells mypy to completely ignore attribute checking for this variable
+    config: Any = ConfigParser.load(config_file)
+    
+    configure_policy(config)
+    configure_metrics(config)
+
+    if PLATFORM == "Linux" and config.cgroup_enabled():
+        setup_cgroup(config.cgroup_path())
+
+    return config
+</file>
+
+<file path="engine/aggregator.py">
+"""
+engine/aggregator.py
+
+Processes high-speed eBPF telemetry, maintaining sliding time windows
+to calculate real-time CPU utilization percentages per process.
+"""
+
+import time
+from collections import defaultdict
+
+class CPUMonitor:
+    def __init__(self, window_size_sec=1.0, cpu_limit_pct=80.0):
+        # Convert our 1-second window into nanoseconds for easy math
+        self.window_size_ns = window_size_sec * 1_000_000_000
+        self.cpu_limit_pct = cpu_limit_pct
+        
+        # A dictionary where Key = PID, Value = List of (timestamp, duration)
+        self.history = defaultdict(list)
+
+    def add_burst(self, pid: int, duration_ns: int):
+        """Records a CPU burst and instantly evaluates if the process is violating limits."""
+        now_ns = time.time_ns()
+        
+        # 1. Record the burst
+        self.history[pid].append((now_ns, duration_ns))
+        
+        # 2. Prune old data (The Sliding Window)
+        cutoff = now_ns - self.window_size_ns
+        self.history[pid] = [b for b in self.history[pid] if b[0] > cutoff]
+        
+        # 3. Sum the remaining bursts in the window
+        total_cpu_ns = sum(b[1] for b in self.history[pid])
+        
+        # 4. Calculate true CPU percentage
+        cpu_pct = (total_cpu_ns / self.window_size_ns) * 100.0
+        
+        # 5. Evaluate
+        if cpu_pct > self.cpu_limit_pct:
+            return cpu_pct  # Violation detected!
+            
+        return None
+</file>
+
+<file path="tests/test_config.py">
+"""
+tests/test_config.py
+
+Validates the unified SentryConfig contract and deterministic memory parsing.
+"""
+import unittest
+import os
+import tempfile
+from core.config import SentryConfig
+
+class TestSentryConfig(unittest.TestCase):
+    def setUp(self):
+        # Create a temporary YAML file mirroring legacy config
+        self.test_yaml = tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.yaml')
+        self.test_yaml.write("memory_throttle_limit: 100MB\ncooldown_period: 120\n")
+        self.test_yaml.close()
+
+    def tearDown(self):
+        os.unlink(self.test_yaml.name)
+
+    def test_default_config_fallback(self):
+        """Ensures defaults apply when YAML is missing."""
+        config = SentryConfig("nonexistent.yaml")
+        self.assertEqual(config.memory_clamp_bytes, 52428800)
+        self.assertEqual(config.cooldown_seconds, 60)
+
+    def test_yaml_load_and_parse(self):
+        """Ensures strings like '100MB' map cleanly to raw bytes."""
+        config = SentryConfig(self.test_yaml.name)
+        self.assertEqual(config.memory_clamp_bytes, 104857600)  # 100MB in bytes
+        self.assertEqual(config.cooldown_seconds, 120)
+        
+    def test_legacy_get_api(self):
+        """Ensures the .get() method still functions for downstream modules."""
+        config = SentryConfig(self.test_yaml.name)
+        self.assertEqual(config.get("cooldown_period"), 120)
+        self.assertEqual(config.get("missing_key", "default_val"), "default_val")
+
+if __name__ == '__main__':
+    unittest.main()
+</file>
+
+<file path="README.md">
+# SENTRY
+
+**Context-Aware Kernel Resource Arbitration for Linux**
+
+[![Linux](https://img.shields.io/badge/Linux-Kernel%20%E2%89%A5%205.x-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://kernel.org)
+[![eBPF](https://img.shields.io/badge/eBPF-BCC-blue?style=for-the-badge)](https://github.com/iovisor/bcc)
+[![cgroup v2](https://img.shields.io/badge/cgroup-v2-E74C3C?style=for-the-badge)](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+[![License](https://img.shields.io/badge/License-MIT-2ECC71?style=for-the-badge)](#license)
+
+---
+
+## Overview
+
+SENTRY is a Ring‑0‑adjacent resource arbitration system for Linux. It closes the gap between two data planes that conventional schedulers keep separate: **kernel-space CPU accounting**, observed via an eBPF probe attached directly to the scheduler's `sched_switch` tracepoint, and **user-space spatial context** — specifically, which process the user is actually looking at right now.
+
+Standard CPU accounting (`top`, `ps`, cgroup CPU statistics) answers *how much* CPU time a process consumed. It cannot answer *whether that consumption should be tolerated*, because that judgment depends on information the kernel does not have: which window currently has focus. A compiler running at 100% CPU in the background is a non-issue. The same consumption pattern in the user's foreground application is the definition of a stutter.
+
+SENTRY closes that loop:
+
+1. An eBPF sensor (`core/bpf_sensor.py`) measures per-PID CPU consumption at the tracepoint level, independent of `/proc` polling intervals.
+2. A desktop telemetry bridge (`tools/desktop_bridge.py`) resolves the actively focused window's PID across X11, XWayland, and native Wayland compositors (Hyprland, Sway/i3, KDE Wayland), and streams it to the daemon over a local UDP channel.
+3. The daemon cross-references the two: processes exceeding the CPU threshold are throttled, *unless* they are the process currently in the user's foreground — in which case they are immune.
+4. A curses-based TUI (`tools/sentry_top.py`) exposes both data planes — the current spatial lock and the set of throttled PIDs — by polling the daemon over a second local UDP channel.
+
+---
+
+## Core Architecture
+
+### Pillar 1 — eBPF Kernel Sensor (`core/bpf_sensor.py`)
+
+`BPFSensor` compiles and injects a small C program into the kernel via BCC, attaching to the `sched_switch` scheduler tracepoint:
+
+```c
+TRACEPOINT_PROBE(sched, sched_switch) {
+    u32 prev_pid = args->prev_pid;
+    u32 next_pid = args->next_pid;
+    u64 ts = bpf_ktime_get_ns();
+    // accumulate on-CPU time for the outgoing PID, reset the clock for the incoming PID
+}
+```
+
+Two BPF hash maps live in kernel space:
+
+| Map | Key | Value | Purpose |
+|---|---|---|---|
+| `start_time` | PID | timestamp (ns) | Tracks when a PID was last scheduled onto a CPU |
+| `cpu_time` | PID | accumulated ns | Running total of on-CPU time between polling windows |
+
+`get_top_hogs(threshold_ns)` reads `cpu_time`, returns every PID that accumulated more than the threshold within the current window (500ms default), and **clears the map**, implementing a sliding-window measurement rather than a monotonic counter. This runs entirely at the tracepoint level — there is no `/proc` polling in the hot path of consumption measurement.
+
+### Pillar 2 — Universal Desktop Telemetry Bridge (`tools/desktop_bridge.py`)
+
+`UniversalDesktopResolver` detects the active session type and compositor via `XDG_SESSION_TYPE` / `XDG_CURRENT_DESKTOP`, and dispatches to the correct backend to resolve the focused window's owning PID:
+
+| Environment | Resolution method |
+|---|---|
+| Hyprland | `hyprctl activewindow -j` (native IPC) |
+| Sway / i3 | `swaymsg -t get_tree`, depth-first search for the focused node |
+| KDE Plasma (Wayland) | `kdotool`, with fallback to `xdotool` if unavailable |
+| X11 / XWayland / EWMH-compliant desktops | `xdotool getactivewindow` → `getwindowpid` |
+
+The bridge polls at a 300ms interval and transmits **only on a PID change** ("gaze shift"), emitting a single UDP datagram containing the raw PID to `127.0.0.1:50505`. This edge-triggered design keeps the telemetry channel idle during sustained focus on one window.
+
+### Pillar 3 — Kernel Enforcement (`SafetyGuard` / `CgroupManager`)
+
+The daemon consumes both signals to make an enforcement decision:
+
+- **`SafetyGuard`** maintains the current spatial lock (`active_foreground_pid`), sourced from the UDP telemetry bridge. Any PID matching the current spatial lock is granted immunity from throttling regardless of measured CPU consumption.
+- **`CgroupManager`** applies enforcement against non-immune PIDs that exceed the eBPF-measured threshold by writing a CPU cap into that process's cgroup v2 controller — referred to operationally as **the Penalty Box** — clamping the offending process to a fraction of a core rather than suspending or killing it. Enforcement is reversible: once a throttled PID's window expires, its cgroup limit is released.
+
+### Pillar 4 — Command Center TUI (`tools/sentry_top.py`)
+
+The daemon exposes its live state over a second UDP channel (`127.0.0.1:50506`). On receiving a `STATUS` datagram, it responds with a JSON snapshot:
+
+```json
+{
+  "spatial_pid": 41213,
+  "throttled_tasks": [
+    { "pid": 8842, "time_left": 12.4 }
+  ]
+}
+```
+
+`sentry_top.py` renders this via `curses` at a 10 FPS refresh rate: the current spatial lock under **Pillar 1: Spatial Context**, and every actively throttled PID with time remaining under **The Penalty Box**. The TUI degrades gracefully to a `DAEMON OFFLINE` state if the daemon is unreachable, rather than blocking on the socket.
+
+### Data Flow
+
+```
+                 ┌─────────────────────────┐
+                 │   Linux Kernel Scheduler  │
+                 │   (sched_switch trace)    │
+                 └────────────┬─────────────┘
+                              │ eBPF tracepoint probe
+                              ▼
+                 ┌─────────────────────────┐
+                 │      BPFSensor            │
+                 │  cpu_time / start_time    │
+                 │      BPF hash maps        │
+                 └────────────┬─────────────┘
+                              │ get_top_hogs()
+                              ▼
+   UDP :50505      ┌─────────────────────────┐      UDP :50506
+  ───────────────► │      SENTRY Daemon       │ ◄───────────────
+  Desktop Bridge    │  SafetyGuard ⇄ CgroupMgr │      sentry_top
+  (focused PID)     └────────────┬─────────────┘      (STATUS poll)
+                              │
+                              ▼
+                    cgroup v2 CPU clamp
+                    (Penalty Box, reversible)
+```
+
+---
+
+## Prerequisites & Installation
+
+### System Requirements
+
+- Linux kernel with `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, and tracepoint support enabled
+- Cgroups v2 unified hierarchy mounted at `/sys/fs/cgroup`
+- Root privileges (or `CAP_SYS_ADMIN` / `CAP_BPF`) — required to load BPF programs into the kernel
+- Python 3.8+
+
+### eBPF Toolchain (BCC)
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3-bpfcc linux-headers-$(uname -r) bpfcc-tools
+```
+
+Verify BCC can see kernel headers before proceeding:
+
+```bash
+sudo python3 -c "from bcc import BPF; print('BCC OK')"
+```
+
+### Desktop Bridge Dependencies
+
+The telemetry bridge shells out to the compositor-appropriate query tool. Install what matches your session:
+
+| Session | Package |
+|---|---|
+| X11 / XWayland | `xdotool` |
+| KDE Plasma (Wayland) | `kdotool` |
+| Hyprland | `hyprctl` (ships with Hyprland) |
+| Sway / i3 | `sway` / `i3` (ships `swaymsg`) |
+
+```bash
+sudo apt-get install -y xdotool
+```
+
+### Python Dependencies
+
+```bash
+git clone https://github.com/apexajay-rc/SENTRY.git
+cd SENTRY
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## Deployment / Usage
+
+SENTRY runs as three cooperating processes. The daemon must run as root (BPF program loading and cgroup writes both require elevated privileges); the bridge and TUI run in the user's session.
+
+**1. Start the Ring‑0 enforcement daemon:**
+
+```bash
+sudo .venv/bin/python3 -m daemon.main
+```
+
+**2. Start the desktop telemetry bridge**, from within the target graphical session (not over SSH — it must have access to the compositor):
+
+```bash
+python3 tools/desktop_bridge.py
+```
+
+**3. Launch the command center TUI** to observe enforcement in real time:
+
+```bash
+python3 tools/sentry_top.py
+```
+
+Press `Q` to exit the TUI. Terminating the bridge or the TUI has no effect on active enforcement; only the daemon owns the enforcement state.
+
+---
+
+## Current Capabilities
+
+- **Microsecond-resolution CPU accounting** via a kernel tracepoint probe, independent of `/proc` polling granularity.
+- **Dynamic CPU throttling** of processes that exceed a configurable CPU-time threshold within a sliding measurement window, enforced through cgroup v2 (the Penalty Box).
+- **Foreground immunity** — the process backing the currently focused window is exempt from throttling, resolved live across X11, XWayland, Hyprland, Sway/i3, and KDE Wayland.
+- **Reversible enforcement** — throttled processes are released once their penalty window expires; no process is killed or suspended.
+- **Zero-overhead spatial polling** — the desktop bridge transmits only on a focus change, not on a fixed interval, keeping idle CPU cost negligible.
+- **Live observability** via a dedicated UDP status channel and curses TUI, decoupled from the enforcement path itself.
+
+---
+
+## Architectural Roadmap
+
+The following represent the planned evolution of SENTRY's kernel-space enforcement surface. None of the items below are implemented in the current codebase; they are documented here as direction, not delivered capability.
+
+### Near Term — PSI-Aware Memory Defense
+
+- Subscribe to kernel **Pressure Stall Information** (`/proc/pressure/memory`) alongside the existing CPU tracepoint, giving SENTRY a second, independent signal for contention that CPU accounting alone cannot see.
+- Extend `CgroupManager` to apply `memory.high` limits against non-immune memory consumers when a PSI stall trigger fires, mirroring the existing CPU Penalty Box mechanism for memory pressure.
+- Blend PSI stall duration with eBPF CPU-time data into a single pressure score, rather than treating CPU and memory contention as independent triggers.
+
+### Medium Term — IPC Dependency Graphing
+
+- Attach eBPF probes to `connect`, `sendmsg`, and related syscalls to observe UNIX domain socket connections between processes.
+- Build a live dependency graph from observed IPC edges, so that a backend process feeding data to the user's foreground application inherits transitive immunity from the spatial lock, rather than being throttled as an apparently unrelated background task.
+- Extend `SafetyGuard` to walk this graph when evaluating immunity, instead of comparing only against the single `active_foreground_pid`.
+
+### Long Term — Hardware Topology Manipulation
+
+- Dynamic **core isolation**: reassign the foreground process's affinity to a reserved set of physical cores under sustained system-wide contention, insulating it from scheduler noise on shared cores.
+- **L3 cache allocation** via Intel RDT / AMD QoS extensions (where available), to prevent throttled background processes from evicting the foreground process's working set from shared cache — a form of contention CPU-time accounting alone cannot detect or mitigate.
+- Topology-aware placement that accounts for NUMA locality when assigning immunity-driven core reservations.
+
+---
+
+## License
+
+MIT. See `LICENSE` for details.
+</file>
+
+<file path="requirements.txt">
+psutil>=5.9.0
+PyYAML>=6.0
+</file>
+
+<file path="tmux_orchestrate.sh">
+#!/bin/bash
+# SENTRY Integration Test - 3-Pane tmux Orchestration
+# Run this script in a terminal to set up the test environment
+
+SESSION="sentry-test"
+
+# Kill any existing session
+tmux kill-session -t $SESSION 2>/dev/null
+
+# Create new session with Pane 1 (Daemon - needs sudo)
+tmux new-session -d -s $SESSION -n "DAEMON" "cd /home/maj-ajay/SENTRY && echo '=== PANE 1: SENTRY DAEMON (requires sudo) ===' && echo 'Starting in 3 seconds...' && sleep 3 && sudo .venv/bin/python daemon/main.py"
+
+# Split horizontally for Pane 2 (TUI - user)
+tmux split-window -h -t $SESSION:0 "cd /home/maj-ajay/SENTRY && echo '=== PANE 2: SENTRY TUI (user) ===' && echo 'Waiting for daemon...' && sleep 5 && .venv/bin/python tools/sentry_top.py"
+
+# Split vertically for Pane 3 (Attacker)
+tmux split-window -v -t $SESSION:0.0 "cd /home/maj-ajay/SENTRY && echo '=== PANE 3: ATTACKER (stress_test.sh Option 2) ===' && echo 'Waiting for daemon to start...' && sleep 7 && ./stress_test.sh <<< 2"
+
+# Select pane 1 and attach
+tmux select-pane -t $SESSION:0.0
+tmux attach-session -t $SESSION
+</file>
+
+<file path="core/psi_sensor.py">
+"""
+core/psi_sensor.py
+
+Native Linux Pressure Stall Information (PSI) reader.
+Detects memory starvation before the OOM-killer activates.
+"""
+
+import os
+from typing import Optional
+
+class PSISensor:
+    def __init__(self, threshold: float = 5.0) -> None:
+        self.threshold = threshold
+        self.psi_path = "/proc/pressure/memory"
+        self.is_supported = os.path.exists(self.psi_path)
+
+    def check_memory_pressure(self) -> bool:
+        """Returns True if memory 'some' avg10 exceeds the threshold."""
+        if not self.is_supported:
+            return False
+            
+        try:
+            with open(self.psi_path, "r") as f:
+                for line in f:
+                    if line.startswith("some"):
+                        # format: some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+                        parts = line.split()
+                        avg10_str = parts[1].split("=")[1]
+                        if float(avg10_str) >= self.threshold:
+                            return True
+                        break
+        except Exception:
+            return False
+            
+        return False
+
+    def find_largest_memory_hog(self) -> int:
+        """Rapidly scans /proc to find the process with the largest RSS."""
+        max_rss = 0
+        hog_pid = -1
+        
+        try:
+            for pid_str in os.listdir("/proc"):
+                if not pid_str.isdigit():
+                    continue
+                pid = int(pid_str)
+                try:
+                    with open(f"/proc/{pid}/statm", "r") as f:
+                        rss_pages = int(f.read().split()[1])
+                        if rss_pages > max_rss:
+                            max_rss = rss_pages
+                            hog_pid = pid
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+        except Exception:
+            pass
+                
+        return hog_pid
+</file>
+
+<file path="core/logger.py">
+"""
+core/logger.py
+
+Production-grade structured JSON logger for SENTRY.
+Renamed from 'logging.py' to avoid standard library namespace collisions in CI/CD.
+"""
+
+import logging
+import json
+import sys
+from datetime import datetime
+
+class SentryJSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "module": record.module
+        }
+        
+        # Inject custom audit fields if present
+        if hasattr(record, "pid"): log_record["pid"] = record.pid
+        if hasattr(record, "reason"): log_record["reason"] = record.reason
+        
+        return json.dumps(log_record)
+
+class StructuredLogger:
+    def __init__(self, name: str, level: int = logging.INFO):
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(level)
+        self.logger.propagate = False # Prevent duplicate stdout spam
+        
+        if not self.logger.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(SentryJSONFormatter())
+            self.logger.addHandler(handler)
+
+    def info(self, msg: str):
+        self.logger.info(msg)
+
+    def warning(self, msg: str):
+        self.logger.warning(msg)
+
+    def error(self, msg: str):
+        self.logger.error(msg)
+
+    def audit(self, action: str, pid: int, target: str, details: str):
+        """Dedicated method for Ring-0 mitigation tracking."""
+        extra = {"pid": pid, "reason": action, "details": details}
+        # In standard logging, passing extra injects attributes into the LogRecord
+        self.logger.warning(f"AUDIT_EVENT: {action} on {target} (PID: {pid}) - {details}", extra=extra)
+</file>
+
+<file path="tools/desktop_bridge.py">
+#!/usr/bin/env python3
+"""
+tools/desktop_bridge.py
+
+A universal user-space telemetry agent.
+Dynamically detects X11 vs. Wayland (KDE, Hyprland, Sway, GNOME) to locate
+the actively focused window PID and beam it to SENTRY's Ring 0 SafetyGuard.
+"""
+
+import os
+import subprocess
+import time
+import socket
+import logging
+import json
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+SENTRY_BRIDGE_SOCK = "/run/sentry_bridge.sock"
+
+class UniversalDesktopResolver:
+    def __init__(self):
+        self.session_type = os.environ.get("XDG_SESSION_TYPE", "x11").lower()
+        self.desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        logging.info(f"Environment Detected -> Session: [{self.session_type}], Desktop: [{self.desktop}]")
+
+    def get_active_pid(self):
+        """Routes the PID query to the correct compositor backend."""
+        try:
+            if "hyprland" in self.desktop:
+                return self._get_hyprland_pid()
+            elif "sway" in self.desktop or "i3" in self.desktop:
+                return self._get_sway_pid()
+            elif self.session_type == "wayland" and "kde" in self.desktop:
+                return self._get_kde_wayland_pid()
+            else:
+                # Fallback for X11, XWayland, and standard EWMH compliant desktops
+                return self._get_xdotool_pid()
+        except Exception:
+            return None
+
+    def _get_xdotool_pid(self):
+        """Standard X11 / XWayland query using xdotool."""
+        try:
+            win_id = subprocess.check_output(['xdotool', 'getactivewindow'], stderr=subprocess.DEVNULL).decode().strip()
+            pid = subprocess.check_output(['xdotool', 'getwindowpid', win_id], stderr=subprocess.DEVNULL).decode().strip()
+            return int(pid) if pid.isdigit() else None
+        except subprocess.CalledProcessError:
+            return None
+
+    def _get_kde_wayland_pid(self):
+        """KDE Plasma Wayland query using kdotool."""
+        try:
+            win_id = subprocess.check_output(['kdotool', 'getactivewindow'], stderr=subprocess.DEVNULL).decode().strip()
+            pid = subprocess.check_output(['kdotool', 'getwindowpid', win_id], stderr=subprocess.DEVNULL).decode().strip()
+            return int(pid) if pid.isdigit() else None
+        except FileNotFoundError:
+            logging.debug("kdotool not installed. Falling back to xdotool.")
+            return self._get_xdotool_pid()
+        except subprocess.CalledProcessError:
+            return None
+
+    def _get_hyprland_pid(self):
+        """Hyprland native IPC query via hyprctl."""
+        try:
+            output = subprocess.check_output(['hyprctl', 'activewindow', '-j'], stderr=subprocess.DEVNULL).decode()
+            data = json.loads(output)
+            pid = data.get("pid")
+            return int(pid) if pid and int(pid) > 0 else None
+        except Exception:
+            return None
+
+    def _get_sway_pid(self):
+        """Sway / i3 native IPC query via swaymsg."""
+        try:
+            output = subprocess.check_output(['swaymsg', '-t', 'get_tree'], stderr=subprocess.DEVNULL).decode()
+            tree = json.loads(output)
+            
+            # DFS search for the focused node
+            def find_focused(node):
+                if node.get("focused") and node.get("pid"):
+                    return node.get("pid")
+                for child in node.get("nodes", []) + node.get("floating_nodes", []):
+                    res = find_focused(child)
+                    if res: return res
+                return None
+                
+            pid = find_focused(tree)
+            return int(pid) if pid else None
+        except Exception:
+            return None
+
+def main():
+    print("=====================================================")
+    print("  SENTRY Universal Desktop Telemetry Bridge v2.0     ")
+    print("=====================================================")
+    
+    resolver = UniversalDesktopResolver()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    last_pid = None
+    
+    print(f"📡 Beaming spatial telemetry to SENTRY Unix Socket: {SENTRY_BRIDGE_SOCK}...\n")
+    
+    while True:
+        active_pid = resolver.get_active_pid()
+        
+        # Only beam a network packet if the user actually shifted their gaze
+        if active_pid and active_pid != last_pid:
+            try:
+                # Send datagram payload directly to the daemon's Unix socket
+                sock.sendto(str(active_pid).encode(), SENTRY_BRIDGE_SOCK)
+                logging.info(f"Gaze Shift Detected -> Active Foreground PID: {active_pid}")
+                last_pid = active_pid
+            except FileNotFoundError:
+                # Daemon is offline, suppress errors to avoid spamming the console
+                pass
+            except Exception as e:
+                logging.error(f"Failed to transmit heartbeat to SENTRY: {e}")
+                
+        time.sleep(0.3)  # 300ms polling rate (Zero measurable CPU overhead)
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="tools/sentry_top.py">
+#!/usr/bin/env python3
+"""
+tools/sentry_top.py
+
+A low-overhead, military-grade Terminal User Interface (TUI) for SENTRY.
+Communicates with the SENTRY Ring 0 Daemon via local Unix IPC to render a live
+dashboard of Spatial VIPs and tasks currently locked in the Penalty Box.
+"""
+
+import curses
+import socket
+import json
+import time
+import os
+
+SENTRY_HUD_SOCK = "/run/sentry_hud.sock"
+
+def get_process_name(pid):
+    """Attempt to resolve the process name for a cleaner UI."""
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            return f.read().strip()
+    except Exception:
+        return "UNKNOWN"
+
+def fetch_sentry_state(sock):
+    """Pings the SENTRY daemon for a brain-dump."""
+    try:
+        sock.sendto(b"STATUS", SENTRY_HUD_SOCK)
+        data, _ = sock.recvfrom(4096)
+        return json.loads(data.decode())
+    except (socket.timeout, ConnectionRefusedError, FileNotFoundError):
+        return None
+
+def draw_hud(stdscr):
+    # Setup curses environment
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN, -1)   # Success / Active
+    curses.init_pair(2, curses.COLOR_RED, -1)     # Danger / Penalty
+    curses.init_pair(3, curses.COLOR_CYAN, -1)    # Headers
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)  # Warnings
+
+    curses.curs_set(0) # Hide the cursor
+    stdscr.nodelay(True) # Make getch() non-blocking
+
+    # Create a unique transient client socket for this TUI instance
+    client_sock_path = f"/tmp/sentry_top_client_{os.getpid()}.sock"
+    if os.path.exists(client_sock_path):
+        os.unlink(client_sock_path)
+        
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(client_sock_path)
+    sock.settimeout(0.2) # Don't block the UI if SENTRY is offline
+
+    try:
+        while True:
+            # Handle Exit
+            key = stdscr.getch()
+            if key == ord('q') or key == ord('Q'):
+                break
+
+            stdscr.erase()
+            max_y, max_x = stdscr.getmaxyx()
+
+            state = fetch_sentry_state(sock)
+
+            # --- HEADER ---
+            header_text = " SENTRY RING-0 COMMAND CENTER "
+            stdscr.addstr(1, max_x // 2 - len(header_text) // 2, header_text, curses.color_pair(3) | curses.A_BOLD)
+            stdscr.addstr(2, 2, "-" * (max_x - 4), curses.color_pair(3))
+
+            if state is None:
+                err_msg = "[!] DAEMON OFFLINE OR UNREACHABLE"
+                stdscr.addstr(4, max_x // 2 - len(err_msg) // 2, err_msg, curses.color_pair(2) | curses.A_BOLD)
+                stdscr.addstr(5, max_x // 2 - 24, "Ensure 'sudo python3 -m daemon.main' is running.")
+            else:
+                # --- PILLAR 1: SPATIAL CONTEXT ---
+                spatial_pid = state.get("spatial_pid")
+                stdscr.addstr(4, 4, "PILLAR 1: SPATIAL CONTEXT (FLOW STATE GUARD)", curses.color_pair(3) | curses.A_BOLD)
+                
+                if spatial_pid:
+                    proc_name = get_process_name(spatial_pid)
+                    stdscr.addstr(6, 6, f"Target Lock: [ PID {spatial_pid} ] -> {proc_name}", curses.color_pair(1) | curses.A_BOLD)
+                    stdscr.addstr(7, 6, "Status: ABSOLUTE IMMUNITY GRANTED", curses.color_pair(1))
+                else:
+                    stdscr.addstr(6, 6, "Target Lock: [ NONE ]", curses.color_pair(4))
+
+                # --- THE PENALTY BOX ---
+                stdscr.addstr(10, 4, "THE PENALTY BOX (20% CPU CLAMP)", curses.color_pair(3) | curses.A_BOLD)
+                
+                throttled_tasks = state.get("throttled_tasks", [])
+                
+                if not throttled_tasks:
+                    stdscr.addstr(12, 6, "Box is empty. System state nominal.", curses.color_pair(1))
+                else:
+                    # Table Header
+                    stdscr.addstr(12, 6, f"{'PID':<10} | {'COMMAND':<15} | {'TIME REMAINING':<15}", curses.color_pair(4) | curses.A_BOLD)
+                    stdscr.addstr(13, 6, "-" * 50)
+                    
+                    row = 14
+                    for task in throttled_tasks:
+                        pid = task.get("pid")
+                        time_left = task.get("time_left", 0)
+                        proc_name = get_process_name(pid)
+                        
+                        stdscr.addstr(row, 6, f"{pid:<10} | {proc_name:<15} | {time_left:>4.1f} sec", curses.color_pair(2))
+                        row += 1
+                        if row >= max_y - 2:
+                            break # Prevent UI overflow
+
+            # --- FOOTER ---
+            footer_text = "Press 'Q' to exit"
+            stdscr.addstr(max_y - 2, max_x - len(footer_text) - 2, footer_text, curses.color_pair(3))
+
+            stdscr.refresh()
+            time.sleep(0.1) # 10FPS refresh rate (Zero overhead)
+            
+    finally:
+        sock.close()
+        if os.path.exists(client_sock_path):
+            os.unlink(client_sock_path)
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(draw_hud)
+    except KeyboardInterrupt:
+        pass
+</file>
+
+<file path="stress_test.sh">
+#!/bin/bash
+# SENTRY Stress Test Script
+# Option 2: CPU Hog (stress-ng CPU workers)
+
+echo "============================================"
+echo "  SENTRY STRESS TEST - Option 2: CPU HOG"
+echo "============================================"
+echo ""
+echo "This will spawn 4 CPU-intensive workers using stress-ng."
+echo "They will consume 100% CPU on 4 cores for 60 seconds."
+echo ""
+echo "Expected SENTRY behavior:"
+echo "  1. Daemon (daemon/main.py) should log: 'Throttling CPU hog PID: <PID>'"
+echo "  2. TUI (tools/sentry_top.py) should show stress-ng workers in 'PENALTY BOX' with 20% CPU clamp"
+echo ""
+echo "Starting stress-ng in 3 seconds... (Ctrl+C to cancel)"
+sleep 3
+
+# Spawn 4 CPU workers for 60 seconds
+stress-ng --cpu 4 --timeout 60s --metrics-brief
+
+echo ""
+echo "Stress test complete. SENTRY should have released the throttles after cooldown (~60s)."
+</file>
+
+<file path="sensor.bpf.c">
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+// 1. Data Payload: Report TGID, comm, and accumulated CPU time
+struct event_t {
+    u32 tgid;
+    char comm[16];
+    u64 cpu_time_ns;
+};
+
+// 2. Per-TGID CPU time accumulator (updated on every sched_switch OUT)
+BPF_HASH(cpu_time, u32, u64);
+
+// 3. Ring buffer for high-consumption events
+BPF_RINGBUF_OUTPUT(events, 256);
+
+// 4. Per-TID last-seen timestamp (start time when switched IN)
+BPF_HASH(start_time, u32, u64);
+
+// Threshold: report if a TGID accumulates > 50ms in one scheduling window
+#define REPORT_THRESHOLD_NS 50000000ULL
+
+TRACEPOINT_PROBE(sched, sched_switch) {
+    u64 now = bpf_ktime_get_ns();
+
+    // --- Outgoing task (prev) ---
+    u64 prev_pid_tgid = bpf_get_current_pid_tgid();
+    u32 prev_tid = prev_pid_tgid;
+    u32 prev_tgid = prev_pid_tgid >> 32;
+
+    if (prev_tid > 0 && prev_tgid > 0) {
+        u64 *start = start_time.lookup(&prev_tid);
+        if (start != 0) {
+            u64 delta = now - *start;
+
+            u64 zero = 0;
+            u64 *total = cpu_time.lookup_or_try_init(&prev_tgid, &zero);
+            if (total) {
+                *total += delta;
+            }
+            start_time.delete(&prev_tid);
+        }
+    }
+
+    // --- Incoming task (next) ---
+    u32 next_tid = args->next_pid;
+    if (next_tid > 0) {
+        start_time.update(&next_tid, &now);
+    }
+
+    return 0;
+}
+</file>
+
+<file path="core/safety_guard.py">
+"""
+core/safety_guard.py
+
+Zero-Trust Policy Engine.
+Defines strict system boundaries to prevent SENTRY auto-immune deadlocks.
+
+CRITICAL FIX: On error reading /proc, return False (NOT immune).
+The old code returned True on error, granting immunity to unreadable processes.
+"""
+
+import os
+
+class SafetyGuard:
+    def __init__(self) -> None:
+        # Critical system infrastructure that must NEVER be throttled
+        # Use exact 15-char comm names (Linux truncates to 15)
+        self.infrastructure_immunity = {
+            "systemd", "dbus-daemon", "Xorg", "wayland", "sway",
+            "hyprland", "gnome-shell", "kwin_wayland",
+            "xdg-desktop-po", "xdg-document-po",
+            "docker", "containerd", "dockerd", "grafana",
+            "sshd", "pipewire", "wireplumber", "pulseaudio",
+            "sentry", "python3",
+            "firefox", "chrome", "chromium", "brave",
+            "gnome-terminal", "alacritty", "kitty", "wezterm",
+        }
+
+    def is_immune(self, pid: int) -> bool:
+        """Return True if process should NEVER be throttled."""
+        if pid <= 0:
+            return True
+
+        try:
+            # 1. Primary check: comm name (15 chars max)
+            with open(f"/proc/{pid}/comm", "r") as f:
+                comm = f.read().strip()
+
+            if comm in self.infrastructure_immunity:
+                return True
+
+            # 2. Deep check: cmdline for browser children (Web Content, GPU, etc.)
+            with open(f"/proc/{pid}/cmdline", "r") as f:
+                cmdline = f.read().replace('\0', ' ').lower()
+
+            critical_parents = ["firefox", "chrome", "chromium", "brave", "code", "cursor"]
+            for app in critical_parents:
+                if app in cmdline:
+                    return True
+
+            return False
+
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            # CRITICAL FIX: On ANY error (process gone, no perms, etc.),
+            # return False (NOT immune). 
+            # Old code returned True, granting immunity to ghosts/malware.
+            return False
+</file>
+
+<file path="core/cgroup_manager.py">
+"""
+core/cgroup_manager.py
+
+Native Cgroups v2 enforcement with PID recycling defense.
+Verifies writes and falls back to scheduler priority if cgroups unavailable.
+"""
+
+import os
+import time
+from typing import Optional, Dict, Tuple, List, Any
+
+class CgroupManager:
+    def __init__(self, logger: Any) -> None:
+        self.logger = logger
+        # {pid: (kernel_start_ticks, expiration_timestamp)}
+        self.throttled_tasks: Dict[int, Tuple[int, float]] = {}
+
+    def _get_cgroup_v2_path(self, pid: int) -> Optional[str]:
+        """Dynamically locate a process's cgroup v2 path."""
+        try:
+            with open(f"/proc/{pid}/cgroup", "r") as f:
+                for line in f:
+                    if line.startswith("0::"):
+                        cgroup_path = line.strip().split("0::")[1]
+                        return f"/sys/fs/cgroup{cgroup_path}"
+        except Exception:
+            return None
+        return None
+
+    def _get_process_start_time(self, pid: int) -> Optional[int]:
+        """Read /proc/[pid]/stat field 22 (starttime) for PID recycling defense."""
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                stat_data = f.read()
+            comm_end = stat_data.rindex(")")
+            fields = stat_data[comm_end + 1:].split()
+            return int(fields[19])  # Field 22 (1-indexed) = index 19 (0-indexed after comm)
+        except Exception:
+            return None
+
+    def register_throttle(self, pid: int, unlock_time: float) -> bool:
+        """Record a throttle event locked to the process's unique kernel boot tick."""
+        start_time = self._get_process_start_time(pid)
+        if start_time is None:
+            return False
+        self.throttled_tasks[pid] = (start_time, unlock_time)
+        return True
+
+    def is_throttled(self, pid: int) -> bool:
+        """Check if PID is actively throttled, defending against PID recycling."""
+        if pid not in self.throttled_tasks:
+            return False
+
+        recorded_start, _ = self.throttled_tasks[pid]
+        current_start = self._get_process_start_time(pid)
+
+        # Process exited or PID recycled
+        if current_start is None or current_start != recorded_start:
+            del self.throttled_tasks[pid]
+            return False
+
+        return True
+
+    def reconcile_cooldowns(self, current_time: float) -> None:
+        """Release expired throttles and purge recycled PIDs."""
+        to_release: List[int] = []
+        to_purge: List[int] = []
+
+        for pid, (start_time, unlock_time) in list(self.throttled_tasks.items()):
+            current_start = self._get_process_start_time(pid)
+            if current_start is None or current_start != start_time:
+                to_purge.append(pid)
+                continue
+
+            if current_time >= unlock_time:
+                to_release.append(pid)
+
+        for pid in to_purge:
+            self.throttled_tasks.pop(pid, None)
+
+        for pid in to_release:
+            self.release_memory_throttle(pid)
+            self.release_cpu_throttle(pid)
+            self.throttled_tasks.pop(pid, None)
+
+    def _verify_write(self, path: str, expected: str) -> bool:
+        """Verify a cgroup file write by reading it back."""
+        try:
+            with open(path, "r") as f:
+                actual = f.read().strip()
+            return actual == expected.strip()
+        except Exception:
+            return False
+
+    def apply_memory_throttle(self, pid: int, limit_bytes: int) -> None:
+        """Apply memory.high clamp via native file writes."""
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if not cgroup_path:
+            self.logger.warning(f"Could not resolve cgroup for PID {pid}. Falling back to scheduler.")
+            self._apply_scheduler_fallback(pid)
+            return
+
+        mem_high_path = os.path.join(cgroup_path, "memory.high")
+        limit_str = str(limit_bytes)
+
+        try:
+            with open(mem_high_path, "w") as f:
+                f.write(limit_str)
+
+            if not self._verify_write(mem_high_path, limit_str):
+                raise IOError(f"Write verification failed for {mem_high_path}")
+
+            self.logger.audit("CLAMP_MEMORY", pid, cgroup_path, f"Limit set to {limit_bytes} bytes")
+        except PermissionError:
+            self.logger.error(f"Permission denied writing to {mem_high_path}")
+            self._apply_scheduler_fallback(pid)
+        except Exception as e:
+            self.logger.warning(f"Cgroup memory write failed: {e}. Executing fallback.")
+            self._apply_scheduler_fallback(pid)
+
+    def release_memory_throttle(self, pid: int) -> None:
+        """Restore memory.high to max."""
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if cgroup_path:
+            mem_high_path = os.path.join(cgroup_path, "memory.high")
+            try:
+                with open(mem_high_path, "w") as f:
+                    f.write("max")
+            except Exception:
+                pass
+        self._release_scheduler_fallback(pid)
+
+    def apply_cpu_throttle(self, pid: int, quota_pct: int = 20) -> None:
+        """
+        Apply cpu.max clamp.
+        quota_pct: percentage of ONE CPU core (e.g., 20 = 20% of one core).
+        cpu.max format: "quota period" where quota/period = CPU fraction.
+        period default = 100000us. quota = quota_pct * 1000.
+        """
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if not cgroup_path:
+            self.logger.warning(f"Could not resolve cgroup for PID {pid}. Falling back to OS scheduler.")
+            self._apply_scheduler_fallback(pid)
+            return
+
+        cpu_max_path = os.path.join(cgroup_path, "cpu.max")
+        period = 100000
+        quota = quota_pct * 1000  # 20% -> 20000us per 100000us period
+        value = f"{quota} {period}"
+
+        try:
+            with open(cpu_max_path, "w") as f:
+                f.write(value)
+
+            if not self._verify_write(cpu_max_path, value):
+                raise IOError(f"Write verification failed for {cpu_max_path}")
+
+            self.logger.audit("CLAMP_CPU", pid, cgroup_path, f"Limit set to {quota_pct}%")
+        except Exception as e:
+            self.logger.warning(f"Cgroup CPU write failed: {e}. Executing fallback.")
+            self._apply_scheduler_fallback(pid)
+
+    def release_cpu_throttle(self, pid: int) -> None:
+        """Restore cpu.max to max."""
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if cgroup_path:
+            cpu_max_path = os.path.join(cgroup_path, "cpu.max")
+            try:
+                with open(cpu_max_path, "w") as f:
+                    f.write("max 100000")
+                self.logger.info(f"Released CPU clamp for PID {pid}")
+            except Exception:
+                pass
+        self._release_scheduler_fallback(pid)
+
+    def _apply_scheduler_fallback(self, pid: int) -> None:
+        """Native OS syscall fallback if cgroups are locked by systemd."""
+        try:
+            os.setpriority(os.PRIO_PROCESS, pid, 19)
+            self.logger.audit("CLAMP_CPU_SCHEDULER", pid, "OS", "Priority reduced to +19")
+        except Exception:
+            pass
+
+    def _release_scheduler_fallback(self, pid: int) -> None:
+        try:
+            os.setpriority(os.PRIO_PROCESS, pid, 0)
+        except Exception:
+            pass
+
+    def release_all(self) -> None:
+        """Emergency release for daemon shutdown."""
+        for pid in list(self.throttled_tasks.keys()):
+            self.release_memory_throttle(pid)
+            self.release_cpu_throttle(pid)
+        self.throttled_tasks.clear()
+</file>
+
+<file path="core/bpf_sensor.py">
+"""
+core/bpf_sensor.py
+
+eBPF CPU Profiler using sched_switch tracepoint.
+Tracks per-TGID CPU time with per-TID start timestamps.
+"""
+
+import sys
+
+sys.path.append("/usr/lib/python3/dist-packages")
+
+try:
+    from bcc import BPF
+except ImportError as e:
+    print(f"CRITICAL [BPF]: BCC module not found. {e}", flush=True)
+    sys.exit(1)
+
+# eBPF program - tables accessed by name string
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+// Per-TID start timestamp (when task was scheduled in)
+BPF_HASH(start_time, u32, u64);
+
+// Per-TGID accumulated CPU time (ns) in current window
+BPF_HASH(tgid_cpu_time, u32, u64);
+
+TRACEPOINT_PROBE(sched, sched_switch) {
+    u64 ts = bpf_ktime_get_ns();
+
+    // 1. Task switching OUT (prev task)
+    // At tracepoint entry, current task is the PREV task
+    u64 prev_pid_tgid = bpf_get_current_pid_tgid();
+    u32 prev_tid = (u32)prev_pid_tgid;
+    u32 prev_tgid = prev_pid_tgid >> 32;
+
+    if (prev_tid > 0) {
+        u64 *start = start_time.lookup(&prev_tid);
+        if (start != 0) {
+            u64 delta = ts - *start;
+
+            // Accumulate to prev_tgid
+            u64 zero = 0;
+            u64 *total = tgid_cpu_time.lookup_or_try_init(&prev_tgid, &zero);
+            if (total) {
+                *total += delta;
+            }
+            start_time.delete(&prev_tid);
+        }
+    }
+
+    // 2. Task switching IN (next task)
+    u32 next_tid = args->next_pid;
+    if (next_tid > 0) {
+        start_time.update(&next_tid, &ts);
+    }
+
+    return 0;
+}
+"""
+
+class BPFSensor:
+    def __init__(self):
+        self.b = None
+
+    def start(self):
+        """Compile and attach the eBPF program."""
+        try:
+            self.b = BPF(text=bpf_text)
+            print("=> ✅ eBPF Profiler attached to sched_switch tracepoint.", flush=True)
+        except Exception as e:
+            print(f"❌ [CRITICAL] BPF Compilation/Attach failed: {e}", flush=True)
+            raise
+
+    def get_top_hogs(self, threshold_ns=50_000_000):
+        """
+        Read accumulated CPU time per TGID.
+        Returns (list_of_hog_tgids, max_cpu_time_ns).
+        """
+        if not self.b:
+            return [], 0
+
+        hog_pids = set()
+        max_time_ns = 0
+
+        try:
+            # Access table by name using get_table()
+            cpu_time = self.b.get_table("tgid_cpu_time")
+            items = list(cpu_time.items())
+
+            for k, v in items:
+                tgid = k.value
+                total_ns = v.value
+
+                if total_ns > max_time_ns:
+                    max_time_ns = total_ns
+
+                if total_ns > threshold_ns and tgid > 0:
+                    hog_pids.add(tgid)
+
+                # Clear for next window
+                try:
+                    del cpu_time[k]
+                except KeyError:
+                    pass
+
+            return list(hog_pids), max_time_ns
+
+        except Exception as e:
+            print(f"❌ [BPF ERROR] Loop crashed: {e}", flush=True)
+            return [], 0
+</file>
+
+<file path="daemon/main.py">
+#!/usr/bin/env python3
+"""
+daemon/main.py
+
+The Basecamp Architecture for SENTRY.
+Restored to pure, flawless user-space polling with beautiful live telemetry.
+"""
+
+import sys
+import os
+import time
+import signal
+import socket
+import json
+import psutil
+from typing import Optional, Any
+
+# IMMEDIATE PRIORITY ELEVATION: Prevent SENTRY from being starved by hogs
+try:
+    os.nice(-20)
+except Exception:
+    pass
+
+from core.logger import StructuredLogger
+from core.cgroup_manager import CgroupManager
+from core.safety_guard import SafetyGuard
+from core.psi_sensor import PSISensor
+from core.config import SentryConfig
+
+class ProcSensor:
+    """The flawless, kernel-agnostic Basecamp CPU profiler."""
+    def __init__(self):
+        self.procs = {}
+        self.tick_count = 0
+
+    def get_top_hogs(self, threshold=85.0):
+        self.tick_count += 1
+        hogs = []
+        max_cpu = 0.0
+        
+        # Every 10 ticks, refresh the process list completely to catch new spawns and drop dead ones
+        if self.tick_count % 10 == 0:
+            current_pids = set(psutil.pids())
+            dead_pids = set(self.procs.keys()) - current_pids
+            for pid in dead_pids:
+                del self.procs[pid]
+
+        for pid in psutil.pids():
+            try:
+                if pid not in self.procs:
+                    p = psutil.Process(pid)
+                    p.cpu_percent() # Prime the psutil counter
+                    self.procs[pid] = p
+                else:
+                    # psutil natively aggregates all thread CPU usage into this single Process ID call
+                    cpu = self.procs[pid].cpu_percent()
+                    if cpu > max_cpu:
+                        max_cpu = cpu
+                    if cpu > threshold:
+                        hogs.append(pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                if pid in self.procs:
+                    del self.procs[pid]
+            except Exception:
+                pass
+                
+        return hogs, max_cpu
+
+class SentryDaemon:
+    def __init__(self) -> None:
+        self.logger = StructuredLogger(name="SENTRY_DAEMON")
+        self.config = SentryConfig("sentry_config.yaml")
+        self.mem_clamp_bytes = self.config.memory_clamp_bytes
+        self.cooldown_sec = self.config.cooldown_seconds
+        
+        self.cgroup_mgr = CgroupManager(self.logger)
+        self.safety_guard = SafetyGuard()
+        self.psi_sensor = PSISensor(threshold=5.0)
+        self.proc_sensor = ProcSensor()
+        
+        self.spatial_pid: Optional[int] = None
+        self.bridge_sock_path = "/run/sentry_bridge.sock"
+        self.hud_sock_path = "/run/sentry_hud.sock"
+        
+        self._cleanup_sockets()
+
+        # IPC Sockets
+        self.bridge_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.bridge_sock.bind(self.bridge_sock_path)
+        os.chmod(self.bridge_sock_path, 0o666)  
+        self.bridge_sock.setblocking(False)
+
+        self.hud_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.hud_sock.bind(self.hud_sock_path)
+        os.chmod(self.hud_sock_path, 0o666)  
+        self.hud_sock.setblocking(False)
+        
+        self.running = True
+        signal.signal(signal.SIGTERM, self.shutdown)
+        signal.signal(signal.SIGINT, self.shutdown)
+
+    def _cleanup_sockets(self) -> None:
+        for path in [self.bridge_sock_path, self.hud_sock_path]:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def _sd_notify(self, state: str) -> None:
+        notify_socket = os.environ.get('NOTIFY_SOCKET')
+        if not notify_socket:
+            return
+        if notify_socket.startswith('@'):
+            notify_socket = '\0' + notify_socket[1:]
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.sendto(state.encode(), notify_socket) # type: ignore
+        except Exception:
+            pass
+
+    def _process_ipc(self, now: float) -> None:
+        """Safe, non-blocking read to absolutely prevent freeze loops."""
+        try:
+            data, _ = self.bridge_sock.recvfrom(1024)
+            pid_str = data.decode().strip()
+            if pid_str.isdigit():
+                self.spatial_pid = int(pid_str)
+        except OSError:
+            pass 
+
+        try:
+            data, addr = self.hud_sock.recvfrom(1024)
+            if data == b"STATUS" and addr:
+                throttled = []
+                if hasattr(self.cgroup_mgr, 'throttled_tasks'):
+                    for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
+                        throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
+                
+                state = {
+                    "spatial_pid": self.spatial_pid,
+                    "throttled_tasks": throttled
+                }
+                self.hud_sock.sendto(json.dumps(state).encode(), addr)
+        except OSError:
+            pass
+
+    def shutdown(self, signum: Any = None, frame: Any = None) -> None:
+        print("\n=> 🛑 SIGTERM/SIGINT received. Releasing all hardware locks...", flush=True)
+        self.running = False
+        self._sd_notify("STOPPING=1")
+        self.cgroup_mgr.release_all()
+        try:
+            self.bridge_sock.close()
+            self.hud_sock.close()
+            self._cleanup_sockets()
+        except Exception:
+            pass
+        print("=> ✅ SENTRY going dark. System restored to default scheduler.", flush=True)
+        sys.exit(0)
+
+    def run(self) -> None:
+        print("\n" + "="*60, flush=True)
+        print(" 🛡️  SENTRY RING-0 COMMAND DAEMON ONLINE (BASECAMP) ", flush=True)
+        print("="*60 + "\n", flush=True)
+        
+        self._sd_notify("READY=1\nSTATUS=SENTRY Basecamp Daemon online.")
+        print("=> ✅ High-Speed PSUtil Profiler armed.", flush=True)
+        
+        if not self.psi_sensor.is_supported:
+            print("=> ⚠️  Kernel PSI not detected. Memory defenses disabled.", flush=True)
+        
+        while self.running:
+            try:
+                now = time.time()
+                
+                self._process_ipc(now)
+                self.cgroup_mgr.reconcile_cooldowns(now)
+                
+                action_taken = False
+                
+                # 1. CPU Defense (Basecamp proc polling)
+                # psutil cpu_percent > 85.0 means it is burning almost an entire core
+                top_cpu_hogs, max_cpu = self.proc_sensor.get_top_hogs(threshold=85.0)
+                
+                for pid in top_cpu_hogs:
+                    if not self.cgroup_mgr.is_throttled(pid):
+                        if pid == self.spatial_pid:
+                            pass # Spatial Immunity
+                        elif not os.path.exists(f"/proc/{pid}"):
+                            pass # Prevent ghosts
+                        elif not self.safety_guard.is_immune(pid):
+                            action_taken = True
+                            print(f"\n🚨 => ACTION: Throttling CPU hog (PID {pid}). cpu.slice set to low, cpu.max clamped to 20%.", flush=True)
+                            self.cgroup_mgr.apply_cpu_throttle(pid, 20)
+                            self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec)
+                
+                # 2. Memory Defense (PSI)
+                if self.psi_sensor.check_memory_pressure():
+                    hog_pid = self.psi_sensor.find_largest_memory_hog()
+                    if hog_pid > 0 and not self.cgroup_mgr.is_throttled(hog_pid):
+                        if hog_pid != self.spatial_pid and os.path.exists(f"/proc/{hog_pid}") and not self.safety_guard.is_immune(hog_pid):
+                            action_taken = True
+                            print(f"\n🚨 => ACTION: Memory starvation detected. memory.high clamped to {self.mem_clamp_bytes} bytes for PID {hog_pid}.", flush=True)
+                            self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
+                            self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec)
+                
+                # --- The Continuous Aesthetic Logging ---
+                if not hasattr(self, '_last_print') or now - self._last_print > 3.0:
+                    if not action_taken and not self.cgroup_mgr.throttled_tasks:
+                        print(f"✨ [SYSTEM NOMINAL] No action needed. Nothing is happening now. (Max CPU Load: {max_cpu:.1f}%)", flush=True)
+                    self._last_print = now
+                
+                self._sd_notify("WATCHDOG=1")
+                time.sleep(0.2)  # 200ms
+                
+            except Exception as e:
+                print(f"\n❌ [CRITICAL LOOP ERROR]: {e}", flush=True)
+                time.sleep(2)
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print("FATAL: SENTRY must be executed with root privileges (sudo).")
+        sys.exit(1)
+        
+    daemon = SentryDaemon()
+    daemon.run()
+</file>
+
+</files>
