@@ -4,6 +4,7 @@ daemon/main.py
 
 The Basecamp Architecture for SENTRY.
 Restored to pure, flawless user-space polling with beautiful live telemetry.
+Secured IPC sockets via SUDO_UID to prevent unprivileged PID spoofing.
 """
 
 import sys
@@ -87,15 +88,28 @@ class SentryDaemon:
         # IPC Sockets
         self.bridge_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.bridge_sock.bind(self.bridge_sock_path)
-        os.chmod(self.bridge_sock_path, 0o666)  
         self.bridge_sock.setblocking(False)
 
         self.hud_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.hud_sock.bind(self.hud_sock_path)
-        os.chmod(self.hud_sock_path, 0o666)  
         self.hud_sock.setblocking(False)
         
+        # SECURE SENTRY IPC: Restrict socket access to root and the active desktop user.
+        # Prevents unprivileged malware (e.g., www-data) from spoofing the foreground PID.
+        try:
+            sudo_uid = os.environ.get("SUDO_UID")
+            if sudo_uid and sudo_uid.isdigit():
+                sudo_uid_int = int(sudo_uid)
+                sudo_gid_int = int(os.environ.get("SUDO_GID", sudo_uid))
+                os.chown(self.bridge_sock_path, sudo_uid_int, sudo_gid_int)
+                os.chown(self.hud_sock_path, sudo_uid_int, sudo_gid_int)
+            os.chmod(self.bridge_sock_path, 0o660)
+            os.chmod(self.hud_sock_path, 0o660)
+        except Exception as e:
+            self.logger.warning(f"Could not secure IPC sockets: {e}")
+        
         self.running = True
+        self.observe_only = False
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
@@ -130,17 +144,23 @@ class SentryDaemon:
 
         try:
             data, addr = self.hud_sock.recvfrom(1024)
-            if data == b"STATUS" and addr:
-                throttled = []
-                if hasattr(self.cgroup_mgr, 'throttled_tasks'):
-                    for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
-                        throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
-                
-                state = {
-                    "spatial_pid": self.spatial_pid,
-                    "throttled_tasks": throttled
-                }
-                self.hud_sock.sendto(json.dumps(state).encode(), addr)
+            if data and addr:
+                cmd = data.decode().strip()
+                if cmd == "STATUS":
+                    throttled = []
+                    if hasattr(self.cgroup_mgr, 'throttled_tasks'):
+                        for t_pid, (s_time, exp) in self.cgroup_mgr.throttled_tasks.items():
+                            throttled.append({"pid": t_pid, "time_left": max(0.0, float(exp - now))})
+                    
+                    state = {
+                        "spatial_pid": self.spatial_pid,
+                        "throttled_tasks": throttled,
+                        "observe_only": self.observe_only
+                    }
+                    self.hud_sock.sendto(json.dumps(state).encode(), addr)
+                elif cmd == "TOGGLE_OBSERVE":
+                    self.observe_only = not self.observe_only
+                    print(f"\n=> ⚙️ SENTRY Mode Changed: Observe Only = {self.observe_only}", flush=True)
         except OSError:
             pass
 
@@ -193,24 +213,29 @@ class SentryDaemon:
                             pass # Prevent ghosts
                         elif not self.safety_guard.is_immune(pid):
                             action_taken = True
-                            print(f"\n🚨 => ACTION: Throttling CPU hog (PID {pid}). cpu.slice set to low, cpu.max clamped to 20%.", flush=True)
-                            
-                            # TOCTOU FIX: apply_cpu_throttle securely grabs the boot tick BEFORE writing
-                            start_tick = self.cgroup_mgr.apply_cpu_throttle(pid, 20)
-                            if start_tick is not None:
-                                self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec, start_tick)
+                            if self.observe_only:
+                                print(f"\n[OBSERVE ONLY] Would throttle CPU hog (PID {pid}).", flush=True)
+                            else:
+                                print(f"\n🚨 => ACTION: Throttling CPU hog (PID {pid}). cpu.slice set to low, cpu.max clamped to 20%.", flush=True)
+                                start_tick = self.cgroup_mgr.apply_cpu_throttle(pid, 20)
+                                if start_tick is not None:
+                                    self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec, start_tick)
                 
                 # 2. Memory Defense (PSI)
                 if self.psi_sensor.check_memory_pressure():
-                    hog_pid = self.psi_sensor.find_largest_memory_hog()
+                    # Optimization: Pass psutil's already-cached PIDs to avoid an I/O storm on /proc
+                    candidate_pids = list(self.proc_sensor.procs.keys())
+                    hog_pid = self.psi_sensor.find_largest_memory_hog(candidate_pids)
                     if hog_pid > 0 and not self.cgroup_mgr.is_throttled(hog_pid):
                         if hog_pid != self.spatial_pid and os.path.exists(f"/proc/{hog_pid}") and not self.safety_guard.is_immune(hog_pid):
                             action_taken = True
-                            print(f"\n🚨 => ACTION: Memory starvation detected. memory.high clamped to {self.mem_clamp_bytes} bytes for PID {hog_pid}.", flush=True)
-                            
-                            start_tick = self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
-                            if start_tick is not None:
-                                self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec, start_tick)
+                            if self.observe_only:
+                                print(f"\n[OBSERVE ONLY] Would clamp memory hog PID {hog_pid} to {self.mem_clamp_bytes} bytes.", flush=True)
+                            else:
+                                print(f"\n🚨 => ACTION: Memory starvation detected. memory.high clamped to {self.mem_clamp_bytes} bytes for PID {hog_pid}.", flush=True)
+                                start_tick = self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
+                                if start_tick is not None:
+                                    self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec, start_tick)
                 
                 # --- The Continuous Aesthetic Logging ---
                 if not hasattr(self, '_last_print') or now - self._last_print > 3.0:

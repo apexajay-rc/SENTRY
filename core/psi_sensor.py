@@ -9,7 +9,7 @@ import os
 from typing import Optional
 
 class PSISensor:
-    def __init__(self, threshold: float = 5.0) -> None:
+    def __init__(self, threshold: float = 5.0):
         self.threshold = threshold
         self.psi_path = "/proc/pressure/memory"
         self.is_supported = os.path.exists(self.psi_path)
@@ -34,25 +34,24 @@ class PSISensor:
             
         return False
 
-    def find_largest_memory_hog(self) -> int:
-        """Rapidly scans /proc to find the process with the largest RSS."""
+    def find_largest_memory_hog(self, candidate_pids: Optional[list[int]] = None) -> int:
+        """Rapidly scans memory usage, optionally restricted to a cached subset to avoid O(N) /proc sweeps."""
         max_rss = 0
         hog_pid = -1
         
-        try:
-            for pid_str in os.listdir("/proc"):
-                if not pid_str.isdigit():
-                    continue
-                pid = int(pid_str)
-                try:
-                    with open(f"/proc/{pid}/statm", "r") as f:
-                        rss_pages = int(f.read().split()[1])
-                        if rss_pages > max_rss:
-                            max_rss = rss_pages
-                            hog_pid = pid
-                except (FileNotFoundError, ProcessLookupError, PermissionError):
-                    continue
-        except Exception:
-            pass
+        # Fallback to full system scan if no candidates are provided
+        pids_to_scan = candidate_pids if candidate_pids is not None else [
+            int(p) for p in os.listdir("/proc") if p.isdigit()
+        ]
+        
+        for pid in pids_to_scan:
+            try:
+                with open(f"/proc/{pid}/statm", "r") as f:
+                    rss_pages = int(f.read().split()[1])
+                    if rss_pages > max_rss:
+                        max_rss = rss_pages
+                        hog_pid = pid
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
                 
         return hog_pid

@@ -55,10 +55,16 @@ def draw_hud(stdscr):
 
     try:
         while True:
-            # Handle Exit
+            # Handle user input
             key = stdscr.getch()
             if key == ord('q') or key == ord('Q'):
                 break
+            elif key == ord('o') or key == ord('O'):
+                # Toggle Observe Only mode in the running daemon
+                try:
+                    sock.sendto(b"TOGGLE_OBSERVE", SENTRY_HUD_SOCK)
+                except Exception:
+                    pass
 
             stdscr.erase()
             max_y, max_x = stdscr.getmaxyx()
@@ -75,6 +81,12 @@ def draw_hud(stdscr):
                 stdscr.addstr(4, max_x // 2 - len(err_msg) // 2, err_msg, curses.color_pair(2) | curses.A_BOLD)
                 stdscr.addstr(5, max_x // 2 - 24, "Ensure 'sudo python3 -m daemon.main' is running.")
             else:
+                # Render the current arming state
+                observe_only = state.get("observe_only", False)
+                mode_text = "[ OBSERVE ONLY ]" if observe_only else "[ ARMED ]"
+                mode_color = curses.color_pair(4) if observe_only else curses.color_pair(1)
+                stdscr.addstr(2, max_x - len(mode_text) - 4, mode_text, mode_color | curses.A_BOLD)
+
                 # --- PILLAR 1: SPATIAL CONTEXT ---
                 spatial_pid = state.get("spatial_pid")
                 stdscr.addstr(4, 4, "PILLAR 1: SPATIAL CONTEXT (FLOW STATE GUARD)", curses.color_pair(3) | curses.A_BOLD)
@@ -110,7 +122,7 @@ def draw_hud(stdscr):
                             break # Prevent UI overflow
 
             # --- FOOTER ---
-            footer_text = "Press 'Q' to exit"
+            footer_text = "Press 'O' to toggle Observe Mode | Press 'Q' to exit"
             stdscr.addstr(max_y - 2, max_x - len(footer_text) - 2, footer_text, curses.color_pair(3))
 
             stdscr.refresh()
