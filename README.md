@@ -1,227 +1,100 @@
+<div align="center">
+
+<pre>
+███████╗███████╗███╗   ██╗████████╗██████╗ ██╗   ██╗
+██╔════╝██╔════╝████╗  ██║╚══██╔══╝██╔══██╗╚██╗ ██╔╝
+███████╗█████╗  ██╔██╗ ██║   ██║   ██████╔╝ ╚████╔╝
+╚════██║██╔══╝  ██║╚██╗██║   ██║   ██╔══██╗  ╚██╔╝
+███████║███████╗██║ ╚████║   ██║   ██║  ██║   ██║
+╚══════╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝
+</pre>
+
+<img src="assets/logo/sentry-meerkat.png" width="220" alt="SENTRY Meerkat">
+
 # SENTRY
 
-**Context-Aware Kernel Resource Arbitration for Linux**
+### Policy-Driven Linux Resource Arbitration for Interactive Workloads
 
-[![Linux](https://img.shields.io/badge/Linux-Kernel%20%E2%89%A5%205.x-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://kernel.org)
-[![eBPF](https://img.shields.io/badge/eBPF-BCC-blue?style=for-the-badge)](https://github.com/iovisor/bcc)
-[![cgroup v2](https://img.shields.io/badge/cgroup-v2-E74C3C?style=for-the-badge)](https://docs.kernel.org/admin-guide/cgroup-v2.html)
-[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-2ECC71?style=for-the-badge)](#license)
+**Observe • Evaluate • Protect • Recover**
 
----
+<br>
 
-## Overview
+<img src="https://img.shields.io/badge/Linux-cgroup_v2-black?logo=linux&logoColor=white">
+<img src="https://img.shields.io/badge/Kernel-PSI-blue">
+<img src="https://img.shields.io/badge/Enforcement-cgroup_v2-success">
+<img src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white">
+<img src="https://img.shields.io/badge/License-MIT-green">
+<img src="https://img.shields.io/badge/Status-Experimental-orange">
 
-SENTRY is a Ring‑0‑adjacent resource arbitration system for Linux. It closes the gap between two data planes that conventional schedulers keep separate: **kernel-space CPU accounting**, observed via an eBPF probe attached directly to the scheduler's `sched_switch` tracepoint, and **user-space spatial context** — specifically, which process the user is actually looking at right now.
-
-Standard CPU accounting (`top`, `ps`, cgroup CPU statistics) answers *how much* CPU time a process consumed. It cannot answer *whether that consumption should be tolerated*, because that judgment depends on information the kernel does not have: which window currently has focus. A compiler running at 100% CPU in the background is a non-issue. The same consumption pattern in the user's foreground application is the definition of a stutter.
-
-SENTRY closes that loop:
-
-1. An eBPF sensor (`core/bpf_sensor.py`) measures per-PID CPU consumption at the tracepoint level, independent of `/proc` polling intervals.
-2. A desktop telemetry bridge (`tools/desktop_bridge.py`) resolves the actively focused window's PID across X11, XWayland, and native Wayland compositors (Hyprland, Sway/i3, KDE Wayland), and streams it to the daemon over a local UDP channel.
-3. The daemon cross-references the two: processes exceeding the CPU threshold are throttled, *unless* they are the process currently in the user's foreground — in which case they are immune.
-4. A curses-based TUI (`tools/sentry_top.py`) exposes both data planes — the current spatial lock and the set of throttled PIDs — by polling the daemon over a second local UDP channel.
+</div>
 
 ---
 
-## Core Architecture
-
-### Pillar 1 — eBPF Kernel Sensor (`core/bpf_sensor.py`)
-
-`BPFSensor` compiles and injects a small C program into the kernel via BCC, attaching to the `sched_switch` scheduler tracepoint:
-
-```c
-TRACEPOINT_PROBE(sched, sched_switch) {
-    u32 prev_pid = args->prev_pid;
-    u32 next_pid = args->next_pid;
-    u64 ts = bpf_ktime_get_ns();
-    // accumulate on-CPU time for the outgoing PID, reset the clock for the incoming PID
-}
-```
-
-Two BPF hash maps live in kernel space:
-
-| Map | Key | Value | Purpose |
-|---|---|---|---|
-| `start_time` | PID | timestamp (ns) | Tracks when a PID was last scheduled onto a CPU |
-| `cpu_time` | PID | accumulated ns | Running total of on-CPU time between polling windows |
-
-`get_top_hogs(threshold_ns)` reads `cpu_time`, returns every PID that accumulated more than the threshold within the current window (500ms default), and **clears the map**, implementing a sliding-window measurement rather than a monotonic counter. This runs entirely at the tracepoint level — there is no `/proc` polling in the hot path of consumption measurement.
-
-### Pillar 2 — Universal Desktop Telemetry Bridge (`tools/desktop_bridge.py`)
-
-`UniversalDesktopResolver` detects the active session type and compositor via `XDG_SESSION_TYPE` / `XDG_CURRENT_DESKTOP`, and dispatches to the correct backend to resolve the focused window's owning PID:
-
-| Environment | Resolution method |
-|---|---|
-| Hyprland | `hyprctl activewindow -j` (native IPC) |
-| Sway / i3 | `swaymsg -t get_tree`, depth-first search for the focused node |
-| KDE Plasma (Wayland) | `kdotool`, with fallback to `xdotool` if unavailable |
-| X11 / XWayland / EWMH-compliant desktops | `xdotool getactivewindow` → `getwindowpid` |
-
-The bridge polls at a 300ms interval and transmits **only on a PID change** ("gaze shift"), emitting a single UDP datagram containing the raw PID to `127.0.0.1:50505`. This edge-triggered design keeps the telemetry channel idle during sustained focus on one window.
-
-### Pillar 3 — Kernel Enforcement (`SafetyGuard` / `CgroupManager`)
-
-The daemon consumes both signals to make an enforcement decision:
-
-- **`SafetyGuard`** maintains the current spatial lock (`active_foreground_pid`), sourced from the UDP telemetry bridge. Any PID matching the current spatial lock is granted immunity from throttling regardless of measured CPU consumption.
-- **`CgroupManager`** applies enforcement against non-immune PIDs that exceed the eBPF-measured threshold by writing a CPU cap into that process's cgroup v2 controller — referred to operationally as **the Penalty Box** — clamping the offending process to a fraction of a core rather than suspending or killing it. Enforcement is reversible: once a throttled PID's window expires, its cgroup limit is released.
-
-### Pillar 4 — Command Center TUI (`tools/sentry_top.py`)
-
-The daemon exposes its live state over a second UDP channel (`127.0.0.1:50506`). On receiving a `STATUS` datagram, it responds with a JSON snapshot:
-
-```json
-{
-  "spatial_pid": 41213,
-  "throttled_tasks": [
-    { "pid": 8842, "time_left": 12.4 }
-  ]
-}
-```
-
-`sentry_top.py` renders this via `curses` at a 10 FPS refresh rate: the current spatial lock under **Pillar 1: Spatial Context**, and every actively throttled PID with time remaining under **The Penalty Box**. The TUI degrades gracefully to a `DAEMON OFFLINE` state if the daemon is unreachable, rather than blocking on the socket.
-
-### Data Flow
-
-```
-                 ┌─────────────────────────┐
-                 │   Linux Kernel Scheduler  │
-                 │   (sched_switch trace)    │
-                 └────────────┬─────────────┘
-                              │ eBPF tracepoint probe
-                              ▼
-                 ┌─────────────────────────┐
-                 │      BPFSensor            │
-                 │  cpu_time / start_time    │
-                 │      BPF hash maps        │
-                 └────────────┬─────────────┘
-                              │ get_top_hogs()
-                              ▼
-   UDP :50505      ┌─────────────────────────┐      UDP :50506
-  ───────────────► │      SENTRY Daemon       │ ◄───────────────
-  Desktop Bridge    │  SafetyGuard ⇄ CgroupMgr │      sentry_top
-  (focused PID)     └────────────┬─────────────┘      (STATUS poll)
-                              │
-                              ▼
-                    cgroup v2 CPU clamp
-                    (Penalty Box, reversible)
-```
+> **SENTRY** is a Linux userspace daemon that preserves desktop responsiveness during CPU and memory contention by combining **Linux Pressure Stall Information (PSI)**, **foreground workload awareness**, and **cgroup v2** resource controls. Instead of terminating processes, SENTRY applies **temporary, policy-driven resource constraints** to competing background workloads and automatically restores them when system pressure subsides.
 
 ---
 
-## Prerequisites & Installation
+## Why SENTRY?
 
-### System Requirements
+Traditional Linux resource management answers one question:
 
-- Linux kernel with `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, and tracepoint support enabled
-- Cgroups v2 unified hierarchy mounted at `/sys/fs/cgroup`
-- Root privileges (or `CAP_SYS_ADMIN` / `CAP_BPF`) — required to load BPF programs into the kernel
-- Python 3.8+
+> **Which process consumes the most resources?**
 
-### eBPF Toolchain (BCC)
+SENTRY answers a different one:
 
-```bash
-sudo apt-get update
-sudo apt-get install -y python3-bpfcc linux-headers-$(uname -r) bpfcc-tools
-```
+> **Which workload should remain responsive right now?**
 
-Verify BCC can see kernel headers before proceeding:
+Rather than relying solely on CPU utilization or reacting only after memory exhaustion, SENTRY continuously evaluates system pressure, active user context, and configurable policies before making resource arbitration decisions.
 
-```bash
-sudo python3 -c "from bcc import BPF; print('BCC OK')"
-```
+<div align="center">
 
-### Desktop Bridge Dependencies
+| Traditional Resource Management | SENTRY |
+|:-------------------------------:|:------:|
+| Resource-centric | User-centric |
+| Reactive | Proactive |
+| Kill or terminate | Temporary resource constraints |
+| CPU & memory usage | PSI + foreground awareness |
+| Static behavior | Policy-driven arbitration |
+| Emergency response | Continuous monitoring |
 
-The telemetry bridge shells out to the compositor-appropriate query tool. Install what matches your session:
-
-| Session | Package |
-|---|---|
-| X11 / XWayland | `xdotool` |
-| KDE Plasma (Wayland) | `kdotool` |
-| Hyprland | `hyprctl` (ships with Hyprland) |
-| Sway / i3 | `sway` / `i3` (ships `swaymsg`) |
-
-```bash
-sudo apt-get install -y xdotool
-```
-
-### Python Dependencies
-
-```bash
-git clone https://github.com/apexajay-rc/SENTRY.git
-cd SENTRY
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+</div>
 
 ---
 
-## Deployment / Usage
+## Philosophy
 
-SENTRY runs as three cooperating processes. The daemon must run as root (BPF program loading and cgroup writes both require elevated privileges); the bridge and TUI run in the user's session.
+SENTRY follows four principles that guide every design decision.
 
-**1. Start the Ring‑0 enforcement daemon:**
-
-```bash
-sudo .venv/bin/python3 -m daemon.main
-```
-
-**2. Start the desktop telemetry bridge**, from within the target graphical session (not over SSH — it must have access to the compositor):
-
-```bash
-python3 tools/desktop_bridge.py
-```
-
-**3. Launch the command center TUI** to observe enforcement in real time:
-
-```bash
-python3 tools/sentry_top.py
-```
-
-Press `Q` to exit the TUI. Terminating the bridge or the TUI has no effect on active enforcement; only the daemon owns the enforcement state.
+| Principle | Description |
+|------------|-------------|
+| **Observe** | Continuously monitor Linux PSI and desktop activity. |
+| **Evaluate** | Combine kernel telemetry, foreground state, and policy rules before taking action. |
+| **Protect** | Preserve the responsiveness of interactive workloads using reversible resource controls. |
+| **Recover** | Automatically restore constrained workloads once resource pressure subsides. |
 
 ---
 
-## Current Capabilities
-
-- **Microsecond-resolution CPU accounting** via a kernel tracepoint probe, independent of `/proc` polling granularity.
-- **Dynamic CPU throttling** of processes that exceed a configurable CPU-time threshold within a sliding measurement window, enforced through cgroup v2 (the Penalty Box).
-- **Foreground immunity** — the process backing the currently focused window is exempt from throttling, resolved live across X11, XWayland, Hyprland, Sway/i3, and KDE Wayland.
-- **Reversible enforcement** — throttled processes are released once their penalty window expires; no process is killed or suspended.
-- **Zero-overhead spatial polling** — the desktop bridge transmits only on a focus change, not on a fixed interval, keeping idle CPU cost negligible.
-- **Live observability** via a dedicated UDP status channel and curses TUI, decoupled from the enforcement path itself.
-
----
-
-## Architectural Roadmap
-
-The following represent the planned evolution of SENTRY's kernel-space enforcement surface. None of the items below are implemented in the current codebase; they are documented here as direction, not delivered capability.
-
-### Near Term — PSI-Aware Memory Defense
-
-- Subscribe to kernel **Pressure Stall Information** (`/proc/pressure/memory`) alongside the existing CPU tracepoint, giving SENTRY a second, independent signal for contention that CPU accounting alone cannot see.
-- Extend `CgroupManager` to apply `memory.high` limits against non-immune memory consumers when a PSI stall trigger fires, mirroring the existing CPU Penalty Box mechanism for memory pressure.
-- Blend PSI stall duration with eBPF CPU-time data into a single pressure score, rather than treating CPU and memory contention as independent triggers.
-
-### Medium Term — IPC Dependency Graphing
-
-- Attach eBPF probes to `connect`, `sendmsg`, and related syscalls to observe UNIX domain socket connections between processes.
-- Build a live dependency graph from observed IPC edges, so that a backend process feeding data to the user's foreground application inherits transitive immunity from the spatial lock, rather than being throttled as an apparently unrelated background task.
-- Extend `SafetyGuard` to walk this graph when evaluating immunity, instead of comparing only against the single `active_foreground_pid`.
-
-### Long Term — Hardware Topology Manipulation
-
-- Dynamic **core isolation**: reassign the foreground process's affinity to a reserved set of physical cores under sustained system-wide contention, insulating it from scheduler noise on shared cores.
-- **L3 cache allocation** via Intel RDT / AMD QoS extensions (where available), to prevent throttled background processes from evicting the foreground process's working set from shared cache — a form of contention CPU-time accounting alone cannot detect or mitigate.
-- Topology-aware placement that accounts for NUMA locality when assigning immunity-driven core reservations.
+> [!NOTE]
+>
+> ### Why a Meerkat?
+>
+> In a meerkat colony, a sentry stands upright and continuously watches the surroundings while the rest of the colony works. It does not fight every threat—it observes, detects danger early, and alerts the colony when intervention is needed.
+>
+> SENTRY follows the same philosophy.
+>
+> Rather than reacting after the desktop becomes unresponsive, it continuously monitors Linux resource pressure, detects contention early, protects interactive workloads, and restores normal operation automatically.
 
 ---
 
-## License
+## Table of Contents
 
-MIT. See `LICENSE` for details.
+- [Features](#features)
+- [Architecture](#architecture)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Monitoring Dashboard](#monitoring-dashboard)
+- [Security Model](#security-model)
+- [Performance](#performance)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
