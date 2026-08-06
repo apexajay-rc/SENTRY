@@ -1,0 +1,15 @@
+# SENTRY Daemon Configuration
+# Values applied dynamically to the control loop.
+
+policy:
+  # The cgroup v2 memory.high limit applied to the heaviest process during a spike.
+  # Accepts standard kernel memory strings (e.g., 500M, 1G, max)
+  memory_throttle_limit: "500M"
+  
+  # Minimum time (in seconds) a process remains throttled before limits are lifted.
+  # Prevents control-loop flapping.
+  cooldown_period: 60.0
+
+daemon:
+  # Interval (in seconds) to ping the systemd watchdog and run the cooldown reconciler.
+  watchdog_interval: 5.0

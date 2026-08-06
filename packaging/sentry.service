@@ -1,0 +1,41 @@
+[Unit]
+Description=SENTRY Pressure-Aware Resource Daemon
+Documentation=https://github.com/apexajay-rc/SENTRY
+After=sysinit.target local-fs.target
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
+ConditionPathExists=/proc/pressure/memory
+
+[Service]
+Type=notify
+WorkingDirectory=/opt/sentry
+Environment="PYTHONPATH=/opt/sentry"
+ExecStart=/opt/sentry/venv/bin/python /opt/sentry/daemon/main.py
+
+Restart=on-failure
+RestartSec=3
+WatchdogSec=15s
+TimeoutStopSec=10s
+SendSIGKILL=yes
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=no
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+
+RestrictNamespaces=yes
+
+[Install]
+WantedBy=multi-user.target
