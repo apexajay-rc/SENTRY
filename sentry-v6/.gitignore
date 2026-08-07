@@ -1,0 +1,17 @@
+# Rust build artifacts & caches
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Local logs and temp files
+*.log

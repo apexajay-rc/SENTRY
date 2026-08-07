@@ -1,0 +1,13 @@
+[package]
+name = "sentry-bpf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The official kernel sched_ext utility crate
+scx_utils = { git = "https://github.com/sched-ext/scx.git" }
+anyhow = "1.0"
+libbpf-rs = "0.26" 
+
+[build-dependencies]
+scx_utils = { git = "https://github.com/sched-ext/scx.git", features = ["deprecated-build-support"] }

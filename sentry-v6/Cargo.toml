@@ -1,0 +1,10 @@
+[workspace]
+resolver="3"
+members = [
+    "sentry-core",
+    "sentry-bpf",
+    "sentry-legacy"
+]
+
+[workspace.dependencies]
+# We will define shared dependencies here later
