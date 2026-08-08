@@ -2,18 +2,17 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-// STRICT COMPLIANCE: eBPF struct_ops require a GPL license to access kernel helpers.
 char _license[] SEC("license") = "GPL";
 
 // -----------------------------------------------------------------------------
-// SHARED MEMORY (eBPF MAPS)
+// SHARED MEMORY: Process Dependency Graph (Hash Map)
 // -----------------------------------------------------------------------------
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, u32);
-    __type(value, u32);
-    __uint(max_entries, 1);
-} vip_pid_map SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u32);   // The Process ID (TGID)
+    __type(value, u8);  // Boolean VIP Flag (1 = active)
+    __uint(max_entries, 1024); // Support a tree of up to 1,024 processes
+} vip_process_tree SEC(".maps");
 
 // -----------------------------------------------------------------------------
 // SCHEDULER LOGIC (THE DICTATOR)
@@ -21,17 +20,14 @@ struct {
 SEC("struct_ops/sentry_enqueue")
 void BPF_PROG(sentry_enqueue, struct task_struct *p, u64 enq_flags)
 {
-    u32 key = 0;
-    u32 *vip_pid_ptr;
-    u32 vip_pid = 0;
+    u32 tgid = p->tgid;
+    u8 *is_vip;
 
-    vip_pid_ptr = bpf_map_lookup_elem(&vip_pid_map, &key);
-    if (vip_pid_ptr) {
-        vip_pid = *vip_pid_ptr;
-    }
+    // Check if this specific task exists anywhere in our VIP Process Tree
+    is_vip = bpf_map_lookup_elem(&vip_process_tree, &tgid);
 
-    if (vip_pid != 0 && p->tgid == vip_pid) {
-        // TARGET ACQUIRED: Dispatch directly to the LOCAL Dispatch Queue.
+    if (is_vip && *is_vip == 1) {
+        // TREE MEMBER ACQUIRED: Dispatch directly to the LOCAL Dispatch Queue.
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
         return;
     }
