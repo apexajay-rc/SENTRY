@@ -7,3 +7,4 @@ edition = "2024"
 sentry-bpf = { path = "../sentry-bpf" }
 anyhow="1.0"
 sentry-legacy = { path = "../sentry-legacy" }
+ctrlc = "3.5.2"

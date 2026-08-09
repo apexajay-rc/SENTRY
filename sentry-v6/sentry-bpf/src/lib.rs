@@ -1,6 +1,6 @@
 use anyhow::Result;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::{MapCore, MapFlags};
+use libbpf_rs::{MapCore, MapFlags}; // THE CRITICAL MISSING IMPORT
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 
@@ -15,34 +15,43 @@ use sentry_dictator_skel::*;
 
 pub struct BpfController<'a> {
     _link: libbpf_rs::Link,
-    _skel: SentryDictatorSkel<'a>,
-    // Tracks current VIPs so we can selectively delete old ones on focus switch
-    active_vip_tree: HashSet<u32>,
+    skel: SentryDictatorSkel<'a>,
 }
 
 impl<'a> BpfController<'a> {
-    /// Syncs the new process tree into the kernel, cleaning up old PIDs.
-    pub fn sync_vip_tree(&mut self, new_tree: &HashSet<u32>) -> Result<()> {
-        let val = 1u8.to_ne_bytes();
-
-        // 1. Remove PIDs that are no longer in focus
-        for pid in &self.active_vip_tree {
-            if !new_tree.contains(pid) {
-                let key = pid.to_ne_bytes();
-                // Ignore ENOENT (error 2) if the PID died and was already cleaned up naturally
-                let _ = self._skel.maps.vip_process_tree.delete(&key);
-            }
+    /// Converts a HashSet of process IDs into a continuous flat array and pushes it to eBPF.
+    pub fn sync_vip_tree(&mut self, vip_tree: &HashSet<u32>) -> Result<()> {
+        // 1. Clear the old tree to prevent ghost VIPs
+        let mut keys_to_delete = Vec::new();
+        for key in self.skel.maps.vip_process_tree.keys() {
+            keys_to_delete.push(key);
+        }
+        for key in keys_to_delete {
+            let _ = self.skel.maps.vip_process_tree.delete(&key);
         }
 
-        // 2. Insert new PIDs
-        for pid in new_tree {
-            if !self.active_vip_tree.contains(pid) {
-                let key = pid.to_ne_bytes();
-                self._skel.maps.vip_process_tree.update(&key, &val, MapFlags::ANY)?;
-            }
+        // 2. Blast the new tree into Ring -1
+        let value = 1u8;
+        for &pid in vip_tree {
+            self.skel.maps.vip_process_tree.update(&pid.to_ne_bytes(), &value.to_ne_bytes(), MapFlags::ANY)?;
+        }
+        Ok(())
+    }
+
+    /// Hard-pins the VIP arrays and Background arrays into the eBPF hardware router.
+    pub fn sync_core_topology(&mut self, vip_cores: &[u32], bg_cores: &[u32]) -> Result<()> {
+        // Sync VIP (P-Cores)
+        self.skel.maps.vip_cores_count.update(&0u32.to_ne_bytes(), &(vip_cores.len() as u32).to_ne_bytes(), MapFlags::ANY)?;
+        for (i, &core_id) in vip_cores.iter().enumerate() {
+            self.skel.maps.vip_cores_list.update(&(i as u32).to_ne_bytes(), &core_id.to_ne_bytes(), MapFlags::ANY)?;
         }
 
-        self.active_vip_tree = new_tree.clone();
+        // Sync Quarantine (E-Cores or partitioned cores)
+        self.skel.maps.bg_cores_count.update(&0u32.to_ne_bytes(), &(bg_cores.len() as u32).to_ne_bytes(), MapFlags::ANY)?;
+        for (i, &core_id) in bg_cores.iter().enumerate() {
+            self.skel.maps.bg_cores_list.update(&(i as u32).to_ne_bytes(), &core_id.to_ne_bytes(), MapFlags::ANY)?;
+        }
+
         Ok(())
     }
 }
@@ -63,7 +72,6 @@ pub fn launch_bpf_engine() -> Result<BpfController<'static>> {
 
     Ok(BpfController {
         _link: link,
-        _skel: static_skel,
-        active_vip_tree: HashSet::new(),
+        skel: static_skel,
     })
 }
