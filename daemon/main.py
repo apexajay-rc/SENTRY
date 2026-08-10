@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-daemon/main.py
-
-The Basecamp Architecture for SENTRY.
-Restored to pure, flawless user-space polling with beautiful live telemetry.
-Secured IPC sockets via SUDO_UID to prevent unprivileged PID spoofing.
-"""
 
 import sys
 import os
@@ -14,7 +7,11 @@ import signal
 import socket
 import json
 import psutil
-from typing import Optional, Any
+from typing import Optional, Any, Tuple, Dict
+
+# --- CRITICAL PATH FIX ---
+# Inject the SENTRY root directory into Python's module path so it can reliably find 'core'
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # IMMEDIATE PRIORITY ELEVATION: Prevent SENTRY from being starved by hogs
 try:
@@ -34,7 +31,7 @@ class ProcSensor:
         self.procs = {}
         self.tick_count = 0
 
-    def get_top_hogs(self, threshold=85.0):
+    def get_top_hogs(self, threshold=35.0):
         self.tick_count += 1
         hogs = []
         max_cpu = 0.0
@@ -95,7 +92,6 @@ class SentryDaemon:
         self.hud_sock.setblocking(False)
         
         # SECURE SENTRY IPC: Restrict socket access to root and the active desktop user.
-        # Prevents unprivileged malware (e.g., www-data) from spoofing the foreground PID.
         try:
             sudo_uid = os.environ.get("SUDO_UID")
             if sudo_uid and sudo_uid.isdigit():
@@ -164,8 +160,30 @@ class SentryDaemon:
         except OSError:
             pass
 
+    def _evaluate_escalation(self, max_cpu: float, mem_pressure: bool) -> Tuple[str, Dict[str, int]]:
+        """Dynamically calculates system stress and maps to the Escalation Matrix."""
+        if max_cpu >= 85.0 or mem_pressure:
+            state = "CRITICAL"
+        elif max_cpu >= 70.0:
+            state = "HIGH"
+        elif max_cpu >= 50.0:
+            state = "MODERATE"
+        elif max_cpu >= 35.0:
+            state = "LOW"
+        else:
+            state = "NOMINAL"
+            
+        matrix = {
+            "NOMINAL":  {"cpu_weight": 100, "memory_limit_percent": 100, "io_weight": 100},
+            "LOW":      {"cpu_weight": 100, "memory_limit_percent": 100, "io_weight": 100},
+            "MODERATE": {"cpu_weight": 50,  "memory_limit_percent": 90,  "io_weight": 50},
+            "HIGH":     {"cpu_weight": 30,  "memory_limit_percent": 75,  "io_weight": 30},
+            "CRITICAL": {"cpu_weight": 10,  "memory_limit_percent": 50,  "io_weight": 10},
+        }
+        return state, matrix[state]
+
     def shutdown(self, signum: Any = None, frame: Any = None) -> None:
-        print("\n=> 🛑 SIGTERM/SIGINT received. Releasing all hardware locks...", flush=True)
+        print("\n=>SIGTERM/SIGINT received. Releasing all hardware locks...", flush=True)
         self.running = False
         self._sd_notify("STOPPING=1")
         self.cgroup_mgr.release_all()
@@ -175,23 +193,22 @@ class SentryDaemon:
             self._cleanup_sockets()
         except Exception:
             pass
-        print("=> ✅ SENTRY going dark. System restored to default scheduler.", flush=True)
+        print("=>SENTRY going dark. System restored to default scheduler.", flush=True)
         sys.exit(0)
 
     def run(self) -> None:
         print("\n" + "="*60, flush=True)
-        print(" 🛡️  SENTRY RING-0 COMMAND DAEMON ONLINE (BASECAMP) ", flush=True)
+        print("SENTRY RING-0 COMMAND DAEMON ONLINE", flush=True)
         print("="*60 + "\n", flush=True)
         
-        # --- CRITICAL FIX: Start-up Reconciliation ---
         # Scan and clear any leftover cgroups limits from a previous crash
         self.cgroup_mgr.clear_orphaned_throttles()
         
         self._sd_notify("READY=1\nSTATUS=SENTRY Basecamp Daemon online.")
-        print("=> ✅ High-Speed PSUtil Profiler armed.", flush=True)
+        print("=>High-Speed PSUtil Profiler armed. Dynamic Escalation Matrix Active.", flush=True)
         
         if not self.psi_sensor.is_supported:
-            print("=> ⚠️  Kernel PSI not detected. Memory defenses disabled.", flush=True)
+            print("=>Kernel PSI not detected. Memory defenses disabled.", flush=True)
         
         while self.running:
             try:
@@ -202,52 +219,63 @@ class SentryDaemon:
                 
                 action_taken = False
                 
-                # 1. CPU Defense (Basecamp proc polling)
-                top_cpu_hogs, max_cpu = self.proc_sensor.get_top_hogs(threshold=85.0)
+                # 1. Telemetry Collection
+                top_cpu_hogs, max_cpu = self.proc_sensor.get_top_hogs(threshold=35.0)
+                is_mem_pressure = self.psi_sensor.check_memory_pressure()
                 
-                for pid in top_cpu_hogs:
-                    if not self.cgroup_mgr.is_throttled(pid):
-                        if pid == self.spatial_pid:
-                            pass # Spatial Immunity
-                        elif not os.path.exists(f"/proc/{pid}"):
-                            pass # Prevent ghosts
-                        elif not self.safety_guard.is_immune(pid):
-                            action_taken = True
-                            if self.observe_only:
-                                print(f"\n[OBSERVE ONLY] Would throttle CPU hog (PID {pid}).", flush=True)
-                            else:
-                                print(f"\n🚨 => ACTION: Throttling CPU hog (PID {pid}). cpu.slice set to low, cpu.max clamped to 20%.", flush=True)
-                                start_tick = self.cgroup_mgr.apply_cpu_throttle(pid, 20)
-                                if start_tick is not None:
-                                    self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec, start_tick)
+                # 2. Dynamic Escalation Matrix Resolution
+                state, limits = self._evaluate_escalation(max_cpu, is_mem_pressure)
                 
-                # 2. Memory Defense (PSI)
-                if self.psi_sensor.check_memory_pressure():
-                    # Optimization: Pass psutil's already-cached PIDs to avoid an I/O storm on /proc
+                # 3. CPU Defense Execution
+                if limits["cpu_weight"] < 100:
+                    for pid in top_cpu_hogs:
+                        if not self.cgroup_mgr.is_throttled(pid):
+                            if pid == self.spatial_pid:
+                                pass # Spatial Immunity
+                            elif not os.path.exists(f"/proc/{pid}"):
+                                pass # Prevent ghosts
+                            elif not self.safety_guard.is_immune(pid):
+                                action_taken = True
+                                if self.observe_only:
+                                    print(f"\n[OBSERVE ONLY - {state}] Would throttle CPU hog (PID {pid}) to {limits['cpu_weight']}%", flush=True)
+                                else:
+                                    print(f"=> [{state}] ACTION: Throttling CPU hog (PID {pid}). cpu.max clamped to {limits['cpu_weight']}%.", flush=True)
+                                    start_tick = self.cgroup_mgr.apply_cpu_throttle(pid, limits["cpu_weight"])
+                                    
+                                    # Fallback hook for I/O Throttle if supported by CgroupManager
+                                    if hasattr(self.cgroup_mgr, 'apply_io_throttle'):
+                                        self.cgroup_mgr.apply_io_throttle(pid, limits["io_weight"])
+                                        
+                                    if start_tick is not None:
+                                        self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec, start_tick)
+                
+                # 4. Memory Defense Execution
+                if is_mem_pressure and limits["memory_limit_percent"] < 100:
                     candidate_pids = list(self.proc_sensor.procs.keys())
                     hog_pid = self.psi_sensor.find_largest_memory_hog(candidate_pids)
                     if hog_pid > 0 and not self.cgroup_mgr.is_throttled(hog_pid):
                         if hog_pid != self.spatial_pid and os.path.exists(f"/proc/{hog_pid}") and not self.safety_guard.is_immune(hog_pid):
                             action_taken = True
+                            dynamic_mem_clamp = int(self.mem_clamp_bytes * (limits["memory_limit_percent"] / 100.0))
                             if self.observe_only:
-                                print(f"\n[OBSERVE ONLY] Would clamp memory hog PID {hog_pid} to {self.mem_clamp_bytes} bytes.", flush=True)
+                                print(f"\n[OBSERVE ONLY - {state}] Would clamp memory hog PID {hog_pid} to {dynamic_mem_clamp} bytes.", flush=True)
                             else:
-                                print(f"\n🚨 => ACTION: Memory starvation detected. memory.high clamped to {self.mem_clamp_bytes} bytes for PID {hog_pid}.", flush=True)
-                                start_tick = self.cgroup_mgr.apply_memory_throttle(hog_pid, self.mem_clamp_bytes)
+                                print(f"=> [{state}] ACTION: Memory starvation detected. memory.high clamped to {dynamic_mem_clamp} bytes for PID {hog_pid}.", flush=True)
+                                start_tick = self.cgroup_mgr.apply_memory_throttle(hog_pid, dynamic_mem_clamp)
                                 if start_tick is not None:
                                     self.cgroup_mgr.register_throttle(hog_pid, now + self.cooldown_sec, start_tick)
                 
                 # --- The Continuous Aesthetic Logging ---
                 if not hasattr(self, '_last_print') or now - self._last_print > 3.0:
                     if not action_taken and not self.cgroup_mgr.throttled_tasks:
-                        print(f"[SYSTEM NOMINAL] No action needed. Nothing is happening now. (Max CPU Load: {max_cpu:.1f}%)", flush=True)
+                        print(f"[{state} LOAD] System nominal. No action needed. (Max CPU Load: {max_cpu:.1f}%)", flush=True)
                     self._last_print = now
                 
                 self._sd_notify("WATCHDOG=1")
                 time.sleep(0.2)  # 200ms
                 
             except Exception as e:
-                print(f"\n❌ [CRITICAL LOOP ERROR]: {e}", flush=True)
+                print(f"[CRITICAL LOOP ERROR]: {e}", flush=True)
                 time.sleep(2)
 
 if __name__ == "__main__":

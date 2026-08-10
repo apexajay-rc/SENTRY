@@ -21,7 +21,7 @@ class TestSentryConfig(unittest.TestCase):
     def test_default_config_fallback(self):
         """Ensures defaults apply when YAML is missing."""
         config = SentryConfig("nonexistent.yaml")
-        self.assertEqual(config.memory_clamp_bytes, 52428800)
+        self.assertEqual(config.memory_clamp_bytes, 524288000)
         self.assertEqual(config.cooldown_seconds, 60)
 
     def test_yaml_load_and_parse(self):

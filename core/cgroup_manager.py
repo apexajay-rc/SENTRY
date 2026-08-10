@@ -3,6 +3,7 @@ core/cgroup_manager.py
 
 Native Cgroups v2 enforcement with TOCTOU-safe boot tick capturing
 and startup reconciliation to prevent permanent locks on crash-restarts.
+Hardened v1.0: Includes the "Cgroup Piercer" to dynamically bypass systemd delegation blocks.
 """
 
 import os
@@ -33,7 +34,7 @@ class CgroupManager:
                     if os.path.exists(cpu_max_path):
                         with open(cpu_max_path, "r") as f:
                             actual = f.read().strip()
-                        # 20000 100000 is our exact hardcoded 20% clamp signature
+                        # 20000 100000 is our exact legacy 20% clamp signature
                         if actual == "20000 100000":
                             with open(cpu_max_path, "w") as f:
                                 f.write("max 100000")
@@ -65,6 +66,43 @@ class CgroupManager:
             return int(fields[19])
         except Exception:
             return None
+
+    def _pierce_cgroup_delegation(self, cgroup_path: str) -> None:
+        """
+        The Cgroup Piercer.
+        Walks top-down from the cgroup root, physically unlocking the hardware 
+        controllers (+cpu +memory +io) in every parent directory to bypass systemd blocks.
+        """
+        if not cgroup_path.startswith("/sys/fs/cgroup"):
+            return
+
+        rel_path = cgroup_path[len("/sys/fs/cgroup"):].strip("/")
+        if not rel_path:
+            return
+
+        parts = rel_path.split("/")
+        current_path = "/sys/fs/cgroup"
+        
+        # Walk top-down, writing to the subtree_control of each parent
+        for part in parts:
+            subtree_path = os.path.join(current_path, "cgroup.subtree_control")
+            try:
+                if os.path.exists(subtree_path):
+                    with open(subtree_path, "w") as f:
+                        f.write("+cpu +memory +io")
+            except Exception:
+                pass # Silently continue if a high-level root is locked but delegated
+                
+            current_path = os.path.join(current_path, part)
+
+        # Attempt to unlock the final target directory for any sub-threads
+        try:
+            target_subtree = os.path.join(cgroup_path, "cgroup.subtree_control")
+            if os.path.exists(target_subtree):
+                with open(target_subtree, "w") as f:
+                    f.write("+cpu +memory +io")
+        except Exception:
+            pass
 
     def register_throttle(self, pid: int, unlock_time: float, start_time: int) -> None:
         """Record a throttle event locked to the pre-captured kernel boot tick."""
@@ -104,6 +142,7 @@ class CgroupManager:
         for pid in to_release:
             self.release_memory_throttle(pid)
             self.release_cpu_throttle(pid)
+            self.release_io_throttle(pid)
             self.throttled_tasks.pop(pid, None)
 
     def _verify_write(self, path: str, expected: str) -> bool:
@@ -126,6 +165,9 @@ class CgroupManager:
             self.logger.warning(f"Could not resolve cgroup for PID {pid}. Falling back to scheduler.")
             self._apply_scheduler_fallback(pid)
             return start_time
+
+        # Inject delegation bypass
+        self._pierce_cgroup_delegation(cgroup_path)
 
         mem_high_path = os.path.join(cgroup_path, "memory.high")
         limit_str = str(limit_bytes)
@@ -159,6 +201,9 @@ class CgroupManager:
             self._apply_scheduler_fallback(pid)
             return start_time
 
+        # Inject delegation bypass
+        self._pierce_cgroup_delegation(cgroup_path)
+
         cpu_max_path = os.path.join(cgroup_path, "cpu.max")
         period = 100000
         quota = quota_pct * 1000  
@@ -178,6 +223,30 @@ class CgroupManager:
             
         return start_time
 
+    def apply_io_throttle(self, pid: int, io_weight: int) -> Optional[int]:
+        """Apply io.weight clamp. TOCTOU safe."""
+        start_time = self._get_process_start_time(pid)
+        if start_time is None:
+            return None
+
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if not cgroup_path:
+            return start_time
+
+        # Inject delegation bypass
+        self._pierce_cgroup_delegation(cgroup_path)
+
+        io_bfq_path = os.path.join(cgroup_path, "io.bfq.weight")
+        try:
+            if os.path.exists(io_bfq_path):
+                with open(io_bfq_path, "w") as f:
+                    f.write(str(io_weight))
+                self.logger.audit("CLAMP_IO", pid, cgroup_path, f"I/O Weight set to {io_weight}")
+        except Exception:
+            pass # I/O controllers are often hardware-specific, fail silently if absent
+
+        return start_time
+
     def release_memory_throttle(self, pid: int) -> None:
         """Restore memory.high to max."""
         cgroup_path = self._get_cgroup_v2_path(pid)
@@ -192,6 +261,7 @@ class CgroupManager:
         self._release_scheduler_fallback(pid)
 
     def release_cpu_throttle(self, pid: int) -> None:
+        """Restore cpu.max to max."""
         cgroup_path = self._get_cgroup_v2_path(pid)
         if cgroup_path:
             cpu_max_path = os.path.join(cgroup_path, "cpu.max")
@@ -202,6 +272,18 @@ class CgroupManager:
             except Exception:
                 pass
         self._release_scheduler_fallback(pid)
+
+    def release_io_throttle(self, pid: int) -> None:
+        """Restore I/O weights to default (100)."""
+        cgroup_path = self._get_cgroup_v2_path(pid)
+        if cgroup_path:
+            io_bfq_path = os.path.join(cgroup_path, "io.bfq.weight")
+            try:
+                if os.path.exists(io_bfq_path):
+                    with open(io_bfq_path, "w") as f:
+                        f.write("100")
+            except Exception:
+                pass
 
     def _apply_scheduler_fallback(self, pid: int) -> None:
         try:
@@ -220,4 +302,5 @@ class CgroupManager:
         for pid in list(self.throttled_tasks.keys()):
             self.release_memory_throttle(pid)
             self.release_cpu_throttle(pid)
+            self.release_io_throttle(pid)
         self.throttled_tasks.clear()

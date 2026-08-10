@@ -1,7 +1,16 @@
+"""
+core/ipc.py
+
+SENTRY Inter-Process Communication (IPC) module.
+Hardened v1.0: Implements a strict ThreadPoolExecutor and Slow-Loris timeout
+to mathematically prevent Thread Explosion Denial-of-Service (DoS) attacks.
+"""
+
 import json
 import os
 import socket
 import threading
+import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -141,6 +150,9 @@ class IpcServer:
         self._stop = threading.Event()
         self._socket: Optional[socket.socket] = None
         self.address: Optional[tuple[Any, ...]] = None
+        
+        # Security Hardening: Cap maximum concurrent IPC threads to prevent DoS
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="SentryIpcWorker")
 
     def start_background(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -156,6 +168,9 @@ class IpcServer:
                 self._socket.close()
             except OSError:
                 pass
+        
+        # Gracefully shutdown the thread pool without waiting for hijacked sockets
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     def _serve(self) -> None:
         kind = self.endpoint[0]
@@ -180,16 +195,23 @@ class IpcServer:
         while not self._stop.is_set():
             try:
                 conn, _addr = sock.accept()
+                # Security Hardening: Strict 5-second socket timeout to prevent Slow-Loris thread hijacking
+                conn.settimeout(5.0)
             except (TimeoutError, socket.timeout):
                 continue
             except OSError:
                 break
 
-            threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+            try:
+                # Dispatch to bounded pool instead of infinitely spawning OS threads
+                self._pool.submit(self._handle_client, conn)
+            except RuntimeError:
+                # Pool is shutting down, safely close the connection and exit
+                conn.close()
+                break
 
     def _handle_client(self, conn: socket.socket) -> None:
         with conn:
-            conn.settimeout(2.0)
             try:
                 payload = _recv_line(conn)
                 if not payload:
@@ -198,7 +220,13 @@ class IpcServer:
                 response = self.state.apply_command(request)
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
                 response = {"ok": False, "error": str(exc)}
-            _send_line(conn, json.dumps(response))
+            except Exception as exc:
+                response = {"ok": False, "error": f"Unhandled error: {exc}"}
+                
+            try:
+                _send_line(conn, json.dumps(response))
+            except OSError:
+                pass
 
 
 class IpcClient:
