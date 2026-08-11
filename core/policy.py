@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 # Stress level thresholds (customize based on workload)
 THRESHOLDS = {
     "LOW": 0.35,
-    "MODERATE": 0.50,
+    "MODERATE": 0.20,
     "HIGH": 0.70,
     "CRITICAL": 0.85,
 }

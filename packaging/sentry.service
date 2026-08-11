@@ -9,6 +9,10 @@ ConditionPathExists=/proc/pressure/memory
 Type=notify
 WorkingDirectory=/opt/sentry
 Environment="PYTHONPATH=/opt/sentry"
+
+Environment="SUDO_UID=1000"
+Environment="SUDO_GID=1000"
+
 ExecStart=/opt/sentry/venv/bin/python /opt/sentry/daemon/main.py
 
 Restart=on-failure
@@ -20,6 +24,7 @@ SendSIGKILL=yes
 StandardOutput=journal
 StandardError=journal
 
+
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -27,13 +32,21 @@ PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
+
+
 ProtectControlGroups=no
+ReadWritePaths=/sys/fs/cgroup /run
+
+
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
 
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 
+
 CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
-AmbientCapabilities=CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
 
 RestrictNamespaces=yes
 
