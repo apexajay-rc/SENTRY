@@ -16,7 +16,7 @@ class CgroupManager:
         # {pid: (kernel_start_ticks, expiration_timestamp)}
         self.throttled_tasks: Dict[int, Tuple[int, float]] = {}
         # Track dynamically modified cgroup delegations for clean rollback
-        self.delegated_subtrees: set[str] = set()
+        self.delegated_subtrees: Dict[int, set[str]] = {}
 
     def clear_orphaned_throttles(self) -> None:
         """Scans running processes on startup and clears orphaned SENTRY cgroup limits."""
@@ -36,7 +36,7 @@ class CgroupManager:
                     if os.path.exists(cpu_max_path):
                         with open(cpu_max_path, "r") as f:
                             actual = f.read().strip()
-                        if actual == "20000 100000":
+                        if actual != "max 100000":
                             with open(cpu_max_path, "w") as f:
                                 f.write("max 100000")
                             self.logger.info(f"Cleared orphaned CPU throttle on PID {pid}")
@@ -68,17 +68,17 @@ class CgroupManager:
         except Exception:
             return None
 
-    def _pierce_cgroup_delegation(self, cgroup_path: str) -> None:
-        """
-        The Cgroup Piercer.
-        Walks top-down from the cgroup root, physically unlocking the hardware controllers.
-        """
+    def _pierce_cgroup_delegation(self, pid: int, cgroup_path: str) -> None:
+        """Walks top-down, physically unlocking hardware controllers and tracking them by PID."""
         if not cgroup_path.startswith("/sys/fs/cgroup"):
             return
 
         rel_path = cgroup_path[len("/sys/fs/cgroup"):].strip("/")
         if not rel_path:
             return
+
+        if pid not in self.delegated_subtrees:
+            self.delegated_subtrees[pid] = set()
 
         parts = rel_path.split("/")
         current_path = "/sys/fs/cgroup"
@@ -89,34 +89,42 @@ class CgroupManager:
                 if os.path.exists(subtree_path):
                     with open(subtree_path, "w") as f:
                         f.write("+cpu +memory +io")
-                    self.delegated_subtrees.add(subtree_path)
+                    self.delegated_subtrees[pid].add(subtree_path)
             except PermissionError:
-                self.logger.error(f"Piercer blocked at {subtree_path}: root slice locked by systemd. Throttle will fall back to scheduler.")
-                raise  # Propagate to caller to trigger fallback
-            except Exception as e:
-                self.logger.warning(f"Piercer error at {subtree_path}: {e}")
-                
-            current_path = os.path.join(current_path, part)
-
-        try:
-            target_subtree = os.path.join(cgroup_path, "cgroup.subtree_control")
-            if os.path.exists(target_subtree):
-                with open(target_subtree, "w") as f:
-                    f.write("+cpu +memory +io")
-                self.delegated_subtrees.add(target_subtree)
-        except Exception:
-            pass
-
-    def _rollback_delegations(self) -> None:
-        """Clean up dynamically enabled cgroup controllers to prevent configuration drift."""
-        for subtree_path in list(self.delegated_subtrees):
-            try:
-                if os.path.exists(subtree_path):
-                    with open(subtree_path, "w") as f:
-                        f.write("-cpu -memory -io")
+                self.logger.error(f"Piercer blocked at {subtree_path}: root slice locked by systemd.")
+                raise
             except Exception:
                 pass
-        self.delegated_subtrees.clear()
+            current_path = os.path.join(current_path, part)
+
+    def _rollback_pid_delegations(self, pid: int) -> None:
+        """Securely locks cgroup pathways unique to this PID without breaking shared active slices."""
+        if pid not in self.delegated_subtrees:
+            return
+            
+        # Compile a set of all subtrees still actively required by OTHER running tasks
+        active_shared_paths = set()
+        for active_pid, paths in self.delegated_subtrees.items():
+            if active_pid != pid:
+                active_shared_paths.update(paths)
+                
+        # Rollback only the paths that are exclusively owned by the expiring PID
+        for path in self.delegated_subtrees[pid]:
+            if path not in active_shared_paths:
+                try:
+                    if os.path.exists(path):
+                        with open(path, "w") as f:
+                            f.write("-cpu -memory -io")
+                except Exception:
+                    pass
+                    
+        del self.delegated_subtrees[pid]
+
+    def _rollback_all_delegations(self) -> None:
+        """Total system cleanup during daemon shutdown."""
+        all_pids = list(self.delegated_subtrees.keys())
+        for pid in all_pids:
+            self._rollback_pid_delegations(pid)
 
     def register_throttle(self, pid: int, unlock_time: float, start_time: int) -> None:
         self.throttled_tasks[pid] = (start_time, unlock_time)
@@ -154,11 +162,8 @@ class CgroupManager:
             self.release_memory_throttle(pid)
             self.release_cpu_throttle(pid)
             self.release_io_throttle(pid)
+            self._rollback_pid_delegations(pid)
             self.throttled_tasks.pop(pid, None)
-            
-        # Rollback all modified tree paths if no tasks remain actively throttled
-        if not self.throttled_tasks:
-            self._rollback_delegations()
 
     def _verify_write(self, path: str, expected: str) -> bool:
         try:
@@ -179,7 +184,7 @@ class CgroupManager:
             return start_time
 
         try:
-            self._pierce_cgroup_delegation(cgroup_path)
+            self._pierce_cgroup_delegation(pid,cgroup_path)
         except PermissionError:
             self._apply_scheduler_fallback(pid)
             return start_time
@@ -213,7 +218,7 @@ class CgroupManager:
             return start_time
 
         try:
-            self._pierce_cgroup_delegation(cgroup_path)
+            self._pierce_cgroup_delegation(pid,cgroup_path)
         except PermissionError:
             self._apply_scheduler_fallback(pid)
             return start_time
@@ -245,7 +250,7 @@ class CgroupManager:
             return start_time
 
         try:
-            self._pierce_cgroup_delegation(cgroup_path)
+            self._pierce_cgroup_delegation(pid, cgroup_path)
         except PermissionError:
             return start_time
 
@@ -319,4 +324,4 @@ class CgroupManager:
             self.release_cpu_throttle(pid)
             self.release_io_throttle(pid)
         self.throttled_tasks.clear()
-        self._rollback_delegations()
+        self._rollback_all_delegations()

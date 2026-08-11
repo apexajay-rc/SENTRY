@@ -46,7 +46,7 @@ PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 
 
-CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_SYS_RESOURCE 
 
 RestrictNamespaces=yes
 
