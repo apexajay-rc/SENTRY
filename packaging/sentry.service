@@ -1,54 +1,25 @@
 [Unit]
 Description=SENTRY Pressure-Aware Resource Daemon
-Documentation=https://github.com/apexajay-rc/SENTRY
-After=sysinit.target local-fs.target
-ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
-ConditionPathExists=/proc/pressure/memory
+After=network.target
 
 [Service]
-Type=notify
+Type=simple
+User=root
 WorkingDirectory=/opt/sentry
 Environment="PYTHONPATH=/opt/sentry"
 
+# Inject UID 1000 (maj-ajay) so the daemon knows who to give socket access to
 Environment="SUDO_UID=1000"
 Environment="SUDO_GID=1000"
 
+# Execute exactly as if you ran it manually with sudo
 ExecStart=/opt/sentry/venv/bin/python /opt/sentry/daemon/main.py
 
-Restart=on-failure
+Restart=always
 RestartSec=3
-WatchdogSec=15s
-TimeoutStopSec=10s
-SendSIGKILL=yes
 
-StandardOutput=journal
-StandardError=journal
-
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-
-
-ProtectControlGroups=no
-ReadWritePaths=/sys/fs/cgroup /run
-
-
-MemoryDenyWriteExecute=yes
-RestrictSUIDSGID=yes
-RestrictRealtime=yes
-
-PrivateNetwork=yes
-RestrictAddressFamilies=AF_UNIX
-
-
-CapabilityBoundingSet=CAP_SYS_RESOURCE 
-
-RestrictNamespaces=yes
+# Ensure open permissions on socket creation before the daemon chowns them
+UMask=0000
 
 [Install]
 WantedBy=multi-user.target

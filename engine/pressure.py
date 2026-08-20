@@ -19,12 +19,13 @@ class PressureEngine:
 
     def __init__(self, weights: Optional[dict[str, float]] = None):
         self.weights = {**DEFAULT_PRESSURE_WEIGHTS, **(weights or {})}
+        self.previous_stress = 0.0
 
     def score(
         self,
         utilization: UtilizationSample,
         psi: Optional[PsiSample] = None,
-    ) -> PressureSnapshot:
+    ) -> tuple[PressureSnapshot, float]:
         psi_sample = psi or PsiSample()
         utilization_score = self.utilization_score(utilization)
         psi_score = self.psi_score(psi_sample)
@@ -35,7 +36,10 @@ class PressureEngine:
             blend = self._bounded_weight("psi_blend")
             total = round(((1 - blend) * utilization_score) + (blend * psi_score), 2)
 
-        return PressureSnapshot(
+        stress_delta = round(total - self.previous_stress, 2)
+        self.previous_stress = total
+
+        snapshot = PressureSnapshot(
             utilization=utilization,
             psi=psi_sample,
             score=PressureScore(
@@ -44,6 +48,7 @@ class PressureEngine:
                 psi=psi_score,
             ),
         )
+        return snapshot, stress_delta
 
     def utilization_score(self, sample: UtilizationSample) -> float:
         cpu_w = self.weights["cpu_weight"]
@@ -87,8 +92,8 @@ def compute_pressure_score(
     psi_cpu: Optional[float] = None,
     psi_memory: Optional[float] = None,
     psi_io: Optional[float] = None,
-) -> PressureScore:
-    snapshot = PressureEngine(weights).score(
+) -> tuple[PressureScore, float]:
+    snapshot, delta = PressureEngine(weights).score(
         UtilizationSample(cpu_percent=cpu, memory_percent=memory, io_wait_percent=io),
         PsiSample(
             cpu_some_avg10=psi_cpu,
@@ -96,5 +101,4 @@ def compute_pressure_score(
             io_some_avg10=psi_io,
         ),
     )
-    return snapshot.score
-
+    return snapshot.score, delta

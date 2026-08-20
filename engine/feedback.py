@@ -6,6 +6,7 @@ Basis for the Verify → Learn stages of Observe→Understand→Predict→Optimi
 """
 
 from dataclasses import dataclass
+import time
 
 
 @dataclass
@@ -21,43 +22,38 @@ class ActionOutcome:
 
 class FeedbackEngine:
     """Evaluates whether actions improved system pressure."""
-    
-    def evaluate(
-        self,
-        pid: int,
-        stress_before: float,
-        stress_after: float,
-        pressure_before: str,
-        pressure_after: str,
-    ) -> ActionOutcome:
+
+    def __init__(self, logger=None):
+        self.logger = logger
+        # Tracks pending evaluations: pid -> {stress_before, pressure_before, level, timestamp}
+        self._pending = {}
+
+    def record_action(self, pid: int, stress_before: float, pressure_before: str, level: str) -> None:
+        """Records pre-action state for later evaluation."""
+        self._pending[pid] = {
+            "stress_before": stress_before,
+            "pressure_before": pressure_before,
+            "level": level,
+            "timestamp": time.monotonic(),
+        }
+
+    def evaluate_action(self, pid: int, stress_after: float, pressure_after: str) -> bool:
+        """Evaluates action using stored pre-state and current post-state.
+        Returns True if successful, False otherwise.
         """
-        Evaluate whether an action was successful.
-        
-        Success is defined as: stress improved AND pressure level did not worsen.
-        
-        Args:
-            pid: Process ID that was throttled
-            stress_before: Stress score before action
-            stress_after: Stress score after action (post-cooldown)
-            pressure_before: Pressure level before action
-            pressure_after: Pressure level after action
-        
-        Returns:
-            ActionOutcome with success/failure determination
-        """
+        if pid not in self._pending:
+            return False
+
+        record = self._pending.pop(pid)
+        stress_before = record["stress_before"]
+        pressure_before = record["pressure_before"]
+
         stress_improved = stress_after < stress_before
         pressure_improved = self._is_improvement(pressure_before, pressure_after)
         successful = stress_improved and pressure_improved
-        
-        return ActionOutcome(
-            pid=pid,
-            stress_before=stress_before,
-            stress_after=stress_after,
-            pressure_before=pressure_before,
-            pressure_after=pressure_after,
-            successful=successful,
-        )
-    
+
+        return successful
+
     @staticmethod
     def _is_improvement(before: str, after: str) -> bool:
         """Check if pressure level improved or stayed same (did not worsen)."""

@@ -34,105 +34,9 @@ from core.config import SentryConfig
 
 # --- The Unified SENTRY Intelligence Engine ---
 from core.metrics import SystemMetricsSampler
-from core.policy import classify_basic, get_action_limits
+from core.policy import classify_basic, get_action_limits, get_dynamic_limits
 from engine.feedback import FeedbackEngine
-
-class ProcScanner:
-    """Lightweight PID scanner mathematically bound to the hardware topology."""
-    def __init__(self):
-        self.procs = {}
-        self.tick_count = 0
-        
-        # Pre-calculate hardware topology for O(1) math lookups
-        self.core_count = psutil.cpu_count(logical=True) or 1
-        
-        # Nemotron Fix #1: Dynamic topology threshold. 
-        # 95.0 ensures 1 fully maxed core trips the sensor despite scheduler micro-yields.
-        self.dynamic_threshold = 95.0 / self.core_count
-
-    def get_top_hogs(self, threshold=None):
-        self.tick_count += 1
-        hogs = []
-        
-        # Use dynamic threshold if a custom policy threshold isn't passed
-        active_threshold = threshold if threshold is not None else self.dynamic_threshold
-        
-        # Garbage collection: Cleanup dead PIDs periodically
-        if self.tick_count % 10 == 0:
-            current_pids = set(psutil.pids())
-            dead_pids = set(self.procs.keys()) - current_pids
-            for pid in dead_pids:
-                del self.procs[pid]
-
-        for pid in psutil.pids():
-            try:
-                if pid not in self.procs:
-                    p = psutil.Process(pid)
-                    p.cpu_percent() # Prime the psutil counter (returns 0.0 on first call)
-                    self.procs[pid] = p
-                else:
-                    # psutil returns up to (100 * cores). Normalize to system-wide percentage
-                    # to match the Nemotron mathematical proof.
-                    raw_cpu = self.procs[pid].cpu_percent()
-                    system_cpu = raw_cpu / self.core_count
-                    
-                    if system_cpu > active_threshold:
-                        hogs.append(pid)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                if pid in self.procs:
-                    del self.procs[pid]
-            except Exception:
-                pass
-                
-        return hogs
-
-class FeedbackEngine:
-    """Evaluates cgroup effectiveness using Strict Causal Attribution (Per-PID telemetry)."""
-    def __init__(self, logger):
-        self.logger = logger
-        self.pending_evaluations = {}
-
-    def record_action(self, pid: int, action_level: str):
-        """Takes a snapshot of the process EXACTLY before the clamp is applied."""
-        try:
-            target = psutil.Process(pid)
-            target.cpu_percent(interval=None) # Prime the CPU counter
-            pre_rss = target.memory_info().rss
-            
-            self.pending_evaluations[pid] = {
-                "level": action_level,
-                "pre_rss": pre_rss,
-                "timestamp": time.monotonic()
-            }
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-
-    def evaluate_action(self, pid: int):
-        """Evaluates the process after the cooldown expires to prove the cgroup lock worked."""
-        if pid not in self.pending_evaluations:
-            return
-
-        record = self.pending_evaluations.pop(pid)
-        
-        try:
-            target = psutil.Process(pid)
-            cooldown_cpu_avg = target.cpu_percent(interval=None)
-            post_rss = target.memory_info().rss
-            
-            # CAUSAL ATTRIBUTION MATH
-            if cooldown_cpu_avg < 90.0 or post_rss <= record["pre_rss"]:
-                self.logger.info(
-                    f"Feedback: Action on PID {pid} SUCCESS. "
-                    f"[Avg CPU: {cooldown_cpu_avg:.1f}%] "
-                    f"[RSS: {record['pre_rss'] / 1024**2:.1f}MB -> {post_rss / 1024**2:.1f}MB]"
-                )
-            else:
-                self.logger.warning(f"Feedback: Action on PID {pid} FAILED. Rogue process resisting limits.")
-                
-        except psutil.NoSuchProcess:
-            self.logger.info(f"Feedback: Action on PID {pid} SUCCESS. Process terminated naturally.")
-        except Exception as e:
-            self.logger.error(f"Feedback loop error on PID {pid}: {e}")
+from core.proc_scanner import ProcScanner
 
 class SentryDaemon:
     def __init__(self) -> None:
@@ -143,17 +47,17 @@ class SentryDaemon:
         self.cgroup_mgr = CgroupManager(self.logger)
         self.safety_guard = SafetyGuard()
         self.proc_scanner = ProcScanner()
-        
+
         # Intelligence & Feedback integration
         self.sampler = SystemMetricsSampler(interval=0.2)
         # Track state for feedback evaluation: {pid: (stress_score_before, pressure_level_before)}
-        #self.active_mitigations: Dict[int, Tuple[float, str]] = {}
+        # self.active_mitigations: Dict[int, Tuple[float, str]] = {}
         self.total_sys_mem = psutil.virtual_memory().total
-        
+
         self.spatial_pid: Optional[int] = None
         self.bridge_sock_path = "/run/sentry_bridge.sock"
         self.hud_sock_path = "/run/sentry_hud.sock"
-        
+
         self._cleanup_sockets()
 
         # IPC Sockets
@@ -164,23 +68,27 @@ class SentryDaemon:
         self.hud_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.hud_sock.bind(self.hud_sock_path)
         self.hud_sock.setblocking(False)
-        
+
+        # Secure sockets AFTER bind (post-bind helper)
+        self._secure_sockets()
+
+        self.running = True
+        self.observe_only = False
+        signal.signal(signal.SIGTERM, self.shutdown)
+        signal.signal(signal.SIGINT, self.shutdown)
+
+    def _secure_sockets(self) -> None:
+        """Apply ownership/perms AFTER bind. Must be called post-bind."""
         try:
             sudo_uid = os.environ.get("SUDO_UID")
             if sudo_uid and sudo_uid.isdigit():
                 sudo_uid_int = int(sudo_uid)
                 sudo_gid_int = int(os.environ.get("SUDO_GID", sudo_uid))
-                os.chown(self.bridge_sock_path, sudo_uid_int, sudo_gid_int)
-                os.chown(self.hud_sock_path, sudo_uid_int, sudo_gid_int)
-            os.chmod(self.bridge_sock_path, 0o660)
-            os.chmod(self.hud_sock_path, 0o660)
+                for path in [self.bridge_sock_path, self.hud_sock_path]:
+                    os.chown(path, sudo_uid_int, sudo_gid_int)
+                    os.chmod(path, 0o660)
         except Exception as e:
             self.logger.warning(f"Could not secure IPC sockets: {e}")
-        
-        self.running = True
-        self.observe_only = False
-        signal.signal(signal.SIGTERM, self.shutdown)
-        signal.signal(signal.SIGINT, self.shutdown)
 
     def _cleanup_sockets(self) -> None:
         for path in [self.bridge_sock_path, self.hud_sock_path]:
@@ -197,7 +105,7 @@ class SentryDaemon:
             notify_socket = '\0' + notify_socket[1:]
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
-                sock.sendto(state.encode(), notify_socket) # type: ignore
+                sock.sendto(state.encode(), notify_socket)  # type: ignore
         except Exception:
             pass
 
@@ -223,7 +131,9 @@ class SentryDaemon:
                     state = {
                         "spatial_pid": self.spatial_pid,
                         "throttled_tasks": throttled,
-                        "observe_only": self.observe_only
+                        "observe_only": self.observe_only,
+                        "stress_score": getattr(self, 'current_stress', 0.0),
+                        "state": getattr(self, 'current_level', "UNKNOWN")
                     }
                     self.hud_sock.sendto(json.dumps(state).encode(), addr)
                 elif cmd == "TOGGLE_OBSERVE":
@@ -272,20 +182,33 @@ class SentryDaemon:
             try:
                 # Use monotonic time to survive system hibernation/NTP adjustments
                 now = time.monotonic()
+                action_taken = False
                 self._process_ipc(now)
                 
                 # 1. Unified Intelligence Collection (Blocks for 200ms)
-                metrics = self.sampler.sample_blocking()
-                current_stress = metrics.stress_score
-                current_level = classify_basic(current_stress)
-                limits = get_action_limits(current_level)
                 
+                metrics = self.sampler.sample_blocking()
+                
+                # Safely unwrap the API change from engine/pressure.py
+                if isinstance(metrics.stress_score, tuple):
+                    pressure_obj, stress_delta = metrics.stress_score
+                    current_stress = getattr(pressure_obj, 'total', float(pressure_obj))
+                else:
+                    current_stress = getattr(metrics.stress_score, 'total', float(metrics.stress_score))
+                    stress_delta = current_stress - getattr(self, '_prev_stress', current_stress)
+                    self._prev_stress = current_stress
+
+                # Proportional-Derivative (PD) Actuator
+                limits = get_dynamic_limits(current_stress, stress_delta)
+                current_level = limits.get("state", "UNKNOWN")
+                self.current_stress = current_stress
+                self.current_level = current_level
                 # 2. Feedback Loop Evaluation (Check expired tasks BEFORE reconcile)
                 expired_pids = [p for p, (_, exp) in self.cgroup_mgr.throttled_tasks.items() if now >= exp]
                 for p in expired_pids:
                     # Fire the new Causal Attribution evaluator
-                    self.feedback_engine.evaluate_action(p)
-                
+                    self.feedback_engine.evaluate_action(p, current_stress, current_level)
+
                 self.cgroup_mgr.reconcile_cooldowns(now)
                 
                 # 3. Dynamic Execution
@@ -305,7 +228,7 @@ class SentryDaemon:
                                     print(f"\n[OBSERVE ONLY - {current_level}] Would clamp PID {pid} to {limits['cpu_weight']}%", flush=True)
                                 else:
                                     print(f"\n[ACTION] [{current_level}] Throttling hog (PID {pid}). Unified Score: {current_stress:.2f}", flush=True)
-                                    self.feedback_engine.record_action(pid, current_level)
+                                    self.feedback_engine.record_action(pid, current_stress, current_level, current_level)
                                     # CPU Throttle
                                     start_tick = self.cgroup_mgr.apply_cpu_throttle(pid, limits["cpu_weight"])
                                     
@@ -314,8 +237,18 @@ class SentryDaemon:
                                         try:
                                             # Grab the exact bytes the process is currently using
                                             proc_rss = psutil.Process(pid).memory_info().rss
-                                            # Apply the percentage clamp to squeeze the process down
-                                            mem_bytes = int(proc_rss * (limits["memory_limit_percent"] / 100.0))
+                                            # Calculate limit as percentage of TOTAL SYSTEM MEMORY (config intent)
+                                            # This enforces system-wide memory pressure policy, not per-process squeeze
+                                            mem_bytes = int(self.total_sys_mem * (limits["memory_limit_percent"] / 100.0))
+                                            # SAFETY: Never set memory.high BELOW current RSS + 10% headroom
+                                            # This prevents instant OOM kill when process is already above the calculated limit
+                                            min_safe = int(proc_rss * 1.1)
+                                            if mem_bytes < min_safe:
+                                                mem_bytes = min_safe
+                                                self.logger.warning(
+                                                    f"Memory limit for PID {pid} raised from {mem_bytes} to {min_safe} "
+                                                    f"(current RSS: {proc_rss}, limit%: {limits['memory_limit_percent']}%)"
+                                                )
                                             self.cgroup_mgr.apply_memory_throttle(pid, mem_bytes)
                                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                                             pass
@@ -326,8 +259,6 @@ class SentryDaemon:
                                         
                                     if start_tick is not None:
                                         self.cgroup_mgr.register_throttle(pid, now + self.cooldown_sec, start_tick)
-                                        # Record initial state for the feedback loop
-                                        self.active_mitigations[pid] = (current_stress, current_level)
                 
                 # 4. Continuous Telemetry Logging
                 if not hasattr(self, '_last_print') or now - self._last_print > 3.0:

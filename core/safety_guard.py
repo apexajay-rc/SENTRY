@@ -15,11 +15,13 @@ class SafetyGuard:
         # Critical system infrastructure that must NEVER be throttled
         # We removed broad application names (like browsers, docker, python) 
         # so SENTRY can do its actual job.
+        # Includes Priority Inversion protection for critical IPC daemons.
         self.infrastructure_immunity = {
             "systemd", "dbus-daemon", "Xorg", "wayland", "sway",
             "hyprland", "gnome-shell", "kwin_wayland",
             "xdg-desktop-po", "xdg-document-po",
-            "sshd", "pipewire", "wireplumber", "pulseaudio"
+            "sshd", "pipewire", "wireplumber", "pulseaudio",
+            "systemd-resolve",  # systemd-resolved (15-char truncation in /proc/pid/comm)
         }
 
     def is_immune(self, pid: int) -> bool:

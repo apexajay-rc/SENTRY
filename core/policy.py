@@ -94,3 +94,49 @@ def get_action_limits(stress_level):
 def is_critical_level(stress_level):
     """Check if stress level requires immediate action."""
     return stress_level in ["HIGH", "CRITICAL"]
+def get_dynamic_limits(stress_score: float, stress_delta: float) -> dict:
+    """
+    Calculates dynamic hardware limits using Proportional-Derivative (PD) logic.
+    Replaces the rigid step-based classification to cure oscillation.
+    """
+    base_limit = 100
+    threshold_mod = THRESHOLDS.get("MODERATE", 0.20)
+
+    # Early exit if system is stable or actively recovering naturally
+    if stress_score < threshold_mod and stress_delta <= 0:
+        return {
+            "cpu_weight": base_limit,
+            "memory_limit_percent": ESCALATION_MATRIX["LOW"]["memory_limit_percent"],
+            "io_weight": base_limit,
+            "state": "LOW"
+        }
+
+    # Proportional penalty: How severe is the current absolute stress?
+    p_penalty = max(0.0, (stress_score - threshold_mod) * 100)
+    
+    # Derivative penalty: How fast is it climbing/falling?
+    d_penalty = stress_delta * 200
+
+    total_penalty = p_penalty + d_penalty
+    
+    # Clamp dynamic limit safely between 5% and 100%
+    dynamic_limit = max(5, min(100, int(100 - total_penalty)))
+
+    # Resolve discrete state for HUD logging and static memory limits
+    if dynamic_limit < 20:
+        state = "CRITICAL"
+    elif dynamic_limit < 60:
+        state = "HIGH"
+    elif dynamic_limit < 100:
+        state = "MODERATE"
+    else:
+        state = "LOW"
+
+    mem_limit = ESCALATION_MATRIX.get(state, ESCALATION_MATRIX["LOW"])["memory_limit_percent"]
+
+    return {
+        "cpu_weight": dynamic_limit,
+        "memory_limit_percent": mem_limit,
+        "io_weight": dynamic_limit,
+        "state": state
+    }

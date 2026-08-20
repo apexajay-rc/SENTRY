@@ -86,7 +86,7 @@ def compute_stress_breakdown(
     psi_memory: Optional[float] = None,
     psi_io: Optional[float] = None,
 ) -> StressBreakdown:
-    score = compute_pressure_score(
+    score, delta = compute_pressure_score(
         cpu,
         memory,
         io,
@@ -95,7 +95,8 @@ def compute_stress_breakdown(
         psi_memory=psi_memory,
         psi_io=psi_io,
     )
-    return StressBreakdown(total=score.total, utilization=score.utilization, psi=score.psi)
+    # Forward the (total, delta) tuple so main.py can extract the derivative
+    return StressBreakdown(total=(score.total, delta), utilization=score.utilization, psi=score.psi)
 
 
 def compute_stress(
