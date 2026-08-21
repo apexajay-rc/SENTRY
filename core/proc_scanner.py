@@ -168,7 +168,7 @@ class ProcScanner:
             sorted_candidates = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
             # Target the top contributors to break the swarm (minimum 2% system CPU to ignore noise)
             for pid, cpu in sorted_candidates[:4]:
-                if cpu >= 2.0:
+                if cpu >= 10.0:
                     hogs.append(pid)
 
         return hogs

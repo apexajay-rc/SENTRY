@@ -8,7 +8,8 @@ Secured IPC sockets via SUDO_UID to prevent unprivileged PID spoofing.
 Hardened v1.2: Fully Unified Architecture. Integrates the SystemMetricsSampler,
 Policy Engine, and Feedback Loop for true PSI-blended stress evaluation.
 """
-
+import pwd
+import grp
 import sys
 import os
 import time
@@ -37,6 +38,39 @@ from core.metrics import SystemMetricsSampler
 from core.policy import classify_basic, get_action_limits, get_dynamic_limits
 from engine.feedback import FeedbackEngine
 from core.proc_scanner import ProcScanner
+
+# --- PHASE 2 PRIVILEGE DROP HELPER ---
+def drop_privileges(username: str = "sentry") -> None:
+    """
+    Drops root privileges to an unprivileged system user (eUID drop)
+    after sockets are bound and initialization is complete.
+    """
+    if os.getuid() != 0:
+        return  # Already running as non-root
+
+    try:
+        pw_record = pwd.getpwnam(username)
+        uid = pw_record.pw_uid
+        gid = pw_record.pw_gid
+
+        # Drop supplementary groups first
+        os.setgroups([])
+        
+        # Drop group ID, then user ID
+        os.setgid(gid)
+        os.setuid(uid)
+
+        # Verify drop was successful
+        if os.getuid() == 0:
+            raise PermissionError("Failed to drop root privileges; UID is still 0.")
+        
+        print(f"[SECURITY] Sandbox Locked: Dropped privileges to '{username}' (UID: {uid})", flush=True)
+    except KeyError:
+        print(f"[WARNING] System user '{username}' not found. Skipping privilege drop.", flush=True)
+    except Exception as e:
+        print(f"[CRITICAL] Privilege drop failed: {e}", flush=True)
+        sys.exit(1)
+# -------------------------------------
 
 class SentryDaemon:
     def __init__(self) -> None:
@@ -71,6 +105,7 @@ class SentryDaemon:
 
         # Secure sockets AFTER bind (post-bind helper)
         self._secure_sockets()
+        drop_privileges("sentry")
 
         self.running = True
         self.observe_only = False
@@ -78,15 +113,16 @@ class SentryDaemon:
         signal.signal(signal.SIGINT, self.shutdown)
 
     def _secure_sockets(self) -> None:
-        """Apply ownership/perms AFTER bind. Must be called post-bind."""
+        """Apply ownership/perms AFTER bind so both daemon and user can communicate."""
         try:
-            sudo_uid = os.environ.get("SUDO_UID")
-            if sudo_uid and sudo_uid.isdigit():
-                sudo_uid_int = int(sudo_uid)
-                sudo_gid_int = int(os.environ.get("SUDO_GID", sudo_uid))
-                for path in [self.bridge_sock_path, self.hud_sock_path]:
-                    os.chown(path, sudo_uid_int, sudo_gid_int)
-                    os.chmod(path, 0o660)
+            import pwd
+            # Daemon needs ownership, User (1000) needs group access
+            sentry_uid = pwd.getpwnam("sentry").pw_uid
+            sudo_gid = int(os.environ.get("SUDO_GID", "1000"))
+            
+            for path in [self.bridge_sock_path, self.hud_sock_path]:
+                os.chown(path, sentry_uid, sudo_gid)
+                os.chmod(path, 0o660)
         except Exception as e:
             self.logger.warning(f"Could not secure IPC sockets: {e}")
 
@@ -203,6 +239,11 @@ class SentryDaemon:
                 current_level = limits.get("state", "UNKNOWN")
                 self.current_stress = current_stress
                 self.current_level = current_level
+                #LAZY EVALUATION: Only evaluate feedback if the system is under stress
+                if current_level in ["LOW","MODERATE","UNKNOWN"]:
+                    time.sleep(0.8)
+                else:
+                    time.sleep(0.5)
                 # 2. Feedback Loop Evaluation (Check expired tasks BEFORE reconcile)
                 expired_pids = [p for p, (_, exp) in self.cgroup_mgr.throttled_tasks.items() if now >= exp]
                 for p in expired_pids:
@@ -212,7 +253,7 @@ class SentryDaemon:
                 self.cgroup_mgr.reconcile_cooldowns(now)
                 
                 # 3. Dynamic Execution
-                if current_level in ["MODERATE", "HIGH", "CRITICAL"]:
+                if current_level in ["HIGH", "CRITICAL"]:
                     # Only scan for hogs if the unified score dictates it
                     hogs = self.proc_scanner.get_top_hogs()
                     

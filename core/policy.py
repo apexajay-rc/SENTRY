@@ -10,10 +10,10 @@ if TYPE_CHECKING:
 
 # Stress level thresholds (customize based on workload)
 THRESHOLDS = {
-    "LOW": 0.35,
-    "MODERATE": 0.20,
-    "HIGH": 0.70,
-    "CRITICAL": 0.85,
+    "LOW": 0.40,
+    "MODERATE": 0.55,
+    "HIGH": 0.75,
+    "CRITICAL": 0.90,
 }
 
 # Action escalation mapping: stress level → (cpu_weight, memory_limit_percent, io_weight)
@@ -47,10 +47,10 @@ def configure_policy(config: "ConfigParser") -> None:
 
     thresholds = config.all_thresholds()  # type: ignore[attr-defined]
     THRESHOLDS = {
-        "LOW": thresholds.get("low", 0.35),
-        "MODERATE": thresholds.get("moderate", 0.50),
-        "HIGH": thresholds.get("high", 0.70),
-        "CRITICAL": thresholds.get("critical", 0.85),
+        "LOW": thresholds.get("low", 0.40),
+        "MODERATE": thresholds.get("moderate", 0.55),
+        "HIGH": thresholds.get("high", 0.75),
+        "CRITICAL": thresholds.get("critical", 0.90),
     }
 
     ESCALATION_MATRIX = {}
@@ -100,7 +100,7 @@ def get_dynamic_limits(stress_score: float, stress_delta: float) -> dict:
     Replaces the rigid step-based classification to cure oscillation.
     """
     base_limit = 100
-    threshold_mod = THRESHOLDS.get("MODERATE", 0.20)
+    threshold_mod = THRESHOLDS.get("MODERATE", 0.55)
 
     # Early exit if system is stable or actively recovering naturally
     if stress_score < threshold_mod and stress_delta <= 0:
@@ -115,7 +115,7 @@ def get_dynamic_limits(stress_score: float, stress_delta: float) -> dict:
     p_penalty = max(0.0, (stress_score - threshold_mod) * 100)
     
     # Derivative penalty: How fast is it climbing/falling?
-    d_penalty = stress_delta * 200
+    d_penalty = stress_delta * 100
 
     total_penalty = p_penalty + d_penalty
     
@@ -125,9 +125,9 @@ def get_dynamic_limits(stress_score: float, stress_delta: float) -> dict:
     # Resolve discrete state for HUD logging and static memory limits
     if dynamic_limit < 20:
         state = "CRITICAL"
-    elif dynamic_limit < 60:
+    elif dynamic_limit < 50:
         state = "HIGH"
-    elif dynamic_limit < 100:
+    elif dynamic_limit < 85:
         state = "MODERATE"
     else:
         state = "LOW"

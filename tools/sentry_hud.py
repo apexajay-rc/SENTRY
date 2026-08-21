@@ -61,7 +61,7 @@ def format_state(state: Dict[str, Any]) -> str:
     
     lines = []
     lines.append(f"{BOLD}╔═══════════════════════════════════════════════════════════╗{RESET}")
-    lines.append(f"{BOLD}║                    SENTRY HUD CLIENT                        ║{RESET}")
+    lines.append(f"{BOLD}║                    SENTRY HUD CLIENT                      ║{RESET}")
     lines.append(f"{BOLD}╚═══════════════════════════════════════════════════════════╝{RESET}")
     lines.append("")
     lines.append(f"  {BOLD}System Stress Score:{RESET} {CYAN}{stress:.3f}{RESET}")
@@ -96,6 +96,8 @@ def query_hud_socket() -> Optional[Dict[str, Any]]:
             os.unlink(client_sock_path)
         
         sock.bind(client_sock_path)
+
+        os.chmod(client_sock_path, 0o666)  
         
         # Send STATUS command
         sock.sendto(b"STATUS", HUD_SOCKET_PATH)
