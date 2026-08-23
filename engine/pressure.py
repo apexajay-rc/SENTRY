@@ -25,7 +25,7 @@ class PressureEngine:
         self,
         utilization: UtilizationSample,
         psi: Optional[PsiSample] = None,
-    ) -> tuple[PressureSnapshot, float]:
+    ) -> PressureSnapshot:
         psi_sample = psi or PsiSample()
         utilization_score = self.utilization_score(utilization)
         psi_score = self.psi_score(psi_sample)
@@ -48,7 +48,7 @@ class PressureEngine:
                 psi=psi_score,
             ),
         )
-        return snapshot, stress_delta
+        return snapshot
 
     def utilization_score(self, sample: UtilizationSample) -> float:
         cpu_w = self.weights["cpu_weight"]
@@ -92,8 +92,8 @@ def compute_pressure_score(
     psi_cpu: Optional[float] = None,
     psi_memory: Optional[float] = None,
     psi_io: Optional[float] = None,
-) -> tuple[PressureScore, float]:
-    snapshot, delta = PressureEngine(weights).score(
+) -> PressureScore:
+    snapshot = PressureEngine(weights).score(
         UtilizationSample(cpu_percent=cpu, memory_percent=memory, io_wait_percent=io),
         PsiSample(
             cpu_some_avg10=psi_cpu,
@@ -101,4 +101,4 @@ def compute_pressure_score(
             io_some_avg10=psi_io,
         ),
     )
-    return snapshot.score, delta
+    return snapshot.score

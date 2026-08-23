@@ -86,7 +86,7 @@ def compute_stress_breakdown(
     psi_memory: Optional[float] = None,
     psi_io: Optional[float] = None,
 ) -> StressBreakdown:
-    score, delta = compute_pressure_score(
+    score = compute_pressure_score(
         cpu,
         memory,
         io,
@@ -95,8 +95,7 @@ def compute_stress_breakdown(
         psi_memory=psi_memory,
         psi_io=psi_io,
     )
-    # Forward the (total, delta) tuple so main.py can extract the derivative
-    return StressBreakdown(total=(score.total, delta), utilization=score.utilization, psi=score.psi)
+    return StressBreakdown(total=score.total, utilization=score.utilization, psi=score.psi)
 
 
 def compute_stress(
@@ -190,7 +189,10 @@ class SystemMetricsSampler:
 
     def sample_blocking(self) -> SystemMetrics:
         if self._previous is None:
-            return self.warmup()
+            # Warmup: take first snapshot, sleep, then return REAL sample
+            self._previous = read_system_stat(self.proc_root)
+            time.sleep(self.interval)
+            return self.sample()
 
         time.sleep(self.interval)
         return self.sample()

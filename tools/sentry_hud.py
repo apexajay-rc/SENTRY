@@ -96,9 +96,8 @@ def query_hud_socket() -> Optional[Dict[str, Any]]:
             os.unlink(client_sock_path)
         
         sock.bind(client_sock_path)
+        os.chmod(client_sock_path, 0o666)
 
-        os.chmod(client_sock_path, 0o666)  
-        
         # Send STATUS command
         sock.sendto(b"STATUS", HUD_SOCKET_PATH)
         
