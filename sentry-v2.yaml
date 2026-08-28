@@ -1,0 +1,17 @@
+thresholds:
+  low: 35
+  moderate: 55
+  high: 75
+  critical: 95
+  psi_trigger: 10.0
+  hysteresis: 5
+
+memory:
+  mode: "RELATIVE_MULTIPLIER"
+  value: 1.5
+
+immunity:
+  immune_slices:
+    - "user.slice"
+    - "system.slice"
+    - "sentry-immune.slice"

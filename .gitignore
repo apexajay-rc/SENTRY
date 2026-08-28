@@ -4,3 +4,13 @@ __pycache__/
 *.pyc
 .env
 .venv/
+
+# Python Virtual Environment
+myenv/
+venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
