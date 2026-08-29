@@ -1,7 +1,4 @@
-import asyncio
-import os
-import signal
-import logging
+import asyncio, os, signal, logging
 from pathlib import Path
 from typing import Dict
 from src.sentry_v2.actuator.protocol import ThrottleActuator, ThrottleSpec
@@ -15,15 +12,14 @@ class UserspaceActuator(ThrottleActuator):
         self._tasks: Dict[int, asyncio.Task] = {}
 
     async def apply_throttle(self, pid: int, spec: ThrottleSpec) -> None:
-        if pid in self._tasks:
-            self._tasks[pid].cancel()
+        if pid in self._tasks: self._tasks[pid].cancel()
         
+        # Ring-3 cannot do proportional weight. It falls back to quota regardless of mode.
         if spec.cpu_quota_pct >= 100:
             if pid in self._tasks: del self._tasks[pid]
             return
             
-        task = asyncio.create_task(self._duty_cycle(pid, spec.cpu_quota_pct))
-        self._tasks[pid] = task
+        self._tasks[pid] = asyncio.create_task(self._duty_cycle(pid, spec.cpu_quota_pct))
 
     async def release_throttle(self, pid: int) -> None:
         if pid in self._tasks:
@@ -31,14 +27,10 @@ class UserspaceActuator(ThrottleActuator):
             del self._tasks[pid]
             await self._send_signal(pid, signal.SIGCONT)
 
-    async def verify_throttle(self, pid: int) -> ThrottleSpec:
-        return ThrottleSpec(cpu_quota_pct=100, memory_limit_bytes=0)
-
     async def _duty_cycle(self, pid: int, quota_pct: int) -> None:
         period_sec = self.PERIOD_MS / 1000.0
         on_sec = period_sec * (quota_pct / 100.0)
         off_sec = period_sec - on_sec
-        
         try:
             while True:
                 await self._send_signal(pid, signal.SIGCONT)
@@ -57,6 +49,5 @@ class UserspaceActuator(ThrottleActuator):
                 for tid_str in os.listdir(task_dir):
                     if tid_str != str(pid):
                         try: os.kill(int(tid_str), sig)
-                        except (ProcessLookupError, PermissionError): pass
-        except (ProcessLookupError, PermissionError):
-            pass
+                        except: pass
+        except: pass

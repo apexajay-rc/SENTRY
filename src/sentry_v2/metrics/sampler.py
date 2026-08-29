@@ -18,17 +18,14 @@ class MetricsSampler:
         self.psi_interval = psi_interval
         self._prev_stat = None
         self._psi_counter = 0
+        self.last_total_delta = 0.0  # REMEDIATION 3: Expose system delta for Scanner
 
     async def sample(self) -> SystemSample:
-        # 1. CPU + IOWait (delta from /proc/stat)
         stat = await self._read_proc_stat()
         cpu_pct, io_pct = self._calc_cpu_io(stat)
         self._prev_stat = stat
-
-        # 2. Memory (instantaneous from /proc/meminfo)
         mem_pct = await self._read_mem_pct()
-
-        # 3. PSI (every 10s)
+        
         psi_cpu = psi_mem = psi_io = None
         self._psi_counter += self.interval
         if self._psi_counter >= self.psi_interval:
@@ -44,11 +41,13 @@ class MetricsSampler:
 
     def _calc_cpu_io(self, cur: list[int]) -> tuple[float, float]:
         if self._prev_stat is None:
+            self.last_total_delta = 0.0
             return 0.0, 0.0
         prev = self._prev_stat
         total_delta = sum(cur) - sum(prev)
-        if total_delta <= 0:
-            return 0.0, 0.0
+        self.last_total_delta = float(total_delta)  # Track the delta
+        
+        if total_delta <= 0: return 0.0, 0.0
         idle_delta = cur[3] - prev[3]
         iowait_delta = cur[4] - prev[4]
         cpu_pct = 100.0 * (1.0 - idle_delta / total_delta)
