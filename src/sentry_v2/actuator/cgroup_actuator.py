@@ -1,80 +1,86 @@
-import asyncio
-import logging
 import os
+import time
 from pathlib import Path
-import aiofiles
-import aiofiles.os
-from src.sentry_v2.actuator.protocol import ThrottleActuator, ThrottleSpec
+from src.sentry_v2.actuator.protocol import ThrottleSpec
 
-logger = logging.getLogger("sentry.actuator.cgroup")
-
-CGROUP_ROOT = Path("/sys/fs/cgroup")
-SENTRY_ROOT = CGROUP_ROOT / "sentry"
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 CPU_PERIOD_US = 100_000
-PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")  # PORTABILITY FIX
 
-class CgroupActuator(ThrottleActuator):
+class CgroupActuator:
     def __init__(self):
-        self._initialized = False
-        self._pid_cgroups: dict[int, Path] = {}
+        self.sentry_root = Path("/sys/fs/cgroup/system.slice/sentry-v2.service")
+        if not self.sentry_root.exists():
+            try:
+                self.sentry_root.mkdir(parents=True, exist_ok=True)
+                with open(self.sentry_root / "cgroup.subtree_control", "w") as f:
+                    f.write("+cpu +memory")
+            except PermissionError:
+                pass # Handled by systemd in production
+        
+        # Layer 2 Hysteresis: Per-PID cooldown
+        self._pid_cooldowns: dict[int, float] = {}
+        self.COOLDOWN_SECONDS = 30.0
 
-    async def initialize(self) -> None:
-        if self._initialized: return
-        try: await aiofiles.os.makedirs(SENTRY_ROOT, exist_ok=True)
-        except PermissionError: raise RuntimeError(f"Requires CAP_SYS_ADMIN.")
-        await self._write_file(SENTRY_ROOT / "cgroup.subtree_control", "+cpu +memory")
-        self._initialized = True
-        logger.info("Cgroup actuator initialized.")
+    def _write_file(self, path: Path, value: str) -> None:
+        try:
+            with open(path, "w") as f:
+                f.write(value)
+        except OSError as e:
+            print(f"CGROUP ERROR: {e}")
 
     async def apply_throttle(self, pid: int, spec: ThrottleSpec) -> None:
-        if not self._initialized: await self.initialize()
-        leaf = await self._ensure_pid_cgroup(pid)
-        
-        # OOM KILLER PREVENTION FIX (Floor at 1 Page)
-        aligned_memory = max(PAGE_SIZE, (spec.memory_limit_bytes // PAGE_SIZE) * PAGE_SIZE)
+        # Layer 2 Hysteresis: Per-PID cooldown check
+        now = time.monotonic()
+        if pid in self._pid_cooldowns and now < self._pid_cooldowns[pid]:
+            remaining = self._pid_cooldowns[pid] - now
+            print(f"COOLDOWN ACTIVE: PID {pid} ({remaining:.1f}s remaining)")
+            return
+        self._pid_cooldowns[pid] = now + self.COOLDOWN_SECONDS
 
-        # MODE VALIDATION FIX
-        if spec.mode == "PROPORTIONAL":
-            await asyncio.gather(
-                self._write_verified(leaf / "cpu.weight", str(spec.cpu_weight)),
-                self._write_verified(leaf / "cpu.max", "max 100000"), 
-                self._write_verified(leaf / "memory.high", str(aligned_memory)),
-            )
-        elif spec.mode == "HARD_LIMIT":
-            quota = max(1, (spec.cpu_quota_pct * CPU_PERIOD_US) // 100)
-            await asyncio.gather(
-                self._write_verified(leaf / "cpu.max", f"{quota} {CPU_PERIOD_US}"),
-                self._write_verified(leaf / "cpu.weight", "100"),     
-                self._write_verified(leaf / "memory.high", str(aligned_memory)),
-            )
+        pid_cgroup = self.sentry_root / str(pid)
+        if not pid_cgroup.exists():
+            try:
+                pid_cgroup.mkdir(exist_ok=True)
+                self._write_file(pid_cgroup / "cgroup.procs", str(pid))
+            except OSError:
+                return
+
+        # MODE HANDLING: PROPORTIONAL vs HARD_LIMIT
+        mode = getattr(spec, 'mode', 'PROPORTIONAL')
+        if mode == "PROPORTIONAL":
+            # Proportional: use cpu.weight, no hard quota
+            if spec.cpu_weight is not None:
+                self._write_file(pid_cgroup / "cpu.weight", str(spec.cpu_weight))
+            self._write_file(pid_cgroup / "cpu.max", "max 100000")
+        elif mode == "HARD_LIMIT":
+            # Hard limit: use cpu.max quota
+            if spec.cpu_quota_pct is not None:
+                quota = max(1, (spec.cpu_quota_pct * CPU_PERIOD_US) // 100)
+                self._write_file(pid_cgroup / "cpu.max", f"{quota} {CPU_PERIOD_US}")
+            self._write_file(pid_cgroup / "cpu.weight", "100")
         else:
-            raise ValueError(f"Invalid throttle mode: {spec.mode!r}")
+            # Default: PROPORTIONAL
+            if spec.cpu_weight is not None:
+                self._write_file(pid_cgroup / "cpu.weight", str(spec.cpu_weight))
+            self._write_file(pid_cgroup / "cpu.max", "max 100000")
+
+        # Memory limits with OOM protection
+        if spec.memory_limit_bytes is not None:
+            # OOM PROTECTION: Set memory.high with headroom
+            self._write_file(pid_cgroup / "memory.high", str(spec.memory_limit_bytes))
+            # OOM PROTECTION: Set memory.min to 10% of limit (floor at 1 page)
+            memory_min = max(PAGE_SIZE, spec.memory_limit_bytes // 10)
+            self._write_file(pid_cgroup / "memory.min", str(memory_min))
+            # OOM PROTECTION: Lower OOM score to prefer killing other processes
+            self._write_file(pid_cgroup / "oom.score", "100")
 
     async def release_throttle(self, pid: int) -> None:
-        leaf = self._pid_cgroups.pop(pid, None)
-        if not leaf or not await aiofiles.os.path.exists(leaf): return
-        try:
-            await asyncio.gather(
-                self._write_verified(leaf / "cpu.max", "max 100000"),
-                self._write_verified(leaf / "cpu.weight", "100"),
-                self._write_verified(leaf / "memory.high", "max"),
-                return_exceptions=True
-            )
-            await self._write_file(CGROUP_ROOT / "cgroup.procs", str(pid))
-            await aiofiles.os.rmdir(leaf)
-        except Exception as e: pass
-
-    async def _ensure_pid_cgroup(self, pid: int) -> Path:
-        if pid in self._pid_cgroups and await aiofiles.os.path.exists(self._pid_cgroups[pid]):
-            return self._pid_cgroups[pid]
-        leaf = SENTRY_ROOT / str(pid)
-        await aiofiles.os.makedirs(leaf, exist_ok=True)
-        await self._write_file(leaf / "cgroup.procs", str(pid))
-        self._pid_cgroups[pid] = leaf
-        return leaf
-
-    async def _write_verified(self, path: Path, value: str) -> None:
-        await self._write_file(path, value)
-
-    async def _write_file(self, path: Path, value: str) -> None:
-        async with aiofiles.open(path, "w") as f: await f.write(value)
+        pid_cgroup = self.sentry_root / str(pid)
+        if pid_cgroup.exists():
+            self._write_file(pid_cgroup / "cpu.max", "max 100000")
+            self._write_file(pid_cgroup / "memory.high", "max")
+            self._write_file(pid_cgroup / "cpu.weight", "100")
+            # Restore OOM settings
+            self._write_file(pid_cgroup / "memory.min", "0")
+            self._write_file(pid_cgroup / "oom.score", "0")
+            # The kernel will automatically clean up the directory when the PID exits

@@ -21,41 +21,46 @@ class ThresholdConfig:
     hysteresis: int = 5
 
 @dataclass(frozen=True)
-class MemoryPolicyConfig:
-    mode: str = "RELATIVE_MULTIPLIER"
-    value: float = 1.5
+class ThrottleConfig:
+    max_hogs: int = 5
+    memory_headroom_multiplier: float = 1.5
 
 @dataclass(frozen=True)
 class ImmunityConfig:
-    immune_slices: List[str] = field(default_factory=lambda: ["user.slice", "system.slice"])
+    immune_slices: list[str] = field(default_factory=lambda: ["system.slice", "init.scope"])
+    desktop_portal_enabled: bool = True
+    cache_ttl: float = 5.0
 
 @dataclass(frozen=True)
-class SentryConfig:
+class SentryV2Config:
     thresholds: ThresholdConfig = field(default_factory=ThresholdConfig)
-    memory: MemoryPolicyConfig = field(default_factory=MemoryPolicyConfig)
+    throttle: ThrottleConfig = field(default_factory=ThrottleConfig)
     immunity: ImmunityConfig = field(default_factory=ImmunityConfig)
 
-    @classmethod
-    def load(cls, path: str = "sentry-v2.yaml") -> "SentryConfig":
-        """Loads YAML config, falling back to safe defaults if missing."""
-        config_path = Path(path)
-        if not config_path.exists():
-            logger.warning(f"Config file {path} not found. Using hardcoded safe defaults.")
-            return cls()
+def load_config(path: str) -> SentryV2Config:
+    config_path = Path(path)
+    if not config_path.exists():
+        logger.warning(f"Config file {path} not found. Using hardcoded safe defaults.")
+        return SentryV2Config()
 
-        try:
-            with open(config_path, 'r') as f:
-                raw = yaml.safe_load(f) or {}
-                
-            t_raw = raw.get("thresholds", {})
-            m_raw = raw.get("memory", {})
-            i_raw = raw.get("immunity", {})
+    try:
+        with open(config_path, "r") as f:
+            raw = yaml.safe_load(f) or {}
 
-            return cls(
-                thresholds=ThresholdConfig(**t_raw),
-                memory=MemoryPolicyConfig(**m_raw),
-                immunity=ImmunityConfig(**i_raw)
-            )
-        except Exception as e:
-            logger.error(f"Failed to parse {path}: {e}. Falling back to safe defaults.")
-            return cls()
+        # Validate required sections exist
+        for section in ["thresholds", "throttle", "immunity"]:
+            if section not in raw:
+                raise ValueError(f"Missing required config section: {section}")
+
+        t_raw = raw.get("thresholds", {})
+        th_raw = raw.get("throttle", {})
+        i_raw = raw.get("immunity", {})
+
+        return SentryV2Config(
+            thresholds=ThresholdConfig(**t_raw),
+            throttle=ThrottleConfig(**th_raw),
+            immunity=ImmunityConfig(**i_raw)
+        )
+    except Exception as e:
+        logger.error(f"Failed to parse {path}: {e}. Falling back to safe defaults.")
+        return SentryV2Config()

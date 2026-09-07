@@ -11,6 +11,11 @@ class UserspaceActuator(ThrottleActuator):
     def __init__(self):
         self._tasks: Dict[int, asyncio.Task] = {}
 
+    @property
+    def sentry_root(self) -> Path:
+        # Userspace actuator doesn't use cgroups
+        return Path("/")
+
     async def apply_throttle(self, pid: int, spec: ThrottleSpec) -> None:
         if pid in self._tasks: self._tasks[pid].cancel()
         

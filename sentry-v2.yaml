@@ -6,12 +6,13 @@ thresholds:
   psi_trigger: 10.0
   hysteresis: 5
 
-memory:
-  mode: "RELATIVE_MULTIPLIER"
-  value: 1.5
+throttle:
+  max_hogs: 5
+  memory_headroom_multiplier: 1.5
 
 immunity:
   immune_slices:
-    - "user.slice"
     - "system.slice"
-    - "sentry-immune.slice"
+    - "init.scope"
+  desktop_portal_enabled: true
+  cache_ttl: 5.0
