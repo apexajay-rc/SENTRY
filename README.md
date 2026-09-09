@@ -1,1417 +1,1227 @@
-<div align="center">
-
-<pre>
-███████╗███████╗███╗   ██╗████████╗██████╗ ██╗   ██╗
-██╔════╝██╔════╝████╗  ██║╚══██╔══╝██╔══██╗╚██╗ ██╔╝
-███████╗█████╗  ██╔██╗ ██║   ██║   ██████╔╝ ╚████╔╝
-╚════██║██╔══╝  ██║╚██╗██║   ██║   ██╔══██╗  ╚██╔╝
-███████║███████╗██║ ╚████║   ██║   ██║  ██║   ██║
-╚══════╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝
-</pre>
-
-<img src="assets/logo/sentry-meerkat.png" width="220" alt="SENTRY Meerkat">
-
 # SENTRY
 
-### Policy-Driven Linux Resource Arbitration for Interactive Workloads
+### Policy-Driven Linux Resource Arbitration
 
-**Observe • Evaluate • Protect • Recover**
+> **Observe system pressure. Attribute contention. Apply bounded resource control. Recover deterministically.**
 
-<br>
+SENTRY is a Linux-first resource arbitration daemon that monitors **CPU, memory, I/O and Linux Pressure Stall Information (PSI)**, classifies system pressure, identifies dominant resource consumers, and applies **reversible cgroup v2 controls** to reduce contention.
 
-<img src="https://img.shields.io/badge/Linux-cgroup_v2-black?logo=linux&logoColor=white">
-<img src="https://img.shields.io/badge/Kernel-PSI-blue">
-<img src="https://img.shields.io/badge/Enforcement-cgroup_v2-success">
-<img src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white">
-<img src="https://img.shields.io/badge/License-MIT-green">
-<img src="https://img.shields.io/badge/Status-Experimental-orange">
+It is designed around a simple systems objective:
 
-</div>
+> **Preserve useful system responsiveness under resource contention without terminating workloads.**
 
----
-# 🏗️ SENTRY
-
-**SENTRY** is a **policy-driven Linux resource pressure management daemon** that continuously observes kernel-level resource contention, computes a unified system stress model from **utilization and Linux Pressure Stall Information (PSI)**, identifies dominant workload contributors, and applies deterministic mitigation policies through **cgroup-based resource controls**.
-
-Rather than acting as a conventional monitoring application, SENTRY operates as a **closed-loop control system**: collect → classify → decide → mitigate → evaluate. Every subsystem is designed around deterministic state transitions, modular policy evaluation, and separation between observation, decision making, and enforcement.
+[![Linux](https://img.shields.io/badge/platform-Linux-black?logo=linux)](https://kernel.org/)
+[![Python](https://img.shields.io/badge/runtime-Python%203.11%2B-blue?logo=python)](https://www.python.org/)
+[![cgroup v2](https://img.shields.io/badge/control-cgroup%20v2-informational)](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+[![PSI](https://img.shields.io/badge/telemetry-Linux%20PSI-purple)](https://docs.kernel.org/accounting/psi.html)
+[![License](https://img.shields.io/badge/license-MIT-success)](LICENSE)
+[![Status](https://img.shields.io/badge/status-experimental-orange)](#limitations)
 
 ---
 
-# 🛠️ Key Architectural Pillars
+## Why SENTRY Exists
 
-* **Policy-Driven Decision Engine**
+Linux already provides excellent primitives for observing and controlling resource usage:
 
-  * Resource mitigation is determined through configurable policy thresholds instead of hardcoded heuristics.
-  * Escalation matrices translate stress classifications into deterministic resource limits.
+* `/proc`
+* Pressure Stall Information
+* cgroup v2
+* CPU bandwidth control
+* CPU scheduling weights
+* memory pressure controls
+* systemd integration
 
-* **Kernel-Native Telemetry**
+The missing layer is **policy**.
 
-  * Samples CPU, memory, I/O wait and Linux **Pressure Stall Information (PSI)** directly from `/proc`.
-  * Avoids heavyweight external monitoring agents.
+The kernel can answer:
 
-* **Deterministic Closed-Loop Feedback**
+> How much CPU is being consumed?
 
-  * Observation, classification, mitigation and recovery are isolated into dedicated subsystems.
-  * Active mitigations are tracked independently from effectiveness evaluation.
+and cgroup v2 can answer:
 
-* **Modular Systems Architecture**
+> How can this workload be constrained?
 
-  * Collection, policy evaluation, IPC, daemon lifecycle, dashboard, feedback engine and enforcement remain loosely coupled.
-  * Individual modules can evolve without introducing cross-component dependencies.
+SENTRY addresses the intermediate question:
+
+> **Given the current contention state, which workload should yield, how aggressively should it yield, and when should its resources be restored?**
+
+That places SENTRY above Linux resource-control primitives rather than attempting to replace them.
 
 ---
 
-# 📊 Core Subsystems & Data Flow
+# System Model
+
+```mermaid
+flowchart LR
+
+    K["Linux Kernel<br/>CPU / Memory / I/O / PSI"]
+    
+    O["Observation Layer<br/>/proc + PSI"]
+    
+    P["Pressure Model<br/>utilization + stall signals"]
+    
+    S["State Machine<br/>LOW → MODERATE → HIGH → CRITICAL"]
+    
+    A["Workload Attribution<br/>per-PID CPU + RSS"]
+    
+    D["Policy / Allocation<br/>bounded intervention"]
+    
+    C["cgroup v2 Actuator<br/>cpu.weight / cpu.max / memory.high"]
+    
+    R["Recovery<br/>release + controlled ramp"]
+    
+    T["Telemetry<br/>Unix-domain IPC"]
+
+    K --> O
+    O --> P
+    P --> S
+    S --> A
+    A --> D
+    D --> C
+    C --> R
+    R --> O
+
+    S --> T
+    A --> T
+    C --> T
+```
+
+### Control-loop abstraction
 
 ```text
-                           Linux Kernel
-                                  │
-               ┌──────────────────┴──────────────────┐
-               │                                     │
-          /proc/stat                         /proc/pressure/*
-               │                                     │
-               └──────────────┬──────────────────────┘
-                              │
-                    System Metrics Sampler
-                              │
-          CPU • Memory • I/O Wait • PSI Samples
-                              │
-                              ▼
-                     Pressure Computation Engine
-                              │
-                Unified Stress Score Generation
-                              │
-                              ▼
-                    Policy Classification Layer
-                              │
-      LOW → MODERATE → HIGH → CRITICAL State Machine
-                              │
-                              ▼
-                    Process Ranking & Selection
-                              │
-                      Candidate Identification
-                              │
-                              ▼
-                 Cgroup Resource Enforcement Layer
-                              │
-       CPU Weight • Memory Limits • IO Weight Controls
-                              │
-                 Action Tracking & Safety Guard
-                              │
-                Feedback / Resume Decision Engine
-                              │
-          ┌───────────────────┴────────────────────┐
-          │                                        │
-          ▼                                        ▼
-     IPC Server                              Dashboard GUI
+       ┌──────────────────────────────────────────────┐
+       │                SENTRY CONTROL                 │
+       └──────────────────────────────────────────────┘
+
+                    ┌───────────────┐
+                    │   OBSERVE     │
+                    │               │
+                    │ CPU           │
+                    │ Memory        │
+                    │ I/O           │
+                    │ PSI           │
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │    EVALUATE   │
+                    │               │
+                    │ Pressure      │
+                    │ Classification│
+                    │ State          │
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │    ATTRIBUTE  │
+                    │               │
+                    │ Which PIDs    │
+                    │ dominate load?│
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │    ARBITRATE  │
+                    │               │
+                    │ Select policy │
+                    │ Allocate limits│
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │    ACTUATE    │
+                    │               │
+                    │ cgroup v2     │
+                    │ cpu / memory  │
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │    RECOVER    │
+                    │               │
+                    │ Release /     │
+                    │ ramp back     │
+                    └───────┬───────┘
+                            │
+                            └──────────────► OBSERVE
 ```
 
 ---
 
-## Core Subsystems
+# What SENTRY Actually Does
 
-### Metric Collection Layer
+SENTRY continuously evaluates the host rather than reacting to a single instantaneous CPU reading.
 
-Responsible for collecting kernel telemetry.
+### 1. Observe
 
-Primary responsibilities include:
-
-* Reading `/proc/stat`
-* Reading `/proc/meminfo`
-* Reading Linux PSI interfaces
-* Computing utilization deltas
-* Producing normalized metric samples
-
-This layer intentionally forms **no policy decisions**.
-
----
-
-### Pressure Engine
-
-Transforms raw utilization into a normalized **Unified Stress Score**.
-
-Inputs include:
-
-* CPU utilization
-* Memory utilization
-* I/O wait
-* PSI pressure
-
-Outputs include:
-
-* Utilization score
-* PSI score
-* Combined pressure score
-
-This provides a single decision variable consumed by higher layers.
-
----
-
-### Policy Engine
-
-Maps stress scores into deterministic oating states.
-
-Example progression:
-
-```text
-Stress Score
-      │
-      ▼
- LOW
-      │
-      ▼
-MODERATE
-      │
-      ▼
- HIGH
-      │
-      ▼
-CRITICAL
-```
-
-Each level maps directly to an escalation policy describing:
-
-* CPU weight
-* Memory limits
-* IO weight
-
-Policies are configuration-driven rather than embedded into business logic.
-
----
-
-### Process Selection
-
-Ranks candidate processes using weighted resource contribution.
-
-The implementation evaluates CPU and resident memory before producing an ordered candidate list.
-
-Protected processes can be excluded before enforcement.
-
----
-
-### Enforcement Layer
-
-Resource mitigation is delegated to dedicated cgroup management components.
-
-Typical actions include:
-
-* CPU throttling
-* Memory restriction
-* IO prioritization
-* Automatic restoration after timeout
-
-Importantly, enforcement logic remains separate from policy logic.
-
----
-
-### Action Tracker
-
-Maintains runtime state for every active mitigation.
-
-Tracks:
-
-* target PID
-* mitigation type
-* application timestamp
-* previous pressure
-* timeout expiration
-
-The tracker deliberately **does not evaluate success**.
-
-That responsibility belongs to the feedback subsystem.
-
----
-
-### Feedback Engine
-
-Completes the control loop.
-
-Responsibilities include:
-
-* monitoring mitigation outcomes
-* determining recovery
-* resuming previously throttled workloads
-* preventing manent resource restriction
-
----
-
-### IPC Layer
-
-Provides daemon ↔ client communication.
-
-Responsibilities:
-
-* daemon state queries
-* mode switching
-* observe-only mode
-* armed/disarmed state
-* dry-run oation
-
-The IPC abstraction allows the dashboard to remain independent of the daemon implementation.
-
----
-
-### Dashboard
-
-The GUI serves as a visualization layer rather than a monitoring engine.
-
-Displays:
-
-* Unified Stress Score
-* PSI values
-* utilization metrics
-* trend history
-* top processes
-* daemon state
-* mitigation decisions
-
-When the daemon is unavailable, the dashboard automatically falls back to local metric collection.
-
----
-
-# Repository Layout
-
-```text
-SENTRY
-├── core/
-│   ├── metrics.py
-│   ├── procfs.py
-│   ├── process.py
-│   ├── psi_sensor.py
-│   ├── policy.py
-│   ├── cgroup_manager.py
-│   ├── action_tracker.py
-│   ├── safety_guard.py
-│   ├── ipc.py
-│   └── config.py
-│
-├── engine/
-│   ├── pressure.py
-│   ├── classifier.py
-│   ├── selector.py
-│   ├── feedback.py
-│   ├── reconciliation.py
-│   └── timeseries.py
-│
-├── daemon/
-│   ├── main.py
-│   └── systemd_integration.py
-│
-├── dashboard/
-│   └── main_gui.py
-│
-├── tests/
-│
-├── packaging/
-│
-├── tools/
-│
-├── Makefile
-├── requirements.txt
-└── sentry_config.yaml
-```
-# ⚙️ Internal Architecture & Execution Pipeline
-
-SENTRY follows a **deterministic control-loop architecture**. Rather than reacting to isolated CPU spikes, the daemon continuously builds a holistic model of system pressure, evaluates policy rules, and applies reversible mitigation actions.
-
-Every iteration of the daemon follows the same execution pipeline.
-
-```text
- ┌───────────────────────────────────────────────────────────┐
- │                   Daemon Main Loop                        │
- └───────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-          Collect System Metrics
-                    │
-                    ▼
-          Read Linux PSI Samples
-                    │
-                    ▼
-      Compute Unified Stress Score
-                    │
-                    ▼
-      Classify Current System State
-                    │
-                    ▼
-        Analyze Historical Trend
-                    │
-                    ▼
-      Rank Candidate Processes
-                    │
-                    ▼
-        Evaluate Policy Rules
-                    │
-                    ▼
-     Apply Resource Mitigation
-                    │
-                    ▼
-      Record Active Action State
-                    │
-                    ▼
-      Evaluate Previous Decisions
-                    │
-                    ▼
-        Resume / Continue Limits
-                    │
-                    ▼
-           Publish Daemon State
-```
-
-This architecture separates **observation**, **decision making**, **resource enforcement**, and **feedback** into independent execution stages.
-
----
-
-# 📊 Unified Pressure Computation
-
-Traditional monitoring systems typically evaluate CPU usage, memory usage, or I/O independently. SENTRY instead constructs a **Unified Stress Score** that fuses multiple kernel signals into a single normalized metric.
-
-## Stage 1 — Utilization Sampling
-
-Raw system utilization is collected from Linux kernel interfaces.
-
-```text
-CPU Usage
-Memory Usage
-I/O Wait
-```
-
-These metrics are sampled using delta-based calculations rather than instantaneous snapshots wherever applicable, reducing transient measurement noise.
-
----
-
-## Stage 2 — Pressure Stall Information (PSI)
-
-Linux PSI introduces information that conventional utilization metrics cannot capture.
-
-Instead of asking:
-
-> "How busy is the CPU?"
-
-PSI answers:
-
-> "How long are processes stalled because the CPU, memory, or storage subsystem cannot make forward progress?"
-
-SENTRY incorporates PSI values including:
-
-```text
-CPU Pressure
-Memory Pressure
-I/O Pressure
-```
-
-This allows stress classification to account for **resource contention**, not merely utilization.
-
----
-
-## Stage 3 — Weighted Fusion
-
-Both utilization and PSI are normalized before being merged into a single pressure model.
-
-Conceptually:
-
-```text
-          Utilization Score
-                 │
-                 ▼
-        Weighted Aggregation
-                 ▲
-                 │
-             PSI Score
-                 │
-                 ▼
-        Unified Stress Score
-```
-
-The weighting coefficients are configurable through the runtime configuration rather than embedded into the implementation, allowing deployments to tune sensitivity for different workload classes.
-
----
-
-# 🧠 Policy Classification Engine
-
-The unified stress score feeds directly into the policy engine.
-
-Instead of continuously scaling actions, SENTRY employs **discrete oating states**.
-
-```text
-0.00 ───────────────────────────────────────────────► 1.00
-
- LOW
-      │
-      ▼
- MODERATE
-           │
-           ▼
- HIGH
-               │
-               ▼
- CRITICAL
-```
-
-Each state corresponds to a deterministic policy.
-
-| Level    | Typical Behavior                       |
-| -------- | -------------------------------------- |
-| LOW      | Observation only                       |
-| MODERATE | Begin conservative mitigation          |
-| HIGH     | Aggressive resource control            |
-| CRITICAL | Maximum configured resource protection |
-
-The thresholds are loaded from configuration, allowing administrators to adapt behavior without modifying source code.
-
----
-
-# 📈 Trend Analysis
-
-Stress classification is intentionally separated from trend analysis.
-
-Two systems may both report **HIGH**, but their trajectories can differ:
-
-```text
-Machine A
-
-LOW
-LOW
-MODERATE
-HIGH
-HIGH
-
-Stable
-```
-
-versus
-
-```text
-Machine B
-
-LOW
-LOW
-MODERATE
-HIGH
-CRITICAL
-
-Rising
-```
-
-Trend analysis enables the decision engine to distinguish:
-
-* stable workloads
-* escalating pressure
-* transient spikes
-* insufficient historical data
-
-This prevents isolated metric spikes from immediately triggering aggressive mitigation.
-
----
-
-# 🎯 Process Selection Pipeline
-
-After system-level classification, SENTRY identifies which workload contributes most significantly to current pressure.
-
-The process sampler computes weighted -process resource scores derived from:
-
-```text
-CPU Utilization
-Memory Utilization
-```
-
-These values are combined into a ranking score.
-
-```text
-          Process A
-              │
-              ▼
-          Score 74.1
-
-          Process B
-              │
-              ▼
-          Score 52.7
-
-          Process C
-              │
-              ▼
-          Score 18.4
-```
-
-Processes are then ordered from highest to lowest contribution.
-
-Protected applications can be excluded before mitigation, preventing critical system services from becoming enforcement targets.
-
----
-
-# 🔒 Resource Enforcement
-
-SENTRY does not terminate workloads.
-
-Instead, it applies **graduated resource controls** using Linux control groups.
-
-The enforcement layer is responsible for translating policy decisions into oating-system primitives.
-
-Typical mitigation actions include:
-
-```text
-CPU Weight Reduction
-
-Memory Limit Adjustment
-
-I/O Weight Reduction
-```
-
-Because enforcement is isolated from decision making, alternative enforcement backends can be introduced without modifying policy evaluation.
-
----
-
-# 📝 Action Lifecycle
-
-Every mitigation action becomes a tracked runtime object.
-
-```text
-Decision
-     │
-     ▼
-Apply Limits
-     │
-     ▼
-Record Metadata
-     │
-     ▼
-Monitor Timeout
-     │
-     ▼
-Resume Resources
-```
-
-Tracked metadata includes:
-
-* process identifier
-* mitigation type
-* application timestamp
-* previous stress level
-* previous pressure state
-* applied resource parameters
-
-This explicit lifecycle prevents duplicate enforcement and enables deterministic recovery.
-
----
-
-# 🛡️ Safety Guard
-
-The safety subsystem exists to prevent unsafe or contradictory actions.
-
-Its responsibilities include:
-
-* preventing repeated throttling of the same workload
-* avoiding duplicate enforcement
-* validating policy decisions
-* ensuring recovery conditions are satisfied
-* protecting against inconsistent runtime state
-
-This layer acts as a final validation stage before oating-system resources are modified.
-
----
-
-# 🔄 Feedback & Reconciliation Engine
-
-Mitigation is only one phase of the control loop.
-
-After actions have been applied, SENTRY continuously evaluates whether:
-
-* pressure has decreased
-* mitigation remains necessary
-* workloads should be restored
-* previous actions should expire
-
-Conceptually:
-
-```text
-Observe
-    │
-    ▼
-Mitigate
-    │
-    ▼
-Observe Again
-    │
-    ▼
-Pressure Reduced?
-      │
- ┌────┴────┐
- │         │
- ▼         ▼
-Resume   Continue
-```
-
-Separating feedback from enforcement prevents policy logic from becoming tightly coupled to runtime bookkeeping.
-
----
-
-# 🌐 IPC Architecture
-
-The daemon exposes a lightweight IPC interface to decouple the monitoring backend from client applications.
-
-```text
-        Dashboard
-             │
-             │
-     JSON Commands
-             │
-             ▼
-      IPC Client Library
-             │
-             ▼
-     Unix Socket / TCP
-             │
-             ▼
-        IPC Server
-             │
-             ▼
-       Daemon State
-```
-
-Supported interactions include:
-
-* retrieving daemon state
-* switching oational mode
-* enabling or disabling mitigation
-* observe-only mode
-* dry-run mode
-* health checks (ping)
-
-Because IPC is isolated behind a dedicated abstraction, additional clients (CLI tools, REST gateways, exporters, or orchestration systems) can reuse the same communication protocol without interacting directly with daemon internals.
-
-# ⚡ Technical Specifications
-
-| Component               | Specification                                                    |
-| ----------------------- | ---------------------------------------------------------------- |
-| **Primary Language**    | Python 3.11+                                                     |
-| **Target Platform**     | Linux (Primary), Windows (limited platform abstraction)          |
-| **Architecture**        | Modular, Policy-Driven Daemon                                    |
-| **Kernel Interfaces**   | `/proc/stat`, `/proc/meminfo`, `/proc/[pid]`, `/proc/pressure/*` |
-| **Scheduling Model**    | iodic Sampling Loop                                           |
-| **Decision Model**      | Rule-Based State Machine                                         |
-| **Stress Model**        | Unified Utilization + PSI Composite Score                        |
-| **Resource Isolation**  | Linux cgroups                                                    |
-| **IPC Transport**       | Unix Domain Socket (Linux), TCP Fallback                         |
-| **Dashboard Framework** | Flet                                                             |
-| **Configuration**       | YAML                                                             |
-| **Packaging**           | systemd Service                                                  |
-| **Testing**             | pytest with synthetic `/proc` fixtures                           |
-| **Logging**             | Structured daemon logging                                        |
-| **Deployment Target**   | Long-running background daemon                                   |
-
----
-
-# 🧵 Concurrency Model
-
-SENTRY intentionally adopts a conservative concurrency model.
-
-```text
-                    Main Daemon Thread
-                           │
-      ┌────────────────────┼────────────────────┐
-      │                    │                    │
-      ▼                    ▼                    ▼
- Metric Sampling     Policy Engine      Action Tracker
-      │
-      ▼
- State Update
-      │
-      ▼
- IPC Publication
-```
-
-Auxiliary components oate independently.
-
-```text
-Dashboard Thread
-        │
-        ▼
-IPC Client Polling
-
-──────────────
-
-IPC Server
-        │
-        ▼
--client Worker Thread
-```
-
-This architecture minimizes shared mutable state while allowing responsive UI updates and concurrent IPC requests.
-
----
-
-# 💾 Memory Characteristics
-
-The daemon intentionally maintains a **small working set**.
-
-sistent runtime state consists primarily of:
-
-* Recent stress history
-* Active mitigation records
-* Top process cache
-* Runtime configuration
-* IPC state
-
-Large telemetry archives are deliberately avoided.
-
-The implementation favors:
-
-* **bounded history buffers**
-* **streaming metric computation**
-* **incremental sampling**
-* **constant-size daemon state**
-
-rather than retaining long-term in-memory datasets.
-
----
-
-# 🔧 Runtime Dependencies
-
-## Python Packages
-
-```bash
-pip install -r requirements.txt
-```
-
-Primary runtime components include:
-
-* Flet (Dashboard)
-* PyYAML
-* pytest
-* Standard Library networking
-* dataclasses
-* threading
-
-Kernel telemetry is obtained directly from Linux rather than through heavyweight monitoring libraries.
-
----
-
-# 📁 Configuration
-
-Runtime behavior is configured through:
-
-```text
-sentry_config.yaml
-```
-
-Typical configuration groups include:
-
-```text
-Thresholds
-
-Metric Weights
-
-Escalation Matrix
-
-Protected Processes
-
-Sampling Interval
-
-Observation Mode
-
-Mitigation Parameters
-```
-
-Configuration-driven policy makes deployments reproducible without recompilation.
-
----
-
-# 🚀 Getting Started
-
-## Clone Repository
-
-```bash
-git clone https://github.com/<username>/SENTRY.git
-
-cd SENTRY
-```
-
----
-
-## Create Virtual Environment
-
-```bash
-python3 -m venv .venv
-
-source .venv/bin/activate
-```
-
----
-
-## Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
----
-
-## Launch Dashboard
-
-```bash
-python dashboard/main_gui.py
-```
-
----
-
-## Start Daemon
-
-```bash
-python daemon/main.py
-```
-
----
-
-## Observe Only Mode
-
-```bash
-python daemon/main.py --observe
-```
-
----
-
-## Dry Run
-
-```bash
-python daemon/main.py --dry-run
-```
-
-No resource limits are enforced.
-
-The complete decision pipeline remains active.
-
----
-
-# ⚙️ Building with Make
-
-The repository includes a dedicated Makefile for common development workflows.
-
-Typical commands:
-
-```bash
-make install
-
-make test
-
-make lint
-
-make run
-
-make clean
-```
-
----
-
-# 🧪 Running Tests
-
-Execute the complete validation suite.
-
-```bash
-pytest
-```
-
-Run with verbose output.
-
-```bash
-pytest -v
-```
-
-Run an individual subsystem.
-
-```bash
-pytest tests/test_pressure_engine.py
-```
-
-The project includes synthetic `/proc` fixtures to allow deterministic testing without depending on live kernel telemetry.
-
----
-
-# 🖥️ Running as a systemd Service
-
-The repository ships with a native service definition.
-
-Install:
-
-```bash
-sudo cp packaging/sentry.service \
-    /etc/systemd/system/
-```
-
-Reload:
-
-```bash
-sudo systemctl daemon-reload
-```
-
-Enable:
-
-```bash
-sudo systemctl enable sentry
-```
-
-Start:
-
-```bash
-sudo systemctl start sentry
-```
-
-Status:
-
-```bash
-systemctl status sentry
-```
-
-Logs:
-
-```bash
-journalctl -u sentry -f
-```
-
-Native `sd_notify` integration allows systemd to track:
-
-* startup completion
-* graceful shutdown
-* watchdog heartbeats
-
----
-
-# 📡 IPC Commands
-
-The daemon exposes a lightweight JSON protocol.
-
-Typical interactions include:
-
-```text
-get_state
-
-ping
-
-set_mode
-
-set_armed
-
-set_observe_only
-
-set_dry_run
-```
-
-Example request:
-
-```json
-{
-    "type": "get_state"
-}
-```
-
-Example response:
-
-```json
-{
-    "ok": true,
-    "state": {
-        "...": "..."
-    }
-}
-```
-
-This protocol intentionally remains small and stable to simplify integration with external tooling.
-
----
-
-## 📊 Performance & Benchmarking (Basecamp Engine)
-
-*Note: These benchmarks reflect the current Python-based `psutil` architecture. Transitioning to eBPF (Phase 4) will reduce mitigation latency to the microsecond scale.*
-
-| Metric | Target / Current State | Notes |
-| :--- | :--- | :--- |
-| **Sampling Interval** | `200 ms` | Hardcoded `time.sleep(0.2)` in the main loop for high-speed response. |
-| **Daemon Startup Time** | `< 250 ms` | Primarily Python interpreter initialization overhead. |
-| **IPC Round Trip** | `< 1 ms` | Edge-triggered Unix Domain Datagram Sockets (`SOCK_DGRAM`) bypass the network stack entirely. |
-| **Process Ranking** | `< 15 ms` | Iterating cached `psutil.pids()` and resolving Top 5 CPU hogs. |
-| **Stress Computation** | `< 1 ms` | Direct `O(1)` file read of `/proc/pressure/memory`. |
-| **Dashboard Refresh** | `100 ms` | `sentry_top.py` runs at a smooth 10 FPS with zero measurable overhead. |
-| **Idle CPU Usage** | `< 2.0 %` | Single-core utilization during the 200ms polling sleep state. |
-| **Idle Memory Footprint** | `< 40 MB` | Standard Python footprint; no heavy ML models loaded in memory. |
-| **Concurrent IPC Clients** | `100+` | Connectionless Unix Sockets scale effortlessly for multiple HUDs. |
-| **Mitigation Latency** | `< 250 ms` | Maximum time from a CPU spike to a successful `cpu.max` cgroup clamp. |
----
-
-## Suggested Benchmark Suite
-
-Measure the following independently.
-
-```text
-Metric Collection Latency
-
-PSI Parsing Latency
-
-Stress Score Computation
-
-Policy Classification
-
-Process Enumeration
-
-cgroup Enforcement
-
-IPC Round Trip Time
-
-Dashboard Refresh Time
-
-Memory Allocation Rate
-
-CPU Overhead
-```
-
-A reproducible benchmark should report:
-
-```text
-Average
-
-Median
-
-p95
-
-p99
-
-Maximum
-
-Standard Deviation
-```
-
----
-
-# 🔍 Observability
-
-The daemon exposes several layers of runtime visibility.
-
-```text
-Kernel Metrics
-        │
-        ▼
-Unified Stress Score
-        │
-        ▼
-Stress Trend
-        │
-        ▼
-Decision Engine
-        │
-        ▼
-Mitigation Action
-        │
-        ▼
-Action History
-```
-
-This progression enables operators to trace **why** an action occurred—not merely that it occurred.
-
----
-
-# 🔒 Reliability Characteristics
-
-The architecture emphasizes deterministic behavior under sustained load through:
-
-* **Bounded in-memory state**
-* **Configurable policy thresholds**
-* **Thread-safe daemon state management**
-* **Graceful mitigation rollback**
-* **Platform abstraction layer**
-* **Native systemd supervision**
-* **Fallback dashboard telemetry when the daemon is unavailable**
-* **Separation of observation, decision, enforcement, and feedback responsibilities**
-
-These design choices reduce subsystem coupling and simplify reasoning about runtime behavior, testing, and future extensions.
-
----
-# 🎯 Design Philosophy
-
-SENTRY was designed around a simple systems engineering principle:
-
-> **Protect overall system responsiveness instead of maximizing individual process throughput.**
-
-Traditional monitoring systems terminate at observability—they report utilization and pressure but leave remediation to the operator. SENTRY extends beyond monitoring by implementing a **closed-loop resource management architecture** that continuously observes, reasons about, and acts upon kernel telemetry while maintaining deterministic behavior.
-
-Several architectural principles guide the implementation.
-
-### Separation of Responsibilities
-
-Each subsystem owns a single responsibility.
-
-```text
-Kernel Telemetry
-        │
-        ▼
-Metric Collection
-
-        │
-        ▼
-Pressure Computation
-
-        │
-        ▼
-Policy Classification
-
-        │
-        ▼
-Process Selection
-
-        │
-        ▼
-Resource Enforcement
-
-        │
-        ▼
-Feedback Evaluation
-```
-
-This separation reduces coupling and allows individual components to evolve independently.
-
----
-
-### Deterministic Decision Making
-
-Policy decisions are intentionally **configuration-driven** rather than heuristic-heavy.
-
-Given identical telemetry and configuration, the daemon should always produce identical mitigation decisions.
-
-This makes behavior:
-
-* reproducible
-* testable
-* explainable
-* auditable
-
----
-
-### Kernel-First Architecture
-
-Rather than depending on third-party monitoring agents, SENTRY builds directly upon Linux kernel facilities.
-
-Primary data sources include:
+Kernel telemetry is sampled from:
 
 ```text
 /proc/stat
-
 /proc/meminfo
-
-/proc/[pid]
-
-/proc/pressure/*
+/proc/<pid>/stat
+/proc/<pid>/statm
+/proc/pressure/cpu
+/proc/pressure/memory
+/proc/pressure/io
 ```
 
-This minimizes runtime dependencies while leveraging interfaces maintained by the Linux kernel itself.
+The current implementation computes:
+
+* CPU utilization
+* memory utilization
+* I/O wait
+* optional PSI signals
+* per-process CPU contribution
+* resident memory size
 
 ---
 
-### Safety Before Aggression
+### 2. Evaluate
 
-Mitigation is deliberately conservative.
-
-The daemon prioritizes:
-
-* observation
-* gradual escalation
-* reversible actions
-* automatic recovery
-
-instead of immediately applying maximum resource restrictions.
-
-This reduces the likelihood of destabilizing the system during transient workload spikes.
-
----
-
-# 🗺️ Roadmap
-
-The current architecture provides a strong foundation for several future extensions.
-
-## Advanced Scheduling Policies
-
-Potential additions include:
-
-* Adaptive policy learning
-* Workload-aware scheduling
-* Priority inheritance
-* Dynamic escalation based on workload class
-* Application-specific mitigation profiles
-
----
-
-## Richer Kernel Integration
-
-Future Linux capabilities could include:
+A normalized pressure score is derived from resource utilization:
 
 ```text
-eBPF
-
-perf events
-
-sched tracepoints
-
-pressure event triggers
-
-cgroup v2 event notifications
+Pressure
+   │
+   ├── CPU contribution
+   ├── Memory contribution
+   └── I/O-wait contribution
+             │
+             ▼
+      Weighted pressure score
 ```
 
-These would allow SENTRY to move from periodic sampling toward event-driven decision making.
-
----
-
-## Distributed Observability
-
-Possible future integrations include:
-
-* Prometheus exporters
-* OpenTelemetry metrics
-* Grafana dashboards
-* REST API
-* gRPC control plane
-
-This would enable centralized monitoring across multiple hosts.
-
----
-
-## Machine Learning Assisted Policies
-
-The current rule-based engine intentionally favors predictability.
-
-Future research directions could explore:
-
-* workload classification
-* anomaly detection
-* adaptive threshold tuning
-* predictive pressure forecasting
-* reinforcement-based mitigation policies
-
-These capabilities should remain optional, preserving the deterministic policy engine as the default execution path.
-
----
-
-## Cross-Platform Support
-
-Although Linux remains the primary target, the platform abstraction layer provides a foundation for expanding support to additional operating systems where equivalent kernel telemetry and resource control primitives exist.
-
----
-
-# 🤝 Contributing
-
-Contributions should preserve the architectural principles of the project.
-
-Before submitting changes, consider the following guidelines:
-
-### Architectural Expectations
-
-* Maintain strict separation between telemetry, policy, enforcement, and feedback.
-* Avoid introducing unnecessary coupling across modules.
-* Prefer composition over inheritance.
-* Keep policy definitions configuration-driven.
-* Preserve deterministic behavior.
-
----
-
-### Code Quality
-
-All new contributions should:
-
-* include unit tests
-* avoid unnecessary dependencies
-* follow existing module organization
-* document architectural decisions
-* preserve backward compatibility where practical
-
----
-
-### Pull Request Checklist
+Current weighting:
 
 ```text
-□ Tests pass
+CPU       50%
+Memory    30%
+I/O       20%
+```
 
-□ New functionality documented
+The score is bounded to the implementation's effective **0–100 range**.
 
-□ Configuration updated if required
+PSI can trigger a saturation-oriented override so that stall pressure is not treated as ordinary utilization.
 
-□ Logging added where appropriate
+---
 
-□ No duplicated business logic
+### 3. Classify
 
-□ Module responsibilities remain isolated
+The controller uses discrete operating states:
+
+```text
+        ┌──────┐
+        │ LOW  │
+        └──┬───┘
+           │ threshold
+           ▼
+      ┌───────────┐
+      │ MODERATE  │
+      └─────┬─────┘
+            │ threshold
+            ▼
+        ┌──────┐
+        │ HIGH │
+        └──┬───┘
+           │ threshold
+           ▼
+      ┌──────────┐
+      │ CRITICAL │
+      └──────────┘
+```
+
+The state machine adds:
+
+* hysteresis
+* delayed de-escalation
+* deterministic state transitions
+
+This reduces unnecessary oscillation around a threshold.
+
+---
+
+# Pressure Model
+
+## Resource Signals
+
+| Signal             | Source                  | Role                               |
+| ------------------ | ----------------------- | ---------------------------------- |
+| CPU utilization    | `/proc/stat`            | Host compute saturation            |
+| Memory utilization | `/proc/meminfo`         | Resident/available memory pressure |
+| I/O wait           | `/proc/stat`            | CPU time waiting on I/O            |
+| CPU PSI            | `/proc/pressure/cpu`    | CPU scheduling contention          |
+| Memory PSI         | `/proc/pressure/memory` | Memory reclaim/stall pressure      |
+| I/O PSI            | `/proc/pressure/io`     | I/O-induced execution stalls       |
+
+### Why PSI matters
+
+CPU utilization alone can be misleading.
+
+Two systems can both report high CPU utilization while experiencing very different user-visible behavior.
+
+PSI adds a different dimension:
+
+```text
+UTILIZATION
+    │
+    │     "How much resource is being used?"
+    │
+    ▼
+┌────────────────────┐
+│ Conventional stats │
+└────────────────────┘
+
+STALL PRESSURE
+    │
+    │     "How much execution is being delayed?"
+    │
+    ▼
+┌────────────────────┐
+│        PSI         │
+└────────────────────┘
+```
+
+SENTRY uses both concepts as inputs to its pressure model.
+
+---
+
+# Workload Attribution
+
+Once the host enters an intervention state, SENTRY identifies candidate processes.
+
+For each PID, the scanner derives:
+
+```text
+/proc/<pid>/stat
+        │
+        ├── utime
+        └── stime
+             │
+             ▼
+      CPU delta over sample
+             │
+             ▼
+       CPU contribution
+
+/proc/<pid>/statm
+        │
+        ▼
+     RSS bytes
+```
+
+A bounded in-memory PID history is used to calculate process CPU deltas without requiring a full external monitoring stack.
+
+### Attribution objective
+
+The system is not trying to determine:
+
+> “Which process is bad?”
+
+It is trying to determine:
+
+> **“Which currently running workloads are the strongest candidates for yielding resource capacity?”**
+
+That distinction is important.
+
+A CPU-intensive compiler is not inherently pathological. It is simply a candidate when the host is already under pressure and policy permits intervention.
+
+---
+
+# Arbitration Model
+
+SENTRY uses a deterministic state-to-policy mapping.
+
+| State      | Mode           |  CPU Policy | Candidate Limit |
+| ---------- | -------------- | ----------: | --------------: |
+| `LOW`      | `NONE`         |        100% |               0 |
+| `MODERATE` | `PROPORTIONAL` | 70% ceiling |               1 |
+| `HIGH`     | `PROPORTIONAL` | 50% ceiling |               3 |
+| `CRITICAL` | `HARD_LIMIT`   | 30% ceiling |               5 |
+
+The exact behavior is configuration-driven through the SENTRY configuration model.
+
+```yaml
+thresholds:
+  low: 35
+  moderate: 55
+  high: 75
+  critical: 95
+  psi_trigger: 10.0
+  hysteresis: 5
+
+throttle:
+  max_hogs: 5
+  memory_headroom_multiplier: 1.5
 ```
 
 ---
 
-# 📚 Documentation
+# Allocation
 
-The repository is organized to make architectural navigation straightforward.
+The current allocator ranks CPU-intensive candidates and computes proportional allocation based on excess CPU consumption relative to an equal-share baseline.
 
-| Directory    | Purpose                                                                              |
-| ------------ | ------------------------------------------------------------------------------------ |
-| `core/`      | Kernel interaction, metrics, IPC, policies, configuration, safety, cgroup management |
-| `engine/`    | Pressure computation, classification, process selection, reconciliation, feedback    |
-| `daemon/`    | Long-running control loop and service lifecycle                                      |
-| `dashboard/` | Graphical monitoring interface                                                       |
-| `model/`     | Shared data models and immutable state objects                                       |
-| `tests/`     | Unit tests and synthetic `/proc` fixtures                                            |
-| `packaging/` | systemd service definitions                                                          |
-| `tools/`     | Auxiliary utilities and CLI helpers                                                  |
+Conceptually:
+
+```text
+                   Candidate processes
+
+             ┌─────────┬─────────┬─────────┐
+             │ PID A   │ PID B   │ PID C   │
+             │  70%    │  20%    │  10%    │
+             └────┬────┴────┬────┴────┬────┘
+                  │         │         │
+                  ▼         ▼         ▼
+                 excess   excess    excess
+                    │         │         │
+                    └────┬────┴────┬────┘
+                         ▼
+                  proportional
+                    allocation
+                         │
+                         ▼
+                  resource policy
+```
+
+SENTRY intentionally calls this **proportional excess allocation**, rather than claiming a general-purpose mathematical fairness guarantee.
 
 ---
 
-# 🔐 License
+# Enforcement
 
-This project is distributed under the **MIT License**.
+The preferred actuator is **Linux cgroup v2**.
 
-Refer to the `LICENSE` file for the complete license text.
+```mermaid
+flowchart TD
+
+    P["Policy Decision"]
+
+    S["ThrottleSpec"]
+
+    M["Actuator Interface"]
+
+    C["Cgroup v2 Actuator"]
+
+    W1["cpu.weight"]
+    W2["cpu.max"]
+    W3["memory.high"]
+    W4["memory.min"]
+
+    P --> S
+    S --> M
+    M --> C
+
+    C --> W1
+    C --> W2
+    C --> W3
+    C --> W4
+```
+
+### Actuator abstraction
+
+The policy layer emits a transport-independent `ThrottleSpec`:
+
+```text
+ThrottleSpec
+├── mode
+├── cpu_quota_pct
+├── cpu_weight
+└── memory_limit_bytes
+```
+
+The enforcement layer translates that decision into Linux-specific controls.
+
+This separation is intentional:
+
+```text
+Policy ≠ Enforcement
+```
+
+The policy engine should not need to understand filesystem paths or cgroup controller syntax.
 
 ---
 
-# 📖 Citation
+# Enforcement Modes
 
-If SENTRY contributes to academic work, research prototypes, or engineering publications, consider citing the repository rather than individual modules so architectural changes remain reflected over time.
+## Proportional
+
+Uses relative CPU weighting rather than an absolute CPU ceiling.
+
+```text
+cpu.weight
+```
+
+This is appropriate when the objective is to make a workload yield proportionally without completely imposing a hard bandwidth ceiling.
+
+## Hard Limit
+
+Uses:
+
+```text
+cpu.max
+```
+
+to establish an explicit CPU quota.
+
+This is reserved for the more severe `CRITICAL` state.
+
+---
+
+# Memory Protection
+
+SENTRY uses `memory.high` as the primary memory pressure control.
+
+The current policy derives the memory boundary from observed RSS:
+
+```text
+memory.high = RSS × configured headroom multiplier
+```
+
+The actuator also configures a `memory.min` floor for protected memory capacity.
+
+This is a deliberately bounded intervention model:
+
+```text
+                 observed RSS
+                      │
+                      ▼
+                + headroom
+                      │
+                      ▼
+                memory.high
+```
+
+SENTRY does not attempt to replace the Linux memory-management subsystem.
+
+---
+
+# Recovery
+
+Intervention without recovery is not a control loop.
+
+SENTRY tracks the PIDs that were actively selected for throttling:
+
+```text
+PRESSURE RISE
+      │
+      ▼
+INTERVENTION
+      │
+      ▼
+TRACK ACTIVE TARGETS
+      │
+      ▼
+PRESSURE FALLS
+      │
+      ▼
+TARGET NO LONGER SELECTED
+      │
+      ▼
+RELEASE
+```
+
+CPU quota restoration can be ramped progressively rather than switching directly from constrained execution to unrestricted execution.
+
+The purpose is to reduce abrupt control changes and avoid unnecessary oscillation.
+
+---
+
+# PID Lifecycle Safety
+
+Linux PIDs are ephemeral identifiers.
+
+A controller that stores only:
+
+```text
+PID → state
+```
+
+must account for process exit and PID reuse.
+
+SENTRY therefore performs runtime cleanup of its tracked process set and removes dead process entries from its in-memory accounting structures.
+
+This is an important invariant for any daemon that changes live workload state.
+
+---
+
+# Immunity
+
+SENTRY includes an immunity layer to prevent obvious classes of system-critical targets from becoming normal candidates for intervention.
+
+Current protections include:
+
+```text
+PID 1
+system / init cgroup slices
+```
+
+Conceptually:
+
+```mermaid
+flowchart TD
+
+    P["Process candidate"]
+
+    I1{"PID 1?"}
+    I2{"Protected cgroup slice?"}
+    A["Eligible for policy"]
+    X["Excluded"]
+
+    P --> I1
+    I1 -- yes --> X
+    I1 -- no --> I2
+    I2 -- yes --> X
+    I2 -- no --> A
+```
+
+Desktop active-window immunity remains an integration area rather than a claim of completed functionality.
+
+---
+
+# Daemon Architecture
+
+```text
+src/
+└── sentry_v2/
+    │
+    ├── daemon/
+    │   ├── main.py
+    │   ├── control_loop.py
+    │   └── systemd.py
+    │
+    ├── metrics/
+    │   └── sampler.py
+    │
+    ├── scanner/
+    │   └── proc_scanner.py
+    │
+    ├── policy/
+    │   ├── scoring.py
+    │   ├── state_machine.py
+    │   ├── fair_share.py
+    │   └── immunity.py
+    │
+    ├── actuator/
+    │   ├── protocol.py
+    │   ├── factory.py
+    │   ├── cgroup_actuator.py
+    │   └── userspace_actuator.py
+    │
+    ├── cgroup/
+    │   └── v2.py
+    │
+    └── ipc/
+        └── bridge.py
+```
+
+### Dependency direction
+
+```text
+Kernel interfaces
+       │
+       ▼
+Observation
+       │
+       ▼
+Policy
+       │
+       ▼
+Actuation
+       │
+       ▼
+Runtime state / telemetry
+```
+
+The architectural goal is to keep policy decisions isolated from low-level Linux I/O.
+
+---
+
+# Main Control Loop
+
+The current daemon executes the following cycle:
+
+```mermaid
+sequenceDiagram
+
+    participant K as Linux Kernel
+    participant M as MetricsSampler
+    participant P as ProcScanner
+    participant E as Policy Engine
+    participant A as Actuator
+    participant T as Telemetry
+
+    loop Control cycle
+        K->>M: /proc + PSI
+        M->>E: SystemSample
+        E->>E: Compute pressure
+        E->>E: Update state machine
+        P->>K: /proc/<pid>/*
+        K-->>P: process statistics
+        P->>E: candidate workloads
+        E->>A: ThrottleSpec
+        A->>K: cgroup controls
+        E->>T: runtime telemetry
+    end
+```
+
+---
+
+# Configuration
+
+SENTRY uses a typed configuration model.
 
 Example:
 
-```text
-SENTRY: Policy-Driven Resource Pressure Management
-for Linux Systems
+```yaml
+thresholds:
+  low: 35
+  moderate: 55
+  high: 75
+  critical: 95
+  psi_trigger: 10.0
+  hysteresis: 5
 
-GitHub Repository:
-https://github.com/<username>/SENTRY
+throttle:
+  max_hogs: 5
+  memory_headroom_multiplier: 1.5
+
+immunity:
+  immune_slices:
+    - "system.slice"
+    - "init.scope"
+  desktop_portal_enabled: true
+  cache_ttl: 5.0
+```
+
+### Configuration philosophy
+
+The implementation separates:
+
+```text
+configuration
+      │
+      ▼
+validated immutable model
+      │
+      ▼
+policy engine
+```
+
+Policy changes should not require rewriting control logic.
+
+---
+
+# Installation
+
+## Requirements
+
+SENTRY is Linux-first and expects:
+
+* Linux with cgroup v2
+* `/proc`
+* Linux PSI support for PSI-aware operation
+* Python 3.11+
+* sufficient privileges to manipulate cgroups and inspect required process state
+
+For development:
+
+```bash
+git clone https://github.com/apexajay-rc/SENTRY.git
+cd SENTRY
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+Run the daemon from the repository environment:
+
+```bash
+sudo .venv/bin/python start_sentry.py
+```
+
+The exact systemd deployment path is intentionally kept separate from the development invocation because the repository contains both the active `sentry_v2` runtime and historical deployment artifacts.
+
+---
+
+# Observability
+
+SENTRY exposes runtime telemetry through its IPC layer.
+
+The daemon can publish state containing fields such as:
+
+```json
+{
+  "timestamp": 1725823456.123,
+  "level": "MODERATE",
+  "score": 67.42,
+  "cpu_pct": 45.2,
+  "mem_pct": 62.1,
+  "throttled_pids": [1234, 5678],
+  "immune_pids": [1]
+}
+```
+
+The intent is to keep telemetry separate from the controller itself:
+
+```text
+                 SENTRY
+                    │
+          ┌─────────┴─────────┐
+          ▼                   ▼
+      controller           telemetry
+                              │
+                     ┌────────┼────────┐
+                     ▼        ▼        ▼
+                    CLI      HUD     future exporters
 ```
 
 ---
 
-# ✅ Project Status
+# Safety Model
 
-| Capability                      | Status        |
-| ------------------------------- | ------------- |
-| Linux `/proc` Telemetry         | ✔ Implemented |
-| Linux PSI Integration           | ✔ Implemented |
-| Unified Stress Model            | ✔ Implemented |
-| Policy Engine                   | ✔ Implemented |
-| Process Ranking                 | ✔ Implemented |
-| cgroup Resource Enforcement     | ✔ Implemented |
-| Action Tracking                 | ✔ Implemented |
-| Feedback Engine                 | ✔ Implemented |
-| IPC Control Plane               | ✔ Implemented |
-| Flet Dashboard                  | ✔ Implemented |
-| systemd Integration             | ✔ Implemented |
-| Automated Tests                 | ✔ Implemented |
-| Windows Platform Abstraction    | ⚠ Partial     |
-| Distributed Control Plane       | 🚧 Planned    |
-| eBPF Integration                | 🚧 Future     |
+SENTRY modifies live host resource allocation, therefore safety is an architectural requirement rather than a UI feature.
+
+The controller is designed around:
+
+```text
+1. bounded actions
+2. reversible actions
+3. explicit state transitions
+4. target immunity
+5. cooldowns
+6. recovery
+7. failure isolation
+```
+
+### Intervention boundary
+
+```text
+        OBSERVATION
+             │
+             ▼
+        POLICY DECISION
+             │
+             ▼
+       SAFETY / IMMUNITY
+             │
+             ▼
+         ACTUATION
+             │
+             ▼
+          RECOVERY
+```
+
+The controller does not terminate a process as its normal enforcement mechanism.
 
 ---
 
-# 📌 Closing Summary
+# Testing Strategy
 
-SENTRY is a **policy-driven Linux resource pressure management system** that combines kernel-native telemetry, unified pressure modeling, deterministic policy evaluation, and cgroup-based resource enforcement into a cohesive closed-loop control architecture.
+The repository includes tests spanning:
 
-Unlike conventional monitoring tools that terminate at observation, SENTRY continuously progresses through **measurement → classification → decision → mitigation → feedback**, enabling automated resource management while preserving modularity, deterministic behavior, and operational transparency. Its architecture cleanly separates telemetry collection, pressure computation, policy evaluation, process selection, enforcement, and recovery, providing a maintainable foundation for future enhancements such as event-driven kernel instrumentation, distributed observability, and adaptive policy engines.
+* configuration
+* pressure scoring
+* process scanning
+* allocation
+* IPC
+* cgroup behavior
 
+Example:
 
+```bash
+pytest tests/
+```
 
+The more important validation target, however, is not merely unit-test correctness.
 
+A resource arbiter must answer:
 
+> **Does intervention improve the system objective enough to justify the cost of intervention?**
 
+That requires workload-level experiments.
 
+---
 
+# Recommended Experimental Matrix
+
+A meaningful evaluation should compare:
+
+```text
+Baseline A
+No intervention
+
+Baseline B
+Static cgroup limits
+
+Baseline C
+CPU-utilization-only heuristic
+
+SENTRY
+Utilization + PSI + policy + reversible enforcement
+```
+
+### Workload classes
+
+```text
+CPU contention
+    ├── stress-ng
+    ├── compilation
+    └── compression
+
+Memory contention
+    ├── allocation pressure
+    └── compile + memory stress
+
+I/O contention
+    ├── fio
+    └── mixed CPU / disk workload
+
+Interactive workloads
+    ├── browser
+    ├── IDE
+    └── terminal / shell
+```
+
+### Metrics
+
+| Metric                  | Why it matters                   |
+| ----------------------- | -------------------------------- |
+| Foreground latency      | Primary responsiveness objective |
+| Foreground throughput   | Work preservation                |
+| Background throughput   | Cost of intervention             |
+| Intervention latency    | Controller responsiveness        |
+| Recovery latency        | Reversibility                    |
+| False intervention rate | Policy quality                   |
+| CPU overhead            | Controller cost                  |
+| Memory overhead         | Resident controller footprint    |
+| Oscillation count       | Control stability                |
+| Collateral degradation  | Safety of arbitration            |
+
+---
+
+# What SENTRY Is Trying to Demonstrate
+
+The central hypothesis is not:
+
+> “CPU throttling works.”
+
+That is already established by Linux.
+
+The stronger systems question is:
+
+> **Can a lightweight policy-driven controller use system pressure and workload attribution to improve host responsiveness under contention while limiting collateral performance loss?**
+
+That is the claim worth evaluating.
+
+---
+
+# Design Principles
+
+## 01 — Observe before acting
+
+Resource consumption is measured before intervention.
+
+## 02 — Separate policy from mechanism
+
+The decision engine should not be coupled to cgroup filesystem implementation details.
+
+## 03 — Prefer reversible control
+
+The system should be able to restore previously constrained workloads.
+
+## 04 — Use pressure, not only utilization
+
+High utilization and high contention are related but not identical phenomena.
+
+## 05 — Avoid control-loop flapping
+
+Hysteresis, dwell behavior and cooldowns exist to reduce unstable state transitions.
+
+## 06 — Keep the intervention bounded
+
+Only a controlled subset of candidate workloads is acted upon.
+
+---
+
+# Current Repository State
+
+The repository is an evolving systems project.
+
+The active architecture is centered on:
+
+```text
+src/sentry_v2/
+```
+
+Older implementations and experiments are retained separately as historical material.
+
+```text
+active architecture
+        │
+        ├── current daemon
+        ├── current metrics
+        ├── current policy
+        ├── current actuator
+        └── current IPC
+
+historical work
+        │
+        └── attic/
+```
+
+Historical implementations are useful for understanding architectural evolution, but are not part of the primary runtime model.
+
+---
+
+# Limitations
+
+SENTRY currently has several important limitations.
+
+| Limitation                 | Current state                           |
+| -------------------------- | --------------------------------------- |
+| Linux only                 | By design                               |
+| Single host                | No distributed coordination             |
+| cgroup v2 dependency       | Required for native enforcement         |
+| Root / elevated privileges | Required for host-wide control          |
+| Workload intent            | Heuristic, not semantic                 |
+| Desktop integration        | Incomplete                              |
+| Container-aware policy     | Not a primary abstraction               |
+| GPU arbitration            | Not implemented                         |
+| Prediction                 | Not part of the current core controller |
+| Formal control guarantees  | Not established                         |
+| Production validation      | Not yet demonstrated                    |
+
+These are not hidden defects. They define the boundary of the current system.
+
+---
+
+# What SENTRY Is Not
+
+SENTRY is **not**:
+
+* a Linux scheduler replacement
+* a complete autoscaling platform
+* a container orchestrator
+* a fleet-management system
+* an AI scheduler
+* a GPU resource manager
+* a general-purpose monitoring platform
+* a guarantee of application-level performance
+
+It is a **host-level resource arbitration experiment and systems prototype**.
+
+---
+
+# Architecture Trade-offs
+
+### Why Python?
+
+Python provides:
+
+* fast iteration
+* good Linux userspace integration
+* straightforward `/proc` parsing
+* convenient configuration and telemetry tooling
+
+The trade-off is runtime overhead and weaker suitability for extremely low-latency control paths.
+
+### Why cgroup v2?
+
+Because cgroup v2 provides a unified interface for workload resource control and maps naturally onto SENTRY's actuator model.
+
+### Why PSI?
+
+Because utilization alone does not directly encode execution stalls.
+
+### Why a state machine?
+
+Because direct threshold-to-action mappings are susceptible to oscillation.
+
+### Why separate attribution?
+
+Because system-level pressure and process-level responsibility are different signals and should not be conflated.
+
+---
+
+# Failure Philosophy
+
+A control system should fail in a way that is easier to reason about than the action it attempted.
+
+Conceptually:
+
+```text
+measurement failure
+       ↓
+degrade observation
+
+policy failure
+       ↓
+do not invent intervention
+
+actuation failure
+       ↓
+record failure / preserve controller state
+
+target disappears
+       ↓
+cleanup state
+
+pressure falls
+       ↓
+restore capacity
+```
+
+The implementation is still being hardened toward these guarantees.
+
+---
+
+# Roadmap
+
+The priority is **validation before expansion**.
+
+### Phase 1 — Correctness
+
+```text
+✓ pressure observation
+✓ policy state machine
+✓ process attribution
+✓ cgroup actuation
+✓ recovery path
+
+→ strengthen lifecycle correctness
+→ unify runtime/package architecture
+→ improve failure-state modeling
+```
+
+### Phase 2 — Experimental Validation
+
+```text
+→ reproducible contention workloads
+→ baseline comparisons
+→ responsiveness measurements
+→ actuation overhead measurements
+→ stability / oscillation analysis
+```
+
+### Phase 3 — Systems Research
+
+Only after the core controller is validated:
+
+```text
+→ richer workload identity
+→ improved pressure modeling
+→ more rigorous allocation models
+→ optional kernel-level telemetry
+→ broader workload environments
+```
+
+The roadmap deliberately does **not** treat additional technologies as goals by themselves.
+
+---
+
+# Project Structure
+
+```text
+SENTRY/
+│
+├── src/
+│   └── sentry_v2/
+│       ├── actuator/
+│       ├── cgroup/
+│       ├── daemon/
+│       ├── ipc/
+│       ├── metrics/
+│       ├── policy/
+│       └── scanner/
+│
+├── tests/
+│   ├── foundation/
+│   └── ...
+│
+├── packaging/
+├── assets/
+├── attic/
+├── start_sentry.py
+├── sentry-v2.yaml
+├── requirements.txt
+└── README.md
+```
+
+---
+
+# Technical Summary
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│                           SENTRY                              │
+├───────────────────────────────────────────────────────────────┤
+│                                                               │
+│  TELEMETRY                                                    │
+│  ├── /proc/stat                                               │
+│  ├── /proc/meminfo                                            │
+│  ├── /proc/<pid>/stat                                         │
+│  ├── /proc/<pid>/statm                                        │
+│  └── /proc/pressure/*                                        │
+│                                                               │
+│  POLICY                                                       │
+│  ├── weighted pressure model                                 │
+│  ├── PSI-triggered saturation heuristic                      │
+│  ├── state machine                                            │
+│  ├── hysteresis                                               │
+│  ├── process attribution                                      │
+│  └── proportional excess allocation                           │
+│                                                               │
+│  ENFORCEMENT                                                  │
+│  ├── cgroup v2                                                │
+│  ├── cpu.weight                                                │
+│  ├── cpu.max                                                   │
+│  ├── memory.high                                               │
+│  └── memory.min                                                │
+│                                                               │
+│  RECOVERY                                                     │
+│  ├── active target tracking                                   │
+│  ├── release                                                   │
+│  ├── cooldown                                                   │
+│  └── gradual CPU restoration                                  │
+│                                                               │
+│  INTERFACE                                                    │
+│  └── Unix-domain telemetry / IPC                              │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Core Thesis
+
+> **Resource management is not only a kernel primitive problem. It is also a policy problem.**
+
+SENTRY explores the space between Linux's low-level resource-control mechanisms and the higher-level objective of preserving useful work under contention.
+
+The system observes.
+
+The system attributes.
+
+The system arbitrates.
+
+The system intervenes.
+
+The system recovers.
+
+That closed loop is the project.
+
+---
+
+# License
+
+MIT License. See [LICENSE](LICENSE).
+
+---
+
+<p align="center">
+  <b>SENTRY</b><br/>
+  Policy-driven Linux resource arbitration.<br/>
+  <sub>Observe → Decide → Actuate → Recover</sub>
+</p>
