@@ -18,7 +18,7 @@ from src.sentry_v2.actuator.protocol import ThrottleSpec
 from src.sentry_v2.config import load_config
 
 # FIX: Restore logging configuration so we can actually see the output!
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("sentry.control")
 
 class ControlLoop:
@@ -52,7 +52,7 @@ class ControlLoop:
         await self.initialize()
         self._running = True
         logger.info(f"Control loop started. Cores: {self.num_cores}")
-        await self.sampler.sample()
+        self.sampler.sample()  # Prime the sampler (synchronous)
         await asyncio.sleep(1.0)
 
         while self._running:
@@ -143,7 +143,7 @@ class ControlLoop:
         try:
             snapshot = TelemetrySnapshot(
                 timestamp=time.time(),
-                level=level,
+                level=level.name,  # Convert enum to string name
                 score=score.combined,
                 cpu_pct=sample.cpu_pct,
                 mem_pct=sample.mem_pct,
@@ -151,6 +151,7 @@ class ControlLoop:
                 immune_pids=[], 
             )
             if self.telemetry_bridge:
+                logger.debug(f"Broadcasting telemetry: clients={len(self.telemetry_bridge._clients) if hasattr(self.telemetry_bridge, '_clients') else 'unknown'}")
                 self.telemetry_bridge.broadcast(snapshot)
         except Exception as e:
             logger.error(f"Telemetry broadcast failed: {e}")

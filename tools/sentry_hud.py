@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-tools/sentry_hud.py
-
-Standalone CLI HUD client for SENTRY daemon.
-Connects to the daemon's status socket (/run/sentry_hud.sock) and displays
-real-time telemetry: stress score, system state, and throttled tasks.
+tools/sentry_hud.py - Fixed CLI HUD client for SENTRY daemon.
+Connects to /run/sentry/telemetry.sock and displays real-time telemetry.
 """
 
 import json
@@ -12,18 +9,23 @@ import socket
 import time
 import sys
 import os
-from typing import Optional, Dict, Any
 
 # Configuration
-HUD_SOCKET_PATH = "/run/sentry_hud.sock"
-POLL_INTERVAL = 1.0  # seconds
+HUD_SOCKET_PATH = "/run/sentry/telemetry.sock"
+POLL_INTERVAL = 1.0
+
+# Colors
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
 
 
 def format_throttled_tasks(throttled_tasks: list) -> str:
-    """Format throttled tasks for display."""
     if not throttled_tasks:
         return "  (none)"
-    
     lines = []
     for task in throttled_tasks:
         pid = task.get("pid", "?")
@@ -32,129 +34,398 @@ def format_throttled_tasks(throttled_tasks: list) -> str:
     return "\n".join(lines)
 
 
-def format_state(state: Dict[str, Any]) -> str:
-    """Format daemon state for pretty terminal output."""
+def format_state(state: dict) -> str:
     stress = state.get("stress_score", 0.0)
     level = state.get("state", "UNKNOWN")
     spatial_pid = state.get("spatial_pid")
     observe_only = state.get("observe_only", False)
     throttled = state.get("throttled_tasks", [])
-    
-    # Color codes for terminal
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    CYAN = "\033[96m"
-    BOLD = "\033[1m"
-    RESET = "\033[0m"
-    
-    # Level color
+
     if level in ("CRITICAL", "HIGH"):
-        level_color = RED
+        level_color = "\033[91m"
     elif level == "MODERATE":
-        level_color = YELLOW
+        level_color = "\033[93m"
     else:
-        level_color = GREEN
-    
-    # Observe mode indicator
-    mode_indicator = f"{YELLOW}[OBSERVE ONLY]{RESET}" if observe_only else f"{GREEN}[ARMED]{RESET}"
-    
+        level_color = "\033[92m"
+
+    mode_indicator = "\033[93m[OBSERVE ONLY]\033[0m" if state.get("observe_only", False) else "\033[92m[ARMED]\033[0m"
+
+    if level in ("CRITICAL", "HIGH"):
+        level_color = "\033[91m"
+    elif level == "MODERATE":
+        level_color = "\033[93m"
+    else:
+        level_color = "\033[92m"
+
     lines = []
-    lines.append(f"{BOLD}╔═══════════════════════════════════════════════════════════╗{RESET}")
-    lines.append(f"{BOLD}║                    SENTRY HUD CLIENT                      ║{RESET}")
-    lines.append(f"{BOLD}╚═══════════════════════════════════════════════════════════╝{RESET}")
+    lines.append("\033[1m╔═══════════════════════════════════════════════════════════╗\033[0m")
+    lines.append("\033[1m║                    SENTRY HUD CLIENT                      ║\033[0m")
+    lines.append("\033[1m╚═════════════════════════════════════════════════════════════╝\033[0m")
     lines.append("")
-    lines.append(f"  {BOLD}System Stress Score:{RESET} {CYAN}{stress:.3f}{RESET}")
-    lines.append(f"  {BOLD}Current State:{RESET}     {level_color}{level}{RESET}  {mode_indicator}")
-    
+    lines.append(f"  \033[1mSystem Stress Score:\033[0m \033[96m{stress:.3f}\033[0m")
+    lines.append(f"  \033[1mCurrent State:\033[0m     {level_color}{level}\033[0m  {mode_indicator}")
+
     if spatial_pid:
-        lines.append(f"  {BOLD}Spatial PID:{RESET}       {CYAN}{spatial_pid}{RESET} {GREEN}(IMMUNE){RESET}")
+        lines.append(f"  \033[1mSpatial PID:\033[0m       \033[96m{spatial_pid}\033[0m \033[92m(IMMUNE)\033[0m")
     else:
-        lines.append(f"  {BOLD}Spatial PID:{RESET}       {YELLOW}(none){RESET}")
-    
+        lines.append(f"  \033[1mSpatial PID:\033[0m       \033[93m(none)\033[0m")
+
     lines.append("")
-    lines.append(f"  {BOLD}THROTTLED TASKS:{RESET}")
-    lines.append(format_throttled_tasks(throttled))
+    lines.append(f"  \033[1mTHROTTLED TASKS:\033[0m")
+    if not state.get("throttled_tasks"):
+        lines.append("  (none)")
+    else:
+        for task in state.get("throttled_tasks", []):
+            pid = task.get("pid", "?")
+            time_left = task.get("time_left", 0.0)
+            lines.append(f"  PID {pid}: {time_left:.1f}s remaining")
     lines.append("")
-    lines.append(f"  Press Ctrl+C to exit. Polling every {POLL_INTERVAL}s.")
-    
+    lines.append("  Press Ctrl+C to exit. Polling every 1.0s.")
+
     return "\n".join(lines)
 
 
-def query_hud_socket() -> Optional[Dict[str, Any]]:
-    """Query the SENTRY HUD socket for status."""
-    if not os.path.exists(HUD_SOCKET_PATH):
-        return None
-    
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        sock.settimeout(2.0)
-        
-        # Create a temporary client socket for response
-        client_sock_path = f"/tmp/sentry_hud_client_{os.getpid()}.sock"
-        if os.path.exists(client_sock_path):
-            os.unlink(client_sock_path)
-        
-        sock.bind(client_sock_path)
-        os.chmod(client_sock_path, 0o666)
-
-        # Send STATUS command
-        sock.sendto(b"STATUS", HUD_SOCKET_PATH)
-        
-        # Receive response
-        data, _ = sock.recvfrom(4096)
-        
-        # Cleanup
-        sock.close()
-        if os.path.exists(client_sock_path):
-            os.unlink(client_sock_path)
-        
-        return json.loads(data.decode())
-    
-    except (ConnectionRefusedError, FileNotFoundError, socket.timeout, json.JSONDecodeError):
-        return None
-    except Exception:
-        return None
-
-
 def main():
-    """Main HUD client loop."""
     print("SENTRY HUD Client - Connecting to daemon...")
-    print(f"Socket: {HUD_SOCKET_PATH}")
+    print("Socket: /run/sentry/telemetry.sock")
     print("")
-    
+
+    client_sock_path = f"/tmp/sentry_hud_client_{os.getpid()}.sock"
+    if os.path.exists(client_sock_path):
+        os.unlink(client_sock_path)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(f"/tmp/sentry_hud_client_{os.getpid()}.sock")
+    sock.setblocking(False)
+
+    daemon_sock = "/run/sentry/telemetry.sock"
+
+    # Send subscribe message (JSON format expected by bridge)
+    subscribe_msg = json.dumps({"type": "subscribe"}).encode()
+    sock.sendto(subscribe_msg, "/run/sentry/telemetry.sock")
+    print(f"Subscribed to /run/sentry/telemetry.sock")
+    print("")
+
+    last_data = None
     consecutive_failures = 0
-    
+
     try:
         while True:
-            state = query_hud_socket()
-            
-            if state is None:
-                consecutive_failures += 1
-                if consecutive_failures == 1:
-                    print("\033[2J\033[H", end="")  # Clear screen
-                    print("SENTRY HUD Client - Waiting for daemon...")
-                    print(f"Socket: {HUD_SOCKET_PATH}")
-                    print("")
-                    print(f"  {consecutive_failures} consecutive connection failures.")
-                    print("  Is the daemon running? (sudo python daemon/main.py)")
+            try:
+                data, _ = sock.recvfrom(4096)
+                if data:
+                    state = json.loads(data.decode())
+                    print("\033[2J\033[H", end="")
+
+                    stress = state.get("stress_score", 0.0)
+                    level = state.get("state", "UNKNOWN")
+                    spatial_pid = state.get("spatial_pid")
+                    observe_only = state.get("observe_only", False)
+                    throttled = state.get("throttled_tasks", [])
+
+                    if level in ("CRITICAL", "HIGH"):
+                        level_color = "\033[91m"
+                    elif level == "MODERATE":
+                        level_color = "\033[93m"
+                    else:
+                        level_color = "\033[92m"
+
+                    mode_indicator = "\033[93m[OBSERVE ONLY]\033[0m" if state.get("observe_only", False) else "\033[92m[ARMED]\033[0m"
+
+                    if level in ("CRITICAL", "HIGH"):
+                        level_color = "\033[91m"
+                    elif level == "MODERATE":
+                        level_color = "\033[93m"
+                    else:
+                        level_color = "\033[92m"
+
+                    mode_indicator = "\033[93m[OBSERVE ONLY]\033[0m" if state.get("observe_only", False) else "\033[92m[ARMED]\033[0m"
+
+                    lines = []
+                    lines.append("\033[1m╔═══════════════════════════════════════════════════════════╗\033[0m")
+                    lines.append("\033[1m║                    SENTRY HUD CLIENT                      ║\033[0m")
+                    lines.append("\033[1m╚═════════════════════════════════════════════════════════════╝\033[0m")
+                    lines.append("")
+                    lines.append(f"  \033[1mSystem Stress Score:\033[0m \033[96m{stress:.3f}\033[0m")
+                    lines.append(f"  \033[1mCurrent State:\033[0m     {level_color}{level}\033[0m  {mode_indicator}")
+
+                    spatial_pid = state.get("spatial_pid")
+                    if spatial_pid:
+                        lines.append(f"  \033[1mSpatial PID:\033[0m       \033[96m{spatial_pid}\033[0m \033[92m(IMMUNE)\033[0m")
+                    else:
+                        lines.append(f"  \033[1mSpatial PID:\033[0m       \033[93m(none)\033[0m")
+
+                    lines.append("")
+                    lines.append("  \033[1mTHROTTLED TASKS:\033[0m")
+                    throttled = state.get("throttled_tasks", [])
+                    if not throttled:
+                        lines.append("  (none)")
+                    else:
+                        for task in throttled:
+                            pid = task.get("pid", "?")
+                            time_left = task.get("time_left", 0.0)
+                            lines.append(f"  PID {pid}: {time_left:.1f}s remaining")
+                    lines.append("")
+                    lines.append("  Press Ctrl+C to exit. Polling every 1.0s.")
+
+                    print("\n".join(lines))
+                    consecutive_failures = 0
                 else:
-                    print(f"\r  {consecutive_failures} consecutive connection failures...", end="", flush=True)
-            else:
-                consecutive_failures = 0
-                # Clear screen and print formatted state
-                print("\033[2J\033[H", end="")  # Clear screen, move cursor to top-left
-                print(format_state(state))
-            
-            time.sleep(POLL_INTERVAL)
-    
+                    consecutive_failures += 1
+            except BlockingIOError:
+                pass
+            except json.JSONDecodeError:
+                pass
+            except Exception:
+                pass
+
+            if consecutive_failures > 20:
+                print("\033[2J\033[H", end="")
+                print("SENTRY HUD Client - Waiting for daemon...")
+                print("Socket: /run/sentry/telemetry.sock")
+                print("")
+                print(f"  Waiting for telemetry broadcast...")
+
+            time.sleep(0.5)
+
     except KeyboardInterrupt:
         print("\n\n[EXIT] HUD client stopped by user.")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n[ERROR] Unexpected error: {e}")
-        sys.exit(1)
-
+    finally:
+        try:
+            os.unlink(f"/tmp/sentry_hud_client_{os.getpid()}.sock")
+        except:
+            pass
 
 if __name__ == "__main__":
+    import json
+    import socket
+    import time
+    import os
+    import sys
+
+    # Socket setup
+    client_sock_path = f"/tmp/sentry_hud_client_{os.getpid()}.sock"
+    if os.path.exists(client_sock_path):
+        os.unlink(client_sock_path)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(f"/tmp/sentry_hud_client_{os.getpid()}.sock")
+    sock.setblocking(False)
+
+    daemon_sock = "/run/sentry/telemetry.sock"
+
+    # Send subscribe message (JSON format expected by bridge)
+    subscribe_msg = json.dumps({"type": "subscribe"}).encode()
+    sock.sendto(subscribe_msg, "/run/sentry/telemetry.sock")
+    print(f"Subscribed to /run/sentry/telemetry.sock")
+    print("")
+
+    last_data = None
+    consecutive_failures = 0
+
+    try:
+        while True:
+            try:
+                data, _ = sock.recvfrom(4096)
+                if data:
+                    state = json.loads(data.decode())
+                    print("\033[2J\033[H", end="")
+
+                    stress = state.get("stress_score", 0.0)
+                    level = state.get("state", "UNKNOWN")
+                    spatial_pid = state.get("spatial_pid")
+                    observe_only = state.get("observe_only", False)
+                    throttled = state.get("throttled_tasks", [])
+
+                    if level in ("CRITICAL", "HIGH"):
+                        level_color = "\033[91m"
+                    elif level == "MODERATE":
+                        level_color = "\033[93m"
+                    else:
+                        level_color = "\033[92m"
+
+                    mode_indicator = "\033[93m[OBSERVE ONLY]\033[0m" if state.get("observe_only", False) else "\033[92m[ARMED]\033[0m"
+
+                    if level in ("CRITICAL", "HIGH"):
+                        level_color = "\033[91m"
+                    elif level == "MODERATE":
+                        level_color = "\033[93m"
+                    else:
+                        level_color = "\033[92m"
+
+                    mode_indicator = "\033[93m[OBSERVE ONLY]\033[0m" if state.get("observe_only", False) else "\033[92m[ARMED]\033[0m"
+
+                    lines = []
+                    lines.append("\033[1m╔═══════════════════════════════════════════════════════════╗\033[0m")
+                    lines.append("\033[1m║                    SENTRY HUD CLIENT                      ║\033[0m")
+                    lines.append("\033[1m╚═════════════════════════════════════════════════════════════╝\033[0m")
+                    lines.append("")
+                    lines.append(f"  \033[1mSystem Stress Score:\033[0m \033[96m{stress:.3f}\033[0m")
+                    lines.append(f"  \033[1mCurrent State:\033[0m     {level_color}{level}\033[0m  {mode_indicator}")
+
+                    spatial_pid = state.get("spatial_pid")
+                    if spatial_pid:
+                        lines.append(f"  \033[1mSpatial PID:\033[0m       \033[96m{spatial_pid}\033[0m \033[92m(IMMUNE)\033[0m")
+                    else:
+                        lines.append("  \033[1mSpatial PID:\033[0m       \033[93m(none)\033[0m")
+
+                    lines.append("")
+                    lines.append("  \033[1mTHROTTLED TASKS:\033[0m")
+                    throttled = state.get("throttled_tasks", [])
+                    if not throttled:
+                        lines.append("  (none)")
+                    else:
+                        for task in throttled:
+                            pid = task.get("pid", "?")
+                            time_left = task.get("time_left", 0.0)
+                            lines.append(f"  PID {pid}: {time_left:.1f}s remaining")
+                    lines.append("")
+                    lines.append("  Press Ctrl+C to exit. Polling every 1.0s.")
+
+                    print("\n".join(lines))
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+            except BlockingIOError:
+                pass
+            except json.JSONDecodeError:
+                pass
+            except Exception:
+                pass
+
+            if consecutive_failures > 20:
+                print("\033[2J\033[H", end="")
+                print("SENTRY HUD Client - Waiting for daemon...")
+                print("Socket: /run/sentry/telemetry.sock")
+                print("")
+                print(f"  Waiting for telemetry broadcast...")
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n\n[EXIT] HUD client stopped by user.")
+    finally:
+        try:
+            os.unlink(f"/tmp/sentry_hud_client_{os.getpid()}.sock")
+        except:
+            pass
+
+if __name__ == "__main__":
+    import json
+    import socket
+    import time
+    import os
+
+    # Socket setup
+    client_sock_path = f"/tmp/sentry_hud_client_{os.getpid()}.sock"
+    if os.path.exists(client_sock_path):
+        os.unlink(client_sock_path)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(f"/tmp/sentry_hud_client_{os.getpid()}.sock")
+    sock.setblocking(False)
+
+    daemon_sock = "/run/sentry/telemetry.sock"
+
+    # Send subscribe message (JSON format expected by bridge)
+    subscribe_msg = json.dumps({"type": "subscribe"}).encode()
+    sock.sendto(subscribe_msg, "/run/sentry/telemetry.sock")
+    print(f"Subscribed to /run/sentry/telemetry.sock")
+    print("")
+
+    last_data = None
+    consecutive_failures = 0
+
+    try:
+        while True:
+            try:
+                data, _ = sock.recvfrom(4096)
+                if data:
+                    state = json.loads(data.decode())
+                    print("\033[2J\033[H", end="")
+
+                    stress = state.get("stress_score", 0.0)
+                    level = state.get("state", "UNKNOWN")
+                    spatial_pid = state.get("spatial_pid")
+                    observe_only = state.get("observe_only", False)
+                    throttled = state.get("throttled_tasks", [])
+
+                    if level in ("CRITICAL", "HIGH"):
+                        level_color = "\033[91m"
+                    elif level == "MODERATE":
+                        level_color = "\033[93m"
+                    else:
+                        level_color = "\033[92m"
+
+                    mode_indicator = "\033[93m[OBSERVE ONLY]\033[0m" if state.get("observe_only", False) else "\033[92m[ARMED]\033[0m"
+
+                    if level in ("CRITICAL", "HIGH"):
+                        level_color = "\033[91m"
+                    elif level == "MODERATE":
+                        level_color = "\033[93m"
+                    else:
+                        level_color = "\033[92m"
+
+                    mode_indicator = "\033[93m[OBSERVE ONLY]\033[0m" if state.get("observe_only", False) else "\033[92m[ARMED]\033[0m"
+
+                    lines = []
+                    lines.append("\033[1m╔═══════════════════════════════════════════════════════════╗\033[0m")
+                    lines.append("\033[1m║                    SENTRY HUD CLIENT                      ║\033[0m")
+                    lines.append("\033[1m╚════════════════════════════════════════════════════════════╝\033[0m")
+                    lines.append("")
+                    lines.append(f"  \033[1mSystem Stress Score:\033[0m \033[96m{stress:.3f}\033[0m")
+                    lines.append(f"  \033[1mCurrent State:\033[0m     {level_color}{level}\033[0m  {mode_indicator}")
+
+                    spatial_pid = state.get("spatial_pid")
+                    if spatial_pid:
+                        lines.append(f"  \033[1mSpatial PID:\033[0m       \033[96m{spatial_pid}\033[0m \033[92m(IMMUNE)\033[0m")
+                    else:
+                        lines.append("  \033[1mSpatial PID:\033[0m       \033[93m(none)\033[0m")
+
+                    lines.append("")
+                    lines.append("  \033[1mTHROTTLED TASKS:\033[0m")
+                    throttled = state.get("throttled_tasks", [])
+                    if not throttled:
+                        lines.append("  (none)")
+                    else:
+                        for task in throttled:
+                            pid = task.get("pid", "?")
+                            time_left = task.get("time_left", 0.0)
+                            lines.append(f"  PID {pid}: {time_left:.1f}s remaining")
+                    lines.append("")
+                    lines.append("  Press Ctrl+C to exit. Polling every 1.0s.")
+
+                    print("\n".join(lines))
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+            except BlockingIOError:
+                pass
+            except json.JSONDecodeError:
+                pass
+            except Exception:
+                pass
+
+            if consecutive_failures > 20:
+                print("\033[2J\033[H", end="")
+                print("SENTRY HUD Client - Waiting for daemon...")
+                print("Socket: /run/sentry/telemetry.sock")
+                print("")
+                print(f"  Waiting for telemetry broadcast...")
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n\n[EXIT] HUD client stopped by user.")
+    finally:
+        try:
+            os.unlink(f"/tmp/sentry_hud_client_{os.getpid()}.sock")
+        except:
+            pass
+
+if __name__ == "__main__":
+    import json
+    import socket
+    import time
+    import os
     main()

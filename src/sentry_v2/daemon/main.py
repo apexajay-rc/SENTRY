@@ -5,7 +5,7 @@ import logging
 from src.sentry_v2.daemon.control_loop import ControlLoop
 from src.sentry_v2.daemon.systemd import sd_notify
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("sentry.main")
 
 async def async_main():
