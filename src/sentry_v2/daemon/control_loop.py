@@ -37,12 +37,16 @@ class ControlLoop:
         self._reload = False
 
     async def initialize(self):
-        self.actuator = create_actuator()
+        self.actuator = await create_actuator()
         await self.immunity.initialize()
         
-        # Initialize telemetry bridge
+        # Initialize telemetry bridge (handle permission errors gracefully)
         self.telemetry_bridge = TelemetryBridge()
-        await self.telemetry_bridge.start()
+        try:
+            await self.telemetry_bridge.start()
+        except PermissionError:
+            logger.warning("Telemetry bridge failed to start (permission denied). Running without telemetry.")
+            self.telemetry_bridge = None
         
         loop = asyncio.get_event_loop()
         try: loop.add_signal_handler(signal.SIGHUP, lambda: setattr(self, '_reload', True))
@@ -116,28 +120,33 @@ class ControlLoop:
             await asyncio.sleep(max(0, 1.0 - elapsed))
 
     async def _gradual_release(self, pid: int) -> None:
-        """Ramp quota from current -> 100% over 5 seconds."""
-        try:
-            pid_cgroup = self.actuator.sentry_root / str(pid)
-            cpu_max_path = pid_cgroup / "cpu.max"
-            if not cpu_max_path.exists():
+            """Ramp CPUWeight from current -> original over 5 seconds via systemd DBus."""
+            try:
+                unit_name = await self.actuator._get_unit_name_from_pid(pid)
+                if not unit_name:
+                    await self.actuator.release_throttle(pid)
+                    return
+
+                original_weight = self.actuator._original_weights.get(unit_name, 100)
+                current_weight = await self.actuator._get_current_cpu_weight(unit_name)
+                if current_weight is None or current_weight == original_weight:
+                    await self.actuator.release_throttle(pid)
+                    return
+
+                steps = 5
+                for i in range(1, steps + 1):
+                    ramp_weight = current_weight + (original_weight - current_weight) * i // steps
+                    await self.actuator._set_cpu_weight(unit_name, ramp_weight)
+                    await asyncio.sleep(1.0)
+
+                # Ensure exact final value
+                await self.actuator._set_cpu_weight(unit_name, original_weight)
+                self.actuator._pid_cooldowns.pop(pid, None)
+                self.actuator._original_weights.pop(unit_name, None)
+
+            except Exception as e:
+                logger.error(f"Gradual release failed for PID {pid}: {e}")
                 await self.actuator.release_throttle(pid)
-                return
-            
-            with open(cpu_max_path) as f:
-                current = f.read().strip()
-            if current == "max 100000":
-                return
-            current_quota = int(current.split()[0])
-            
-            steps = 5
-            for i in range(1, steps + 1):
-                ramp_quota = current_quota + (100000 - current_quota) * i // 5
-                with open(cpu_max_path, 'w') as f:
-                    f.write(f"{ramp_quota} 100000")
-                await asyncio.sleep(1.0)
-        except Exception:
-            await self.actuator.release_throttle(pid)
 
     def _broadcast_telemetry(self, sample, score, level, new_throttled):
         try:

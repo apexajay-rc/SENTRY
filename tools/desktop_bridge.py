@@ -2,122 +2,227 @@
 """
 tools/desktop_bridge.py
 
-A universal user-space telemetry agent.
-Dynamically detects X11 vs. Wayland (KDE, Hyprland, Sway, GNOME) to locate
-the actively focused window PID and beam it to SENTRY's Ring 0 SafetyGuard.
+SENTRY Foreground QoS Bridge - Active Window PID Detection.
+Maps active window → PID → systemd DBus CPUWeight shift (foreground=10000, background=100).
+
+Supported compositors:
+- GNOME (Mutter): Requires GNOME Shell extension for active window (placeholder)
+- KWin: org.kde.kwin.Scripting DBus
+- X11 fallback: xdotool
 """
 
 import os
-import subprocess
+import sys
+import json
 import time
 import socket
 import logging
-import json
+import asyncio
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("sentry.desktop_bridge")
 
-SENTRY_BRIDGE_SOCK = "/run/sentry_bridge.sock"
+SENTRY_TELEMETRY_SOCK = "/run/sentry/telemetry.sock"
+POLL_INTERVAL = 0.3  # 300ms
 
-class UniversalDesktopResolver:
+
+class GnomeBackend:
+    """GNOME (Mutter) active window detection - placeholder for Wayland.
+    
+    Note: GNOME Wayland does not expose active window via DBus without a 
+    GNOME Shell extension. This backend returns None and logs a warning.
+    """
+
     def __init__(self):
-        self.session_type = os.environ.get("XDG_SESSION_TYPE", "x11").lower()
-        self.desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
-        logging.info(f"Environment Detected -> Session: [{self.session_type}], Desktop: [{self.desktop}]")
+        pass
 
-    def get_active_pid(self):
-        """Routes the PID query to the correct compositor backend."""
-        try:
-            if "hyprland" in self.desktop:
-                return self._get_hyprland_pid()
-            elif "sway" in self.desktop or "i3" in self.desktop:
-                return self._get_sway_pid()
-            elif self.session_type == "wayland" and "kde" in self.desktop:
-                return self._get_kde_wayland_pid()
-            else:
-                # Fallback for X11, XWayland, and standard EWMH compliant desktops
-                return self._get_xdotool_pid()
-        except Exception:
-            return None
+    async def initialize(self) -> bool:
+        logger.warning("GNOME Wayland backend: Active window detection requires GNOME Shell extension. Returning None.")
+        return True
 
-    def _get_xdotool_pid(self):
-        """Standard X11 / XWayland query using xdotool."""
-        try:
-            win_id = subprocess.check_output(['xdotool', 'getactivewindow'], stderr=subprocess.DEVNULL).decode().strip()
-            pid = subprocess.check_output(['xdotool', 'getwindowpid', win_id], stderr=subprocess.DEVNULL).decode().strip()
-            return int(pid) if pid.isdigit() else None
-        except subprocess.CalledProcessError:
-            return None
+    async def get_active_pid(self) -> Optional[int]:
+        return None
 
-    def _get_kde_wayland_pid(self):
-        """KDE Plasma Wayland query using kdotool."""
-        try:
-            win_id = subprocess.check_output(['kdotool', 'getactivewindow'], stderr=subprocess.DEVNULL).decode().strip()
-            pid = subprocess.check_output(['kdotool', 'getwindowpid', win_id], stderr=subprocess.DEVNULL).decode().strip()
-            return int(pid) if pid.isdigit() else None
-        except FileNotFoundError:
-            logging.debug("kdotool not installed. Falling back to xdotool.")
-            return self._get_xdotool_pid()
-        except subprocess.CalledProcessError:
-            return None
 
-    def _get_hyprland_pid(self):
-        """Hyprland native IPC query via hyprctl."""
-        try:
-            output = subprocess.check_output(['hyprctl', 'activewindow', '-j'], stderr=subprocess.DEVNULL).decode()
-            data = json.loads(output)
-            pid = data.get("pid")
-            return int(pid) if pid and int(pid) > 0 else None
-        except Exception:
-            return None
+class KWinBackend:
+    """KWin active window detection via Scripting DBus."""
 
-    def _get_sway_pid(self):
-        """Sway / i3 native IPC query via swaymsg."""
+    def __init__(self, bus):
+        self._bus = bus
+        self._workspace_proxy = None
+
+    async def initialize(self) -> bool:
         try:
-            output = subprocess.check_output(['swaymsg', '-t', 'get_tree'], stderr=subprocess.DEVNULL).decode()
-            tree = json.loads(output)
-            
-            # DFS search for the focused node
-            def find_focused(node):
-                if node.get("focused") and node.get("pid"):
-                    return node.get("pid")
-                for child in node.get("nodes", []) + node.get("floating_nodes", []):
-                    res = find_focused(child)
-                    if res: return res
+            introspection = await self._bus.introspect(
+                'org.kde.kwin', '/org/kde/kwin/Scripting'
+            )
+            proxy = self._bus.get_proxy_object(
+                'org.kde.kwin', '/org/kde/kwin/Scripting', introspection
+            )
+            self._workspace_proxy = proxy.get_interface('org.kde.kwin.Scripting')
+            logger.info("KWin Scripting backend initialized")
+            return True
+        except Exception as e:
+            logger.warning(f"KWin backend init failed: {e}")
+            return False
+
+    async def get_active_pid(self) -> Optional[int]:
+        try:
+            if not self._workspace_proxy:
                 return None
-                
-            pid = find_focused(tree)
-            return int(pid) if pid else None
-        except Exception:
+
+            # Get active window
+            window_variant = await self._workspace_proxy.call_active_window()
+            if not window_variant or not window_variant.value:
+                return None
+
+            window_path = str(window_variant.value)
+            window_proxy = self._bus.get_proxy_object('org.kde.kwin', window_path)
+            introspection = await self._bus.introspect('org.kde.kwin', window_path)
+            window_iface = window_proxy.get_interface('org.kde.kwin.Window')
+
+            pid_variant = await window_iface.call_get_pid()
+            pid = int(pid_variant.value)
+            return pid if pid > 0 else None
+        except Exception as e:
+            logger.debug(f"KWin get_active_pid failed: {e}")
             return None
 
-def main():
-    print("=====================================================")
-    print("  SENTRY Universal Desktop Telemetry Bridge v2.0     ")
-    print("=====================================================")
-    
-    resolver = UniversalDesktopResolver()
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    last_pid = None
-    
-    print(f"📡 Beaming spatial telemetry to SENTRY Unix Socket: {SENTRY_BRIDGE_SOCK}...\n")
-    
-    while True:
-        active_pid = resolver.get_active_pid()
-        
-        # Only beam a network packet if the user actually shifted their gaze
-        if active_pid and active_pid != last_pid:
+
+class X11Backend:
+    """X11/XWayland fallback using xdotool."""
+
+    async def get_active_pid(self) -> Optional[int]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'xdotool', 'getactivewindow',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.debug(f"xdotool getactivewindow failed: {stderr.decode().strip()}")
+                return None
+            win_id = stdout.decode().strip()
+
+            proc = await asyncio.create_subprocess_exec(
+                'xdotool', 'getwindowpid', win_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.debug(f"xdotool getwindowpid failed: {stderr.decode().strip()}")
+                return None
+            pid_str = stdout.decode().strip()
+            return int(pid_str) if pid_str.isdigit() else None
+        except Exception as e:
+            logger.debug(f"X11 backend error: {e}")
+            return None
+
+
+class DesktopBridge:
+    """Main desktop bridge - detects active window PID and notifies SENTRY."""
+
+    def __init__(self):
+        self._bus = None
+        self._backends = []
+        self._last_pid = None
+        self._socket = None
+
+    async def initialize(self) -> bool:
+        """Initialize DBus connection and detect compositor backend."""
+        try:
+            from dbus_next.aio import MessageBus
+            from dbus_next.constants import BusType
+
+            self._bus = await MessageBus(bus_type=BusType.SESSION).connect()
+
+            # Try GNOME backend (placeholder)
+            gnome = GnomeBackend()
+            if await gnome.initialize():
+                logger.info("GNOME backend registered (placeholder)")
+
+            # Try KWin backend
+            kwin = KWinBackend(self._bus)
+            if await kwin.initialize():
+                self._backends.append(kwin)
+                logger.info("Using KWin Scripting backend")
+
+            # X11 fallback (always available)
+            self._backends.append(X11Backend())
+            logger.info("X11/xdotool fallback registered")
+
+            if not self._backends:
+                logger.error("No desktop backend available")
+                return False
+
+            # UDP socket for SENTRY telemetry
+            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            return True
+        except Exception as e:
+            logger.error(f"Desktop bridge initialization failed: {e}")
+            return False
+
+    async def get_active_pid(self) -> Optional[int]:
+        """Query active backends for current foreground PID."""
+        for backend in self._backends:
             try:
-                # Send datagram payload directly to the daemon's Unix socket
-                sock.sendto(str(active_pid).encode(), SENTRY_BRIDGE_SOCK)
-                logging.info(f"Gaze Shift Detected -> Active Foreground PID: {active_pid}")
-                last_pid = active_pid
-            except FileNotFoundError:
-                # Daemon is offline, suppress errors to avoid spamming the console
-                pass
+                pid = await backend.get_active_pid()
+                if pid and pid > 0:
+                    return pid
             except Exception as e:
-                logging.error(f"Failed to transmit heartbeat to SENTRY: {e}")
-                
-        time.sleep(0.3)  # 300ms polling rate (Zero measurable CPU overhead)
+                logger.debug(f"Backend {type(backend).__name__} failed: {e}")
+        return None
+
+    async def run(self):
+        """Main loop - detect focus changes and notify SENTRY."""
+        logger.info(f"Desktop bridge running, polling every {POLL_INTERVAL}s")
+        logger.info(f"SENTRY socket: {SENTRY_TELEMETRY_SOCK}")
+
+        while True:
+            try:
+                pid = await self.get_active_pid()
+                if pid and pid != self._last_pid:
+                    # Send focus change notification to SENTRY
+                    payload = json.dumps({
+                        "type": "focus_change",
+                        "pid": pid,
+                        "timestamp": time.time()
+                    }).encode()
+                    try:
+                        self._socket.sendto(payload, SENTRY_TELEMETRY_SOCK)
+                        logger.info(f"Focus change → PID {pid}")
+                        self._last_pid = pid
+                    except Exception as e:
+                        logger.warning(f"Failed to send focus change: {e}")
+
+                await asyncio.sleep(POLL_INTERVAL)
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                await asyncio.sleep(1)
+
+
+async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    bridge = DesktopBridge()
+    if not await bridge.initialize():
+        logger.error("Failed to initialize desktop bridge")
+        sys.exit(1)
+
+    await bridge.run()
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Desktop bridge stopped")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)

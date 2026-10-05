@@ -1,86 +1,181 @@
+"""
+Systemd DBus-based actuator for SENTRY V2 using dbus-next.
+Replaces direct cgroup filesystem writes with systemd Manager.SetUnitProperties DBus API.
+"""
+
 import os
 import time
-from pathlib import Path
+import logging
+from typing import Optional
 from src.sentry_v2.actuator.protocol import ThrottleSpec
 
-PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-CPU_PERIOD_US = 100_000
+logger = logging.getLogger("sentry.actuator")
 
-class CgroupActuator:
+try:
+    from dbus_next.aio import MessageBus
+    from dbus_next.constants import BusType
+    from dbus_next import DBusError
+    DBUS_AVAILABLE = True
+except ImportError:
+    DBUS_AVAILABLE = False
+    logger.warning("dbus-next not available, systemd DBus actuation disabled")
+
+
+class SystemdActuator:
+    """
+    Actuates CPU resource limits via systemd DBus API using dbus-next.
+    Uses Manager.SetUnitProperties to dynamically adjust CPUWeight.
+    """
+
     def __init__(self):
-        self.sentry_root = Path("/sys/fs/cgroup/system.slice/sentry-v2.service")
-        if not self.sentry_root.exists():
-            try:
-                self.sentry_root.mkdir(parents=True, exist_ok=True)
-                with open(self.sentry_root / "cgroup.subtree_control", "w") as f:
-                    f.write("+cpu +memory")
-            except PermissionError:
-                pass # Handled by systemd in production
-        
+        if not DBUS_AVAILABLE:
+            raise RuntimeError("dbus-next required for SystemdActuator. Install with: pip install dbus-next")
+
+        self._bus: Optional[MessageBus] = None
+        self._manager_iface = None
+
         # Layer 2 Hysteresis: Per-PID cooldown
         self._pid_cooldowns: dict[int, float] = {}
         self.COOLDOWN_SECONDS = 30.0
 
-    def _write_file(self, path: Path, value: str) -> None:
+        # Cache original CPU weights for restoration
+        self._original_weights: dict[str, int] = {}
+
+    async def initialize(self) -> None:
+        """Initialize DBus connection to systemd."""
         try:
-            with open(path, "w") as f:
-                f.write(value)
-        except OSError as e:
-            print(f"CGROUP ERROR: {e}")
+            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            introspection = await self._bus.introspect('org.freedesktop.systemd1', '/org/freedesktop/systemd1')
+            # Get proxy object WITH introspection
+            manager_obj = self._bus.get_proxy_object(
+                'org.freedesktop.systemd1',
+                '/org/freedesktop/systemd1',
+                introspection
+            )
+            self._manager_iface = manager_obj.get_interface('org.freedesktop.systemd1.Manager')
+            logger.info("Systemd DBus actuator initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize systemd DBus actuator: {e}")
+            raise
+
+    async def _get_unit_name_from_pid(self, pid: int) -> Optional[str]:
+        """Resolve systemd unit name from PID via GetUnitByPID."""
+        try:
+            if not self._manager_iface:
+                return None
+
+            unit_path = await self._manager_iface.call_get_unit_by_pid(pid)
+            if not unit_path or unit_path == '/':
+                logger.warning(f"No systemd unit found for PID {pid}")
+                return None
+
+            # Get the unit object and read its Id property
+            introspection = await self._bus.introspect('org.freedesktop.systemd1', unit_path)
+            unit_proxy = self._bus.get_proxy_object('org.freedesktop.systemd1', unit_path, introspection)
+            props_iface = unit_proxy.get_interface('org.freedesktop.DBus.Properties')
+            unit_name_variant = await props_iface.call_get('org.freedesktop.systemd1.Unit', 'Id')
+            unit_name = str(unit_name_variant.value)
+            return unit_name
+        except Exception as e:
+            logger.warning(f"Failed to get unit for PID {pid}: {e}")
+            return None
+
+    async def _set_cpu_weight(self, unit_name: str, weight: int) -> bool:
+        """Set CPUWeight via Manager.SetUnitProperties (runtime=True)."""
+        try:
+            if not self._manager_iface:
+                return False
+
+            # CPUWeight must be 1-10000
+            weight = max(1, min(10000, weight))
+            await self._manager_iface.call_set_unit_properties(
+                unit_name,
+                True,  # runtime=True (persist only until reboot)
+                [("CPUWeight", 'u', weight)]  # 'u' = uint64
+            )
+            logger.debug(f"Set CPUWeight={weight} for {unit_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set CPUWeight for {unit_name}: {e}")
+            return False
+
+    async def _get_current_cpu_weight(self, unit_name: str) -> Optional[int]:
+        """Get current CPUWeight from unit properties."""
+        try:
+            if not self._bus:
+                return None
+
+            # systemd unit paths are escaped: . -> _2e, - -> _2d
+            escaped_name = unit_name.replace(".", "_2e").replace("-", "_2d")
+            unit_path = f'/org/freedesktop/systemd1/unit/{escaped_name}'
+            introspection = await self._bus.introspect('org.freedesktop.systemd1', unit_path)
+            unit_proxy = self._bus.get_proxy_object('org.freedesktop.systemd1', unit_path, introspection)
+            props_iface = unit_proxy.get_interface('org.freedesktop.DBus.Properties')
+            weight_variant = await props_iface.call_get('org.freedesktop.systemd1.Unit', 'CPUWeight')
+            return int(weight_variant.value)
+        except Exception as e:
+            logger.debug(f"Could not read CPUWeight for {unit_name}: {e}")
+            return None
 
     async def apply_throttle(self, pid: int, spec: ThrottleSpec) -> None:
+        """Apply CPU throttling via systemd CPUWeight."""
         # Layer 2 Hysteresis: Per-PID cooldown check
         now = time.monotonic()
         if pid in self._pid_cooldowns and now < self._pid_cooldowns[pid]:
             remaining = self._pid_cooldowns[pid] - now
-            print(f"COOLDOWN ACTIVE: PID {pid} ({remaining:.1f}s remaining)")
+            logger.info(f"COOLDOWN ACTIVE: PID {pid} ({remaining:.1f}s remaining)")
             return
         self._pid_cooldowns[pid] = now + self.COOLDOWN_SECONDS
 
-        pid_cgroup = self.sentry_root / str(pid)
-        if not pid_cgroup.exists():
-            try:
-                pid_cgroup.mkdir(exist_ok=True)
-                self._write_file(pid_cgroup / "cgroup.procs", str(pid))
-            except OSError:
-                return
+        unit_name = await self._get_unit_name_from_pid(pid)
+        if not unit_name:
+            logger.warning(f"No systemd unit found for PID {pid}, cannot throttle")
+            return
 
-        # MODE HANDLING: PROPORTIONAL vs HARD_LIMIT
+        # Determine target weight from spec
         mode = getattr(spec, 'mode', 'PROPORTIONAL')
         if mode == "PROPORTIONAL":
-            # Proportional: use cpu.weight, no hard quota
-            if spec.cpu_weight is not None:
-                self._write_file(pid_cgroup / "cpu.weight", str(spec.cpu_weight))
-            self._write_file(pid_cgroup / "cpu.max", "max 100000")
+            target_weight = spec.cpu_weight if spec.cpu_weight is not None else 100
         elif mode == "HARD_LIMIT":
-            # Hard limit: use cpu.max quota
-            if spec.cpu_quota_pct is not None:
-                quota = max(1, (spec.cpu_quota_pct * CPU_PERIOD_US) // 100)
-                self._write_file(pid_cgroup / "cpu.max", f"{quota} {CPU_PERIOD_US}")
-            self._write_file(pid_cgroup / "cpu.weight", "100")
+            # Convert quota percentage to weight (approximate)
+            target_weight = max(1, (spec.cpu_quota_pct * 100) if spec.cpu_quota_pct else 100)
         else:
-            # Default: PROPORTIONAL
-            if spec.cpu_weight is not None:
-                self._write_file(pid_cgroup / "cpu.weight", str(spec.cpu_weight))
-            self._write_file(pid_cgroup / "cpu.max", "max 100000")
+            target_weight = spec.cpu_weight if spec.cpu_weight is not None else 100
 
-        # Memory limits with OOM protection
-        if spec.memory_limit_bytes is not None:
-            # OOM PROTECTION: Set memory.high with headroom
-            self._write_file(pid_cgroup / "memory.high", str(spec.memory_limit_bytes))
-            # OOM PROTECTION: Set memory.min to 10% of limit (floor at 1 page)
-            memory_min = max(PAGE_SIZE, spec.memory_limit_bytes // 10)
-            self._write_file(pid_cgroup / "memory.min", str(memory_min))
-            # OOM PROTECTION: Lower OOM score to prefer killing other processes
-            self._write_file(pid_cgroup / "oom.score", "100")
+        # Cache original weight if not already cached
+        if unit_name not in self._original_weights:
+            current = await self._get_current_cpu_weight(unit_name)
+            if current is not None:
+                self._original_weights[unit_name] = current
+            else:
+                self._original_weights[unit_name] = 100  # systemd default
+
+        # Apply new weight
+        success = await self._set_cpu_weight(unit_name, target_weight)
+        if success:
+            logger.info(f"Throttled PID {pid} ({unit_name}): CPUWeight={target_weight}")
 
     async def release_throttle(self, pid: int) -> None:
-        pid_cgroup = self.sentry_root / str(pid)
-        if pid_cgroup.exists():
-            self._write_file(pid_cgroup / "cpu.max", "max 100000")
-            self._write_file(pid_cgroup / "memory.high", "max")
-            self._write_file(pid_cgroup / "cpu.weight", "100")
-            # Restore OOM settings
-            self._write_file(pid_cgroup / "memory.min", "0")
-            self._write_file(pid_cgroup / "oom.score", "0")
-            # The kernel will automatically clean up the directory when the PID exits
+        """Restore original CPU weight for a PID."""
+        unit_name = await self._get_unit_name_from_pid(pid)
+        if not unit_name:
+            return
+
+        original_weight = self._original_weights.get(unit_name, 100)
+        success = await self._set_cpu_weight(unit_name, original_weight)
+        if success:
+            logger.info(f"Released PID {pid} ({unit_name}): restored CPUWeight={original_weight}")
+            # Clean up cache
+            self._original_weights.pop(unit_name, None)
+            self._pid_cooldowns.pop(pid, None)
+
+
+# Factory function for actuator creation
+async def create_actuator() -> 'SystemdActuator':
+    """Factory function to create the systemd actuator."""
+    if not DBUS_AVAILABLE:
+        raise RuntimeError("dbus-next not installed. Install with: pip install dbus-next")
+
+    actuator = SystemdActuator()
+    await actuator.initialize()
+    return actuator
