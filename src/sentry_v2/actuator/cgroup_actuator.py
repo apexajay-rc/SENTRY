@@ -14,7 +14,7 @@ logger = logging.getLogger("sentry.actuator")
 try:
     from dbus_next.aio import MessageBus
     from dbus_next.constants import BusType
-    from dbus_next import DBusError
+    from dbus_next import DBusError, Variant
     DBUS_AVAILABLE = True
 except ImportError:
     DBUS_AVAILABLE = False
@@ -59,7 +59,7 @@ class SystemdActuator:
             raise
 
     async def _get_unit_name_from_pid(self, pid: int) -> Optional[str]:
-        """Resolve systemd unit name from PID via GetUnitByPID."""
+        """Resolve systemd unit name from PID via GetUnitByPID, then find leaf scope."""
         try:
             if not self._manager_iface:
                 return None
@@ -75,6 +75,25 @@ class SystemdActuator:
             props_iface = unit_proxy.get_interface('org.freedesktop.DBus.Properties')
             unit_name_variant = await props_iface.call_get('org.freedesktop.systemd1.Unit', 'Id')
             unit_name = str(unit_name_variant.value)
+            
+            # For user@1000.service, we need to find the leaf scope that actually has CPUWeight
+            # Check if this is a user service - if so, find the leaf scope from cgroup
+            if unit_name.startswith('user@') and unit_name.endswith('.service'):
+                # Try to find the actual leaf scope from /proc/PID/cgroup
+                try:
+                    with open(f'/proc/{pid}/cgroup', 'r') as f:
+                        cgroup_path = f.read().strip().split(':')[-1]
+                    # Extract the leaf scope name (last component)
+                    if cgroup_path and cgroup_path != '/':
+                        leaf = cgroup_path.strip('/').split('/')[-1]
+                        # Convert systemd escaped path back to unit name
+                        leaf_unit = leaf.replace('_2e', '.').replace('_2d', '-')
+                        if leaf_unit.endswith('.scope') or leaf_unit.endswith('.slice'):
+                            logger.debug(f"Found leaf scope for PID {pid}: {leaf_unit}")
+                            return leaf_unit
+                except Exception as e:
+                    logger.debug(f"Could not read cgroup for PID {pid}: {e}")
+            
             return unit_name
         except Exception as e:
             logger.warning(f"Failed to get unit for PID {pid}: {e}")
@@ -91,7 +110,7 @@ class SystemdActuator:
             await self._manager_iface.call_set_unit_properties(
                 unit_name,
                 True,  # runtime=True (persist only until reboot)
-                [("CPUWeight", 'u', weight)]  # 'u' = uint64
+                [['CPUWeight', Variant('t', weight)]]  # a(sv) format
             )
             logger.debug(f"Set CPUWeight={weight} for {unit_name}")
             return True

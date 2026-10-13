@@ -26,11 +26,16 @@ class TelemetryBridge:
         self._socket: Optional[socket.socket] = None
         self._clients: set = set()
         self._running = False
+        self._focus_handler = None
         
         try:
             self._sentry_uid = pwd.getpwnam("sentry").pw_uid
         except KeyError:
             self._sentry_uid = os.getuid()
+
+    def set_focus_handler(self, handler):
+        """Register callback for focus change messages."""
+        self._focus_handler = handler
 
     async def start(self) -> None:
         logger.info(f"TelemetryBridge.start() called for {self.bind_path}")
@@ -109,9 +114,25 @@ class TelemetryBridge:
                 
                 try:
                     msg = json.loads(data.decode())
-                    if msg.get("type") == "subscribe" and addr:
+                    msg_type = msg.get("type")
+                    
+                    if msg_type == "subscribe" and addr:
                         self._clients.add(addr)
                         logger.info(f"Client subscribed: {addr} (UID: {uid})")
+                    elif msg_type == "focus_change" and self._focus_handler:
+                        focus_pid = msg.get("pid")
+                        if focus_pid:
+                            logger.info(f"Focus change received: PID {focus_pid}")
+                            self._focus_handler(focus_pid)
+                    elif msg_type == "enable_focus_qos" and self._focus_handler:
+                        # Special handler for enabling focus QoS - pass None to signal enable
+                        logger.info("Enable focus QoS received")
+                        if hasattr(self._focus_handler, '__self__') and hasattr(self._focus_handler.__self__, 'enable_focus_qos'):
+                            self._focus_handler.__self__.enable_focus_qos()
+                    elif msg_type == "disable_focus_qos" and self._focus_handler:
+                        logger.info("Disable focus QoS received")
+                        if hasattr(self._focus_handler, '__self__') and hasattr(self._focus_handler.__self__, 'disable_focus_qos'):
+                            self._focus_handler.__self__.disable_focus_qos()
                 except json.JSONDecodeError:
                     pass
             except Exception as e:

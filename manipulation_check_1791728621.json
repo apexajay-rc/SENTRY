@@ -1,0 +1,10 @@
+{
+  "timestamp": 1791728621.042726,
+  "trials": [],
+  "checks": {
+    "weights_in_systemd": true,
+    "weights_in_kernel": true,
+    "processes_verified": true
+  },
+  "passed": true
+}

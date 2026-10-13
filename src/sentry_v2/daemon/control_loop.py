@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 from pathlib import Path
+from typing import Optional
 
 from src.sentry_v2.daemon.systemd import sd_notify
 from src.sentry_v2.metrics.sampler import MetricsSampler
@@ -21,6 +22,12 @@ from src.sentry_v2.config import load_config
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("sentry.control")
 
+# Experiment scope names
+FOREGROUND_SCOPE = "foreground.scope"
+BACKGROUND_SCOPE = "background.scope"
+EXPERIMENT_SCOPES = {FOREGROUND_SCOPE, BACKGROUND_SCOPE}
+
+
 class ControlLoop:
     def __init__(self, config_path: str = "sentry-v2.yaml"):
         self.config_path = config_path
@@ -35,6 +42,10 @@ class ControlLoop:
         self.num_cores = os.cpu_count() or 1
         self._running = False
         self._reload = False
+        
+        # Focus-based QoS state
+        self._foreground_scope: Optional[str] = None
+        self._focus_active = False
 
     async def initialize(self):
         self.actuator = await create_actuator()
@@ -44,6 +55,8 @@ class ControlLoop:
         self.telemetry_bridge = TelemetryBridge()
         try:
             await self.telemetry_bridge.start()
+            # Register focus change handler
+            self.telemetry_bridge.set_focus_handler(self._handle_focus_change)
         except PermissionError:
             logger.warning("Telemetry bridge failed to start (permission denied). Running without telemetry.")
             self.telemetry_bridge = None
@@ -51,6 +64,59 @@ class ControlLoop:
         loop = asyncio.get_event_loop()
         try: loop.add_signal_handler(signal.SIGHUP, lambda: setattr(self, '_reload', True))
         except NotImplementedError: pass # Windows support
+
+    def _handle_focus_change(self, pid: int):
+        """Handle focus change from desktop bridge - shift experiment scope weights."""
+        if not self._focus_active:
+            return
+            
+        # Find which experiment scope this PID belongs to
+        target_scope = self._pid_to_experiment_scope(pid)
+        if not target_scope:
+            # PID not in our experiment scopes - ignore
+            logger.debug(f"Focus PID {pid} not in experiment scopes, ignoring")
+            return
+            
+        # Shift weights: focused=10000, unfocused=100
+        focused_weight = 10000
+        unfocused_weight = 100
+        
+        if target_scope == FOREGROUND_SCOPE:
+            logger.info(f"FOCUS SHIFT: foreground.scope=10000, background.scope=100 (PID {pid})")
+            asyncio.create_task(self.actuator._set_cpu_weight(FOREGROUND_SCOPE, focused_weight))
+            asyncio.create_task(self.actuator._set_cpu_weight(BACKGROUND_SCOPE, unfocused_weight))
+        elif target_scope == BACKGROUND_SCOPE:
+            logger.info(f"FOCUS SHIFT: background.scope=10000, foreground.scope=100 (PID {pid})")
+            asyncio.create_task(self.actuator._set_cpu_weight(BACKGROUND_SCOPE, focused_weight))
+            asyncio.create_task(self.actuator._set_cpu_weight(FOREGROUND_SCOPE, unfocused_weight))
+
+    def _pid_to_experiment_scope(self, pid: int) -> Optional[str]:
+        """Check if PID belongs to an experiment scope, return scope name or None."""
+        try:
+            with open(f'/proc/{pid}/cgroup', 'r') as f:
+                cgroup_path = f.read().strip().split(':')[-1]
+            # Extract leaf scope
+            if cgroup_path and cgroup_path != '/':
+                leaf = cgroup_path.strip('/').split('/')[-1]
+                leaf_unit = leaf.replace('_2e', '.').replace('_2d', '-')
+                if leaf_unit in EXPERIMENT_SCOPES:
+                    return leaf_unit
+        except Exception:
+            pass
+        return None
+
+    def enable_focus_qos(self):
+        """Enable focus-based QoS (called when experiment starts)."""
+        self._focus_active = True
+        logger.info("Focus-based QoS ENABLED")
+
+    def disable_focus_qos(self):
+        """Disable focus-based QoS, restore equal weights."""
+        self._focus_active = False
+        # Restore equal weights
+        asyncio.create_task(self.actuator._set_cpu_weight(FOREGROUND_SCOPE, 10000))
+        asyncio.create_task(self.actuator._set_cpu_weight(BACKGROUND_SCOPE, 10000))
+        logger.info("Focus-based QoS DISABLED - weights restored to 10000")
 
     async def run(self):
         await self.initialize()
