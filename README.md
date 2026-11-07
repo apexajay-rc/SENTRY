@@ -1,3 +1,26 @@
+# SENTRY development status
+
+> **Current development direction:** a clean Rust implementation is being built on the `rewrite/rust-core` branch. The Python V1/V2 and Ring -1 trees are retained as historical research and are not the source of truth for the new runtime.
+>
+> The Rust workspace supports explicit workload grouping under `sentry-workloads.slice`, environment diagnostics, one-shot read-only observation, and an experimental, operator-triggered aggregate CPU-weight actuator with timed restoration. It does **not** yet implement pressure-driven automatic adaptation, foreground detection, a long-running daemon, or recovery across user-manager shutdown/reboot.
+
+The historical README below describes earlier generations and must not be interpreted as a claim that those capabilities are present in the Rust implementation.
+
+---
+
+### Experimental Rust CPU control
+
+The Rust workspace now includes an explicitly invoked, leased aggregate CPU-weight
+actuator for the dedicated `sentry.slice`. It is bounded to CPUWeight 20–100 and
+uses a systemd user timer to restore the prior effective kernel weight if the
+CLI process exits or crashes while the user manager remains available. This is
+an experimental control primitive, not an automatic policy engine. It does not
+perform foreground detection or adapt weights from PSI. Restoration preserves
+the effective kernel weight; if the original property was unset, systemd may
+show an explicit runtime property after restoration.
+
+---
+
 # SENTRY
 
 ### Policy-Driven Linux Resource Arbitration
